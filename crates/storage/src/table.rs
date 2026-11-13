@@ -76,6 +76,28 @@ pub fn catalog_name(key: &[u8]) -> Result<&str> {
         .map_err(|e| Error::corruption(format!("catalog key not utf8: {e}")))
 }
 
+/// 统计键:保留表 0 前缀 ++ [0x01] ++ 表名。
+/// 表名不可能以 0x01 开头(标识符不含控制字节),与 catalog 键天然隔离。
+pub fn stats_key(name: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(9 + name.len());
+    buf.extend_from_slice(&CATALOG_TABLE_ID.to_be_bytes());
+    buf.push(common::stats::STATS_MARKER);
+    buf.extend_from_slice(name.as_bytes());
+    buf
+}
+
+/// 统计键剥表名。
+pub fn stats_name(key: &[u8]) -> Result<&str> {
+    if key.len() < 9
+        || &key[..8] != &CATALOG_TABLE_ID.to_be_bytes()
+        || key[8] != common::stats::STATS_MARKER
+    {
+        return Err(Error::corruption("bad stats key prefix"));
+    }
+    std::str::from_utf8(&key[9..])
+        .map_err(|e| Error::corruption(format!("stats key not utf8: {e}")))
+}
+
 // ---------- 唯一索引(PK)键布局 ----------
 //
 // 索引键:`table_id ++ index_id ++ 可排序编码的主键值`,值 = row_id u64BE。
@@ -335,5 +357,21 @@ mod tests {
         assert_eq!(name, "users");
         assert!(catalog_name(&[0u8; 4]).is_err());
         assert!(catalog_name(&[1u8, 0, 0, 0, 0, 0, 0, 0, b'x']).is_err());
+    }
+
+    #[test]
+    fn stats_keys_are_inside_table0_and_disjoint_from_catalog() {
+        let skey = stats_key("users");
+        let ckey = catalog_key("users");
+        assert_ne!(skey, ckey);
+        assert!(skey < ckey, "0x01 < 可打印字符 → 统计键排在 catalog 键之前");
+        // 仍在目录扫描范围内(恢复时一次 scan 同时取到 schema 与 stats)
+        let (from, to) = catalog_range();
+        assert!(skey > from && skey < to);
+        assert_eq!(stats_name(&skey).unwrap(), "users");
+        assert!(stats_name(&ckey).is_err(), "catalog 键不是统计键");
+        assert!(stats_name(&[0u8; 4]).is_err());
+        // 统计键聚在 [0x01] 前缀区,不会被任何以普通字符开头的表名夹住
+        assert!(skey < catalog_key("a"));
     }
 }

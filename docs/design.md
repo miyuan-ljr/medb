@@ -194,9 +194,68 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 - v1 同步执行在 async 上下文:短查询可接受;扫描算子接入后换 spawn_blocking
   或把执行器做成 async(见路线图)。
 
+## 5.5 统计信息与代价优化器
+
+### 5.5.1 统计(`common::stats`,持久化于保留表 0)
+
+- **布局**:键 = `[0;8] ++ [0x01] ++ 表名`(表名不可能以 0x01 开头,与 catalog
+  键天然隔离;0x01 < 可打印字符 → 统计键聚在目录区最前)。值 = 手写编码
+  (版本 + row_count + stale 标记 + 每列 {ndv, null_count, min/max codec 标量})。
+  恢复与 catalog 同一次 scan;**统计键排在 catalog 键之前 → 两阶段恢复**
+  (先收集,待 schema 全部挂载后再绑定 table_id)。
+- **生命周期**:
+  - row_count 精确增量:INSERT +n / DELETE -n / UPDATE 不变;
+  - min/max 只扩不缩(删除不收窄 —— 永远是合法上界,估算安全);
+  - NDV 写路径**不做**增量(增量 NDV 只会越数越错),只在 ANALYZE 时全量
+    (或 >100 万行等步长抽样)计算;`ndv == 0` 表示"未统计过";
+  - 事务提交 / DELETE 标记 `stale`;规划期 `needs_analyze()`(stale / 缺条目 /
+    有列未统计且 row_count > 0)→ 自动 ANALYZE(同步、持久化)。
+- **为什么规划期能写**:统计写是幂等的单键 put,与数据写互不冲突;
+  自动 ANALYZE 的代价 = 一次全表扫描,对教学规模数据可接受(大表走抽样)。
+
+### 5.5.2 选择性估算(`optimizer::Estimator`)
+
+- 列 op 常量:等值 = 1/NDV × (1 - null_frac);范围 = min/max 线性插值
+  (标量 → f64,Date 按天数),夹到 [0.001, 1];
+- 列 = 列:1/max(NDV 两侧)(连接基数因子);表达式键 → 表基数/10 启发式;
+- LIKE = 0.1;IS NULL = null_frac;NOT/OR 递归;形状不明 = 0.25。
+- 无统计表:rows = 1000,ndv = rows/10 夹到 [1, 100]。
+
+### 5.5.3 连接顺序枚举(`optimizer::optimize_join_order`)
+
+- **条件池**:WHERE + INNER ON 的跨表(≥2 表)合取项;等值对
+  (`a = b` 两侧各引一表)单独标记(键候选,选择性 1/max(NDV))。
+- **DP**:节点集 ⊆ 10 张表时子集 DP。代价 = Σ 每步
+  (累计读 + 新表读 + min(两侧)× BUILD_WEIGHT(2.0)+ 输出估行);
+  每步物化侧 = 较小者(必要时交换 probe/build,输出经投影置换还原规范列序)。
+  等价代价取 FROM 书写序(确定性);> 10 表贪心(每步选累计基数最小者)。
+- **估计基数**:est(S) = Π est(表) × Π 生效条件选择性(引用 ⊆ S 的条件),
+  下限 1 行。
+- **LEFT JOIN 是屏障**:连续 INNER 段为重排组;LEFT 步骤固定在 FROM 位置
+  (探测侧 = 屏障前全部,构建侧 = 该表,谓词不下推)。跨屏障的组通过
+  VIRTUAL 虚拟节点(既有流水线,基数已知)接入 DP。
+- **列序不变式**:每步连接后流水线列 = 已连接集合的规范(FROM)序,不一致即
+  投影置换;`col_shift` 跟踪"位置 i ↔ 扁平 i + shift"(首表非表 0 的重排组
+  shift ≠ 0),累计/新表两侧表达式按 shift 重基 —— 这是连接键/残余条件
+  正确性的关键(踩过:重排后键引用错位 → Date = Float64 之类怪错)。
+- **WHERE 路由不变式**(统一 WHERE + INNER ON):单表条件当且仅当其后
+  (FROM 序 ≥ 自身)无 LEFT 步骤才下推扫描;否则延迟到该 LEFT 步骤连接后
+  过滤。空产侧条件下推会把"匹配后过滤"变成"过滤后 NULL 补齐" —— 语义 bug,
+  统一路由时修正。
+
+### 5.5.4 EXPLAIN
+
+`EXPLAIN <SELECT>` → `StatementPlan::Explain { lines }`(不执行查询)。
+计划树自顶向下:Limit → Sort → Project → Aggregate → HashJoin → Scan,
+每节点带估行数 / 下推过滤 / 连接键 / 物化侧标签。planner 以 `ExplNode` 树
+累积、`flatten_expl` 摊平;LIMIT 在外层包装时整体缩进一级。
+
 ## 6. 测试策略
 
 - 单元:每个格式(键/块/bloom/WAL/SST)codec 往返 + 损坏检测;
 - 集成:LsmStore put/flush/compaction/恢复/并发写;PG 协议端到端(原生 TCP);
-- 内存:配额树超限/回滚/并发、arena 对齐/增长/reset/配额联动。
+- 内存:配额树超限/回滚/并发、arena 对齐/增长/reset/配额联动;
+- 优化器:选择性数学(NDV/插值/默认)、DP 顺序(避免无选择性的笛卡尔前缀)、
+  虚拟节点;e2e:EXPLAIN 树形状、ANALYZE、统计增量/重启恢复、CBO 禁止
+  无键连接(`server/tests/optimizer.rs`)。
 - 新格式字段一律"写入端-读取端-测试"三方同改,footer 尺寸变更要 bump version。

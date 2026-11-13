@@ -31,6 +31,8 @@ use sqlparser::ast::{
     TableWithJoins, UnaryOperator, Value,
 };
 
+use crate::optimizer::{self, Estimator, split_conjuncts, sql_expr_tables};
+
 /// 计划上下文:批大小 + 元数据 + 表数据源。
 pub struct PlanContext<'a> {
     pub batch_size: usize,
@@ -150,6 +152,17 @@ pub enum StatementPlan {
     DropTable {
         name: String,
     },
+    /// ANALYZE [TABLE] <name>:全量(或抽样)重建表统计。
+    Analyze {
+        name: Option<String>,
+    },
+    /// EXPLAIN <query>:只产出计划描述文本,不执行查询。
+    Explain {
+        /// 单列 TEXT 输出 schema("plan")
+        schema: Vec<ColumnDesc>,
+        /// 计划树(根在前,子节点带缩进)
+        lines: Vec<String>,
+    },
     Begin,
     Commit,
     Rollback,
@@ -159,6 +172,8 @@ pub enum StatementPlan {
 pub struct PlannedQuery {
     pub executor: BoxedExecutor,
     pub schema: Vec<ColumnDesc>,
+    /// 计划树描述(EXPLAIN 用;普通执行忽略)
+    pub explain: Vec<String>,
 }
 
 pub fn plan_statement(stmt: &Statement, ctx: &PlanContext<'_>) -> Result<StatementPlan> {
@@ -168,6 +183,26 @@ pub fn plan_statement(stmt: &Statement, ctx: &PlanContext<'_>) -> Result<Stateme
         Statement::Update(update) => plan_update(update, ctx),
         Statement::Delete(delete) => plan_delete(delete, ctx),
         Statement::CreateTable(create) => plan_create_table(create),
+        Statement::Analyze(analyze) => {
+            let name = analyze
+                .table_name
+                .as_ref()
+                .map(object_name_to_string)
+                .transpose()?;
+            Ok(StatementPlan::Analyze { name })
+        }
+        Statement::Explain { statement, .. } => {
+            // v1 仅支持 EXPLAIN <SELECT>;ANALYZE 选项忽略(不实际执行)
+            let Statement::Query(q) = statement.as_ref() else {
+                return Err(Error::not_supported("EXPLAIN <statement> (only SELECT)"));
+            };
+            let pq = plan_query(q, ctx)?;
+            let schema = vec![ColumnDesc::new("plan".to_string(), DataType::Utf8, true)];
+            Ok(StatementPlan::Explain {
+                schema,
+                lines: pq.explain,
+            })
+        }
         Statement::AlterTable(alter) => {
             // v1 仅支持 ADD COLUMN
             let [op] = alter.operations.as_slice() else {
@@ -273,16 +308,27 @@ pub fn plan_query(q: &Query, ctx: &PlanContext<'_>) -> Result<PlannedQuery> {
 }
 
 fn finish_with_limit(
-    planned: PlannedQuery,
+    mut planned: PlannedQuery,
     offset: u64,
     limit: Option<u64>,
 ) -> Result<PlannedQuery> {
     if offset == 0 && limit.is_none() {
         return Ok(planned);
     }
+    // EXPLAIN 树:Limit 置于根,原计划整体缩进一级
+    let label = match limit {
+        Some(l) => format!("Limit (offset {offset}, take {l})"),
+        None => format!("Offset ({offset})"),
+    };
+    let mut explain = vec![label];
+    explain.extend(planned.explain.drain(..).map(|l| format!("  {l}")));
     let schema = planned.schema.clone();
     let executor = Box::new(LimitExec::new(planned.executor, offset as usize, limit));
-    Ok(PlannedQuery { executor, schema })
+    Ok(PlannedQuery {
+        executor,
+        schema,
+        explain,
+    })
 }
 
 /// 查询是否是聚合查询:GROUP BY 非空,或投影/HAVING/ORDER BY 中出现聚合调用。
@@ -338,7 +384,7 @@ fn is_aggregate_name(name: &str) -> bool {
 }
 
 /// 从 AST 函数调用提取实参表达式(仅未命名参数;COUNT(*) → 空列表)。
-fn function_call_args(f: &sqlparser::ast::Function) -> Result<Vec<SE>> {
+pub(crate) fn function_call_args(f: &sqlparser::ast::Function) -> Result<Vec<SE>> {
     if f.filter.is_some() || f.over.is_some() || !f.within_group.is_empty() {
         return Err(Error::not_supported("FILTER/OVER/WITHIN GROUP clauses"));
     }
@@ -615,6 +661,8 @@ fn plan_select(
 
     // ---------- 流水线 ----------
     // 无 FROM:单行占位批(plain 路径投影不引用列;聚合路径在其上聚合一组)
+    #[allow(unused_assignments)] // 两个分支都会覆盖初值
+    let mut expl: Option<ExplNode> = None;
     let (mut pipeline, base_dtypes): (BoxedExecutor, Vec<DataType>) = if steps.is_empty() {
         let d = vec![ColumnDesc::new(
             "__dummy".to_string(),
@@ -622,83 +670,146 @@ fn plan_select(
             true,
         )];
         let dtypes = vec![DataType::Int64];
+        expl = Some(ExplNode::leaf("Values (1 row)".to_string()));
         (Box::new(ValuesExec::one_row(d)), dtypes)
     } else {
-        // WHERE 合取项路由:
-        // - 单表且其后无 LEFT JOIN 步骤 → 下推该表扫描(列下标重基到表内);
-        // - 单表且其后有 LEFT 步骤(保留侧/空产侧)→ 挂到该 LEFT 步骤 residual;
-        // - 常量谓词 → 挂第一张表扫描;
-        // - 跨表等值(两侧各引一表,INNER)→ 该步骤的哈希键;
-        // - 其余跨表条件 → 在其引用的最大表位置步骤之后过滤(residual)。
-        let mut scan_preds: Vec<Vec<Expr>> = vec![Vec::new(); steps.len()];
-        let mut step_keys: Vec<(Vec<Expr>, Vec<Expr>)> =
-            vec![(Vec::new(), Vec::new()); steps.len()];
-        let mut step_match: Vec<Vec<Expr>> = vec![Vec::new(); steps.len()];
-        let mut step_res: Vec<Vec<Expr>> = vec![Vec::new(); steps.len()];
+        // 统计 + 选择性估算(数据源缺失/过期统计时可自动 ANALYZE)
+        let est = Estimator::collect(&scope, &mut |t| ctx.data.table_stats(t));
 
-        // ON 条件路由(连接步骤;非哈希部分进 match_cond,匹配期判定,
-        // 保证 LEFT JOIN 下未过条件的左行仍 NULL 补齐)
-        for (j, step) in steps.iter().enumerate().skip(1) {
-            if let Some(on) = &step.on {
-                for c in split_conjuncts(on) {
-                    if let Some((pk, bk)) = try_hash_eq(c, &scope, &offsets)? {
-                        step_keys[j].0.push(pk);
-                        step_keys[j].1.push(bk);
-                        continue;
+        // ---------- 条件路由:WHERE + INNER ON 统一处理;LEFT ON 留在步骤上 ----------
+        // - 常量谓词 → 第一张表扫描;
+        // - 单表 WHERE 谓词:位置 ≥ 自身的 LEFT 步骤都会挡住下推(保留侧条件
+        //   不能沉到连接之下;空产侧条件下推会把"匹配后过滤"变成"过滤后
+        //   NULL 补齐"),否则下推扫描;被挡住的延迟到该 LEFT 步骤的连接后过滤;
+        // - INNER ON 的单表部分恒可下推(属于该连接,先于后续 LEFT 求值);
+        // - 跨表条件 → 条件池(顺序枚举时在"引用齐备"的最早步骤应用)。
+        let mut scan_preds: Vec<Vec<Expr>> = vec![Vec::new(); steps.len()];
+        let mut scan_sql: Vec<Vec<String>> = vec![Vec::new(); steps.len()];
+        let mut scan_sels: Vec<Vec<f64>> = vec![Vec::new(); steps.len()];
+        let mut deferred: Vec<(usize, Expr)> = Vec::new();
+        // 持有合取项克隆(条件池借引用;克隆避免闭包生命周期纠缠)
+        let mut pool_src: Vec<SE> = Vec::new();
+        // LEFT 步骤的 ON:哈希等值键 + 匹配期 match_cond(非等值;LEFT 下
+        // 未过条件的左行仍 NULL 补齐)
+        let mut left_keys: Vec<(Vec<Expr>, Vec<Expr>)> =
+            vec![(Vec::new(), Vec::new()); steps.len()];
+        let mut left_match: Vec<Vec<Expr>> = vec![Vec::new(); steps.len()];
+
+        let mut route = |c: &SE, from_where: bool| -> Result<()> {
+            if from_where && aggregate && is_aggregate_call(c) {
+                return Err(Error::sql(
+                    "aggregates are not allowed in WHERE (use HAVING)",
+                ));
+            }
+            let touched = sql_expr_tables(c, &scope)?;
+            match touched.as_slice() {
+                [] => {
+                    let e = plan_expr(c, scope_ref)?;
+                    check_bool(&e, &input_schema, "WHERE")?;
+                    scan_preds[0].push(e);
+                    scan_sql[0].push(format!("{c}"));
+                    scan_sels[0].push(est.selectivity(c));
+                }
+                [pos] => {
+                    let first_left = steps[*pos..]
+                        .iter()
+                        .position(|s| s.join_type == JoinType::LeftOuter)
+                        .map(|off| off + pos);
+                    if from_where {
+                        if let Some(l) = first_left {
+                            let e = plan_expr(c, scope_ref)?;
+                            check_bool(&e, &input_schema, "WHERE")?;
+                            deferred.push((l, e));
+                            return Ok(());
+                        }
                     }
                     let e = plan_expr(c, scope_ref)?;
-                    check_bool(&e, &input_schema, "join condition")?;
-                    step_match[j].push(e);
+                    check_bool(&e, &input_schema, "filter")?;
+                    scan_preds[*pos].push(e);
+                    scan_sql[*pos].push(format!("{c}"));
+                    scan_sels[*pos].push(est.selectivity(c));
                 }
+                _ => pool_src.push(c.clone()),
             }
-        }
+            Ok(())
+        };
 
-        // WHERE 路由
-        if let Some(where_expr) = &select.selection {
-            let first_left = steps
-                .iter()
-                .position(|s| s.join_type == JoinType::LeftOuter);
-            for c in split_conjuncts(where_expr) {
-                if aggregate && is_aggregate_call(c) {
-                    return Err(Error::sql(
-                        "aggregates are not allowed in WHERE (use HAVING)",
-                    ));
-                }
-                let touched = sql_expr_tables(c, &scope)?;
-                let e = plan_expr(c, scope_ref)?;
-                check_bool(&e, &input_schema, "WHERE")?;
-                match touched.as_slice() {
-                    [] => scan_preds[0].push(e),
-                    // 扁平下标入队;重基到表内局部由 table_scan 统一完成
-                    [pos] => match first_left {
-                        Some(l) if l > *pos => step_res[l].push(e),
-                        _ => scan_preds[*pos].push(e),
-                    },
-                    multi => {
-                        let j = *multi.last().expect("non-empty");
-                        step_res[j].push(e);
+        for (j, step) in steps.iter().enumerate() {
+            if step.join_type == JoinType::LeftOuter {
+                if let Some(on) = &step.on {
+                    for c in split_conjuncts(on) {
+                        if let Some((pk, bk)) = try_hash_eq(c, &scope, &offsets)? {
+                            left_keys[j].0.push(pk);
+                            left_keys[j].1.push(bk);
+                            continue;
+                        }
+                        let e = plan_expr(c, scope_ref)?;
+                        check_bool(&e, &input_schema, "join condition")?;
+                        left_match[j].push(e);
                     }
                 }
+            } else if let Some(on) = &step.on {
+                for c in split_conjuncts(on) {
+                    route(c, false)?;
+                }
             }
         }
+        if let Some(where_expr) = &select.selection {
+            for c in split_conjuncts(where_expr) {
+                route(c, true)?;
+            }
+        }
+        let pool_refs: Vec<&SE> = pool_src.iter().collect();
+        let pool = optimizer::build_pool(&pool_refs, &scope, &est)?;
 
-        // 逐表扫描(下推过滤)→ HashJoin 组合
-        let mut exec: BoxedExecutor = table_scan(&steps[0], &scan_preds[0], 0, ctx)?;
-        for j in 1..steps.len() {
-            let build = table_scan(&steps[j], &scan_preds[j], offsets[j], ctx)?;
-            let probe_schema = input_schema[..offsets[j]].to_vec();
-            let build_schema = steps[j].schema.columns.clone();
-            let (pk, bk) = step_keys[j].clone();
-            exec = Box::new(HashJoinExec::new(
-                exec,
-                build,
-                probe_schema,
-                build_schema,
-                pk,
-                bk,
-                combine_and(step_match[j].clone()),
-                combine_and(step_res[j].clone()),
-                steps[j].join_type,
+        // ---------- 发射:连续 INNER 段 DP 枚举连接顺序;LEFT 步骤为屏障 ----------
+        let em = EmitCtx {
+            steps: &steps,
+            offsets: &offsets,
+            input_schema: &input_schema,
+            scan_preds: &scan_preds,
+            scan_sql: &scan_sql,
+            scan_sels: &scan_sels,
+            pool: &pool,
+            est: &est,
+            scope_ref,
+            plan_ctx: ctx,
+        };
+        let mut st = PipelineState::default();
+        let mut applied: std::collections::HashSet<usize> = Default::default();
+        let mut pending: Vec<usize> = Vec::new();
+        for k in 0..steps.len() {
+            if steps[k].join_type == JoinType::LeftOuter {
+                flush_group(&mut st, &em, &pending, &mut applied)?;
+                pending.clear();
+                emit_left_join(
+                    &mut st,
+                    &em,
+                    k,
+                    &deferred,
+                    &left_keys,
+                    &left_match,
+                    &mut applied,
+                )?;
+            } else {
+                pending.push(k);
+            }
+        }
+        flush_group(&mut st, &em, &pending, &mut applied)?;
+
+        let mut exec: BoxedExecutor = st.exec.expect("FROM pipeline must exist");
+        expl = st.expl;
+        // 条件池兜底:未被任何步骤应用的条件(理论上不可达)在顶层过滤
+        for (pi, entry) in pool.iter().enumerate() {
+            if applied.contains(&pi) {
+                continue;
+            }
+            let e = plan_expr(entry.expr, scope_ref)?;
+            check_bool(&e, &input_schema, "WHERE")?;
+            exec = Box::new(FilterExec::new(exec, e));
+            expl = Some(ExplNode::with(
+                "Filter (leftover predicate)".to_string(),
+                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
             ));
         }
         let dtypes = input_schema.iter().map(|c| c.ty.clone()).collect();
@@ -715,18 +826,28 @@ fn plan_select(
             }
             let pred = plan_expr(where_expr, None)?;
             pipeline = Box::new(FilterExec::new(pipeline, pred));
+            expl = Some(ExplNode::with(
+                "Filter".to_string(),
+                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+            ));
         }
     }
 
     // HAVING + 聚合
     if aggregate {
         let (group_exprs, aggs, agg_out_schema) = rewriter.take_pipeline_parts();
+        let n_groups = group_exprs.len();
+        let n_aggs = aggs.len();
         pipeline = Box::new(AggHashExec::new(
             pipeline,
             base_dtypes,
             group_exprs,
             aggs,
             agg_out_schema,
+        ));
+        expl = Some(ExplNode::with(
+            format!("Aggregate (groups={n_groups} aggs={n_aggs})"),
+            vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
         ));
         if let Some(having) = &select.having {
             let pred = rewriter.rewrite(having, false)?;
@@ -737,6 +858,10 @@ fn plan_select(
                 }
             }
             pipeline = Box::new(FilterExec::new(pipeline, pred));
+            expl = Some(ExplNode::with(
+                "Filter (HAVING)".to_string(),
+                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+            ));
         }
     }
 
@@ -748,10 +873,19 @@ fn plan_select(
         project_schema.clone(),
         project_exprs,
     ));
+    expl = Some(ExplNode::with(
+        format!("Project ({} cols)", project_schema.len()),
+        vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+    ));
 
     // Sort + 砍隐藏列
     if !keys.is_empty() {
+        let n_keys = keys.len();
         pipeline = Box::new(SortExec::new(pipeline, keys, project_schema.clone()));
+        expl = Some(ExplNode::with(
+            format!("Sort ({n_keys} keys)"),
+            vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+        ));
         if !hidden.is_empty() {
             let visible_n = visible.len();
             pipeline = Box::new(ProjectExec::new(
@@ -759,16 +893,509 @@ fn plan_select(
                 project_schema[..visible_n].to_vec(),
                 (0..visible_n).map(Expr::Column).collect(),
             ));
+            expl = Some(ExplNode::with(
+                "Project (drop sort keys)".to_string(),
+                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+            ));
         }
     }
 
     let final_schema = project_schema[..visible.len()].to_vec();
-    // batch_size 由 ExecuteContext 携带,计划期不固化
+    // batch_size 由 ExecuteContext 携带,计划期不固化(LIMIT 由外层包装)
     let _ = ctx.batch_size;
     Ok(PlannedQuery {
         executor: pipeline,
         schema: final_schema,
+        explain: expl
+            .map(|root| {
+                let mut lines = Vec::new();
+                flatten_expl(&root, 0, &mut lines);
+                lines
+            })
+            .unwrap_or_default(),
     })
+}
+
+// ---------- 执行计划描述(EXPLAIN) ----------
+
+/// 计划树节点(自顶向下展示:根在前,子节点缩进)。
+struct ExplNode {
+    label: String,
+    children: Vec<ExplNode>,
+}
+
+impl ExplNode {
+    fn leaf(label: String) -> ExplNode {
+        ExplNode {
+            label,
+            children: Vec::new(),
+        }
+    }
+
+    fn with(label: String, children: Vec<ExplNode>) -> ExplNode {
+        ExplNode { label, children }
+    }
+}
+
+fn flatten_expl(node: &ExplNode, depth: usize, out: &mut Vec<String>) {
+    out.push(format!("{}{}", "  ".repeat(depth), node.label));
+    for c in &node.children {
+        flatten_expl(c, depth + 1, out);
+    }
+}
+
+/// 发射上下文:路由产物与计划期环境(供 flush/emit 函数共享)。
+struct EmitCtx<'a> {
+    steps: &'a [RelationStep],
+    offsets: &'a [usize],
+    input_schema: &'a [ColumnDesc],
+    scan_preds: &'a [Vec<Expr>],
+    scan_sql: &'a [Vec<String>],
+    scan_sels: &'a [Vec<f64>],
+    pool: &'a [optimizer::PoolEntry<'a>],
+    est: &'a Estimator<'a>,
+    scope_ref: Option<&'a Scope>,
+    plan_ctx: &'a PlanContext<'a>,
+}
+
+/// 流水线发射状态。
+#[derive(Default)]
+struct PipelineState {
+    exec: Option<BoxedExecutor>,
+    /// 流水线当前列顺序(scope 位置;每步后重排为已连接集合的规范序)
+    cur_order: Vec<usize>,
+    /// 列下标偏移:流水线位置 i 对应扁平下标 i + col_shift。
+    /// 首表扫描(非表 0)时为该表偏移;累计集合含表 0 后恒为 0。
+    col_shift: usize,
+    /// 流水线估计行数
+    est_rows: f64,
+    expl: Option<ExplNode>,
+}
+
+/// 扫描节点标签。
+fn scan_label(em: &EmitCtx<'_>, t: usize, est_rows: f64) -> String {
+    let mut label = format!("Scan {} rows≈{}", em.steps[t].alias, fmt_est(est_rows));
+    if !em.scan_sql[t].is_empty() {
+        label.push_str(&format!(" filter: [{}]", em.scan_sql[t].join(" AND ")));
+    }
+    label
+}
+
+fn fmt_est(v: f64) -> String {
+    if v >= 10.0 {
+        format!("{}", v.round() as u64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+/// 表集合 → 规范(FROM 序)扁平列下标。
+fn canonical_flat(em: &EmitCtx<'_>, tables: &[usize]) -> Vec<usize> {
+    let mut sorted: Vec<usize> = tables.to_vec();
+    sorted.sort_unstable();
+    let mut out = Vec::new();
+    for p in sorted {
+        out.extend(em.offsets[p]..em.offsets[p] + em.steps[p].schema.columns.len());
+    }
+    out
+}
+
+/// 把流水线列顺序重排回规范序(投影置换)。
+fn permute_to_canonical(exec: BoxedExecutor, cur: &[usize], em: &EmitCtx<'_>) -> BoxedExecutor {
+    let mut cur_flat: Vec<usize> = Vec::new();
+    for &p in cur {
+        cur_flat.extend(em.offsets[p]..em.offsets[p] + em.steps[p].schema.columns.len());
+    }
+    let canonical = canonical_flat(em, cur);
+    let exprs: Vec<Expr> = canonical
+        .iter()
+        .map(|&f| {
+            let pos = cur_flat
+                .iter()
+                .position(|&c| c == f)
+                .expect("permutation source");
+            Expr::Column(pos)
+        })
+        .collect();
+    let schema: Vec<ColumnDesc> = canonical
+        .iter()
+        .map(|&f| em.input_schema[f].clone())
+        .collect();
+    Box::new(ProjectExec::new(exec, schema, exprs))
+}
+
+/// flush 一个 INNER 连接组:DP 枚举连接顺序,逐表扫描 + HashJoin 组合。
+fn flush_group(
+    st: &mut PipelineState,
+    em: &EmitCtx<'_>,
+    pending: &[usize],
+    applied: &mut std::collections::HashSet<usize>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut nodes: Vec<usize> = pending.to_vec();
+    if st.exec.is_some() {
+        nodes.insert(0, optimizer::VIRTUAL);
+    }
+    let base: Vec<f64> = nodes
+        .iter()
+        .map(|&n| match n {
+            optimizer::VIRTUAL => st.est_rows.max(1.0),
+            p => base_of(em, p),
+        })
+        .collect();
+    let plan = optimizer::optimize_join_order(&nodes, &base, em.pool);
+
+    for (k, &node) in plan.order.iter().enumerate() {
+        if node == optimizer::VIRTUAL {
+            continue; // 首节点为既有流水线(col_shift = 0,全扁平)
+        }
+        if k == 0 {
+            // 首表扫描:列 = 该表局部下标(偏移 = offsets[node]);
+            // 后续连接的累计侧表达式按 st.col_shift 重基
+            st.exec = Some(table_scan(
+                &em.steps[node],
+                &em.scan_preds[node],
+                em.offsets[node],
+                em.plan_ctx,
+            )?);
+            st.cur_order = vec![node];
+            st.col_shift = em.offsets[node];
+            st.est_rows = plan.est_rows[0];
+            st.expl = Some(ExplNode::leaf(scan_label(em, node, base_of(em, node))));
+            continue;
+        }
+        let step = &plan.steps[k - 1];
+        emit_inner_join(
+            st,
+            em,
+            node,
+            step.build_accumulated,
+            applied,
+            plan.est_rows[k],
+        )?;
+    }
+    Ok(())
+}
+
+/// 表的扫描基数估计(行数 × 下推谓词选择性)。
+fn base_of(em: &EmitCtx<'_>, p: usize) -> f64 {
+    let mut b = em.est.rows(p);
+    for &s in &em.scan_sels[p] {
+        b *= s;
+    }
+    b.max(1.0)
+}
+
+/// 等值对中属于指定表一侧的 SQL 表达式。
+fn pair_side<'a>(pair: &'a optimizer::JoinPair<'a>, pos: usize) -> &'a SE {
+    if pair.lo == pos {
+        pair.lo_expr
+    } else {
+        pair.hi_expr
+    }
+}
+
+/// 等值对在 prefix 中的那一侧的 scope 位置。
+fn prefix_member(prefix: &[usize], pair: &optimizer::JoinPair<'_>) -> usize {
+    if prefix.contains(&pair.lo) {
+        pair.lo
+    } else {
+        pair.hi
+    }
+}
+
+/// 发射一步 INNER 连接(新表 t;可选物化侧交换 = 物化累计侧、探测新表)。
+fn emit_inner_join(
+    st: &mut PipelineState,
+    em: &EmitCtx<'_>,
+    t: usize,
+    build_accumulated: bool,
+    applied: &mut std::collections::HashSet<usize>,
+    est_out: f64,
+) -> Result<()> {
+    let prefix: Vec<usize> = st.cur_order.clone();
+    let acc_shift = st.col_shift; // 累计侧:位置 i ↔ 扁平 i + acc_shift
+    let t_offset = em.offsets[t];
+    let t_width = em.steps[t].schema.columns.len();
+
+    let mut probe_keys: Vec<Expr> = Vec::new();
+    let mut build_keys: Vec<Expr> = Vec::new();
+    let mut key_sql: Vec<String> = Vec::new();
+    let mut residual: Vec<Expr> = Vec::new();
+    let mut residual_sql: Vec<String> = Vec::new();
+
+    for (pi, entry) in em.pool.iter().enumerate() {
+        let tables = match &entry.join_pair {
+            Some(p) => vec![p.lo, p.hi],
+            None => entry.tables.clone(),
+        };
+        let contains_t = tables.contains(&t);
+        let complete = tables.iter().all(|&x| x == t || prefix.contains(&x));
+        let newly = tables.iter().any(|&x| !prefix.contains(&x));
+        if !(complete && contains_t && newly) {
+            continue;
+        }
+        if let Some(pair) = &entry.join_pair {
+            if !build_accumulated {
+                // probe = 累计(位置 = 扁平 - acc_shift),build = t(局部重基)
+                let probe_side = pair_side(pair, prefix_member(&prefix, pair));
+                let build_side = pair_side(pair, t);
+                probe_keys.push(rebase_columns(
+                    plan_expr(probe_side, em.scope_ref)?,
+                    acc_shift,
+                )?);
+                build_keys.push(rebase_columns(
+                    plan_expr(build_side, em.scope_ref)?,
+                    t_offset,
+                )?);
+                key_sql.push(format!("{probe_side} = {build_side}"));
+                applied.insert(pi);
+                continue;
+            }
+            // 交换:probe = t 扫描(局部重基),build = 累计(重基 acc_shift)
+            let probe_side = pair_side(pair, t);
+            let build_side = pair_side(pair, prefix_member(&prefix, pair));
+            probe_keys.push(rebase_columns(
+                plan_expr(probe_side, em.scope_ref)?,
+                t_offset,
+            )?);
+            build_keys.push(rebase_columns(
+                plan_expr(build_side, em.scope_ref)?,
+                acc_shift,
+            )?);
+            key_sql.push(format!("{probe_side} = {build_side}"));
+            applied.insert(pi);
+            continue;
+        }
+        // 非等值/跨多表条件:连接后过滤(组合列序见 remap_for_join)
+        let e = plan_expr(entry.expr, em.scope_ref)?;
+        check_bool(&e, em.input_schema, "join condition")?;
+        let prefix_width = prefix
+            .iter()
+            .map(|&p| em.steps[p].schema.columns.len())
+            .sum();
+        let e = remap_for_join(
+            e,
+            t_offset,
+            t_width,
+            prefix_width,
+            acc_shift,
+            build_accumulated,
+        )?;
+        residual.push(e);
+        residual_sql.push(format!("{}", entry.expr));
+        applied.insert(pi);
+    }
+
+    let prefix_schema: Vec<ColumnDesc> = canonical_flat(em, &prefix)
+        .iter()
+        .map(|&f| em.input_schema[f].clone())
+        .collect();
+    let (probe_exec, build_exec, probe_schema, build_schema, children) = if build_accumulated {
+        let probe = table_scan(&em.steps[t], &em.scan_preds[t], t_offset, em.plan_ctx)?;
+        let build = st.exec.take().expect("accumulated pipeline");
+        let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
+        (
+            probe,
+            build,
+            em.steps[t].schema.columns.clone(),
+            prefix_schema,
+            vec![ExplNode::leaf(scan_label(em, t, base_of(em, t))), expl_prev],
+        )
+    } else {
+        let build = table_scan(&em.steps[t], &em.scan_preds[t], t_offset, em.plan_ctx)?;
+        let probe = st.exec.take().expect("accumulated pipeline");
+        let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
+        (
+            probe,
+            build,
+            prefix_schema,
+            em.steps[t].schema.columns.clone(),
+            vec![expl_prev, ExplNode::leaf(scan_label(em, t, base_of(em, t)))],
+        )
+    };
+
+    let exec: BoxedExecutor = Box::new(HashJoinExec::new(
+        probe_exec,
+        build_exec,
+        probe_schema,
+        build_schema,
+        probe_keys,
+        build_keys,
+        None,
+        combine_and(residual),
+        JoinType::Inner,
+    ));
+    let side = if build_accumulated {
+        "build=accumulated"
+    } else {
+        "build=new"
+    };
+    let mut label = format!("HashJoin inner rows≈{} [{side}]", fmt_est(est_out));
+    if !key_sql.is_empty() {
+        label.push_str(&format!(" on: [{}]", key_sql.join(", ")));
+    }
+    if !residual_sql.is_empty() {
+        label.push_str(&format!(" filter: [{}]", residual_sql.join(" AND ")));
+    }
+    st.expl = Some(ExplNode::with(label, children));
+
+    // 列顺序:交换 = [t] ++ 前缀,否则 = 前缀 ++ [t](集合 = 前缀 ∪ {t});
+    // 与规范序不一致则置换
+    let mut new_cur = if build_accumulated {
+        let mut c = vec![t];
+        c.extend(prefix.iter().copied());
+        c
+    } else {
+        let mut c = prefix.clone();
+        c.push(t);
+        c
+    };
+    let mut canonical = new_cur.clone();
+    canonical.sort_unstable();
+    let mut exec = exec;
+    if new_cur != canonical {
+        exec = permute_to_canonical(exec, &new_cur, em);
+        new_cur = canonical;
+        st.expl = Some(ExplNode::with(
+            "Project (column restore)".to_string(),
+            vec![st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+        ));
+    }
+    st.cur_order = new_cur;
+    // 规范序后,流水线位置 i ↔ 扁平 canonical_flat[0] + i
+    st.col_shift = em.offsets[st.cur_order[0]];
+    st.est_rows = est_out;
+    st.exec = Some(exec);
+    Ok(())
+}
+
+/// LEFT JOIN 发射:探测侧 = 既有流水线(保留行),构建侧 = 新表(不下推谓词,
+/// 见路由注释);延迟的 WHERE 条件与本步完成的池条件在连接后过滤(WHERE 语义;
+/// 不做连接键 —— 键会把不匹配行变成 NULL 补齐而非丢弃)。
+#[allow(clippy::too_many_arguments)]
+fn emit_left_join(
+    st: &mut PipelineState,
+    em: &EmitCtx<'_>,
+    k: usize,
+    deferred: &[(usize, Expr)],
+    left_keys: &[(Vec<Expr>, Vec<Expr>)],
+    left_match: &[Vec<Expr>],
+    applied: &mut std::collections::HashSet<usize>,
+) -> Result<()> {
+    let prefix: Vec<usize> = st.cur_order.clone();
+    let probe_schema: Vec<ColumnDesc> = canonical_flat(em, &prefix)
+        .iter()
+        .map(|&f| em.input_schema[f].clone())
+        .collect();
+    let build = table_scan(&em.steps[k], &[], em.offsets[k], em.plan_ctx)?;
+
+    let mut residual: Vec<Expr> = Vec::new();
+    let mut residual_sql: Vec<String> = Vec::new();
+    for (l, e) in deferred {
+        if *l == k {
+            residual.push(e.clone());
+        }
+    }
+    for (pi, entry) in em.pool.iter().enumerate() {
+        let complete = entry.tables.iter().all(|&x| x == k || prefix.contains(&x));
+        let newly = entry.tables.iter().any(|&x| !prefix.contains(&x));
+        if !(complete && newly && entry.tables.contains(&k)) {
+            continue;
+        }
+        let e = plan_expr(entry.expr, em.scope_ref)?;
+        check_bool(&e, em.input_schema, "WHERE")?;
+        residual.push(e);
+        residual_sql.push(format!("{}", entry.expr));
+        applied.insert(pi);
+    }
+
+    let (pk, bk) = left_keys[k].clone();
+    let probe_est = st.est_rows;
+    let exec: BoxedExecutor = Box::new(HashJoinExec::new(
+        st.exec.take().expect("accumulated pipeline"),
+        build,
+        probe_schema,
+        em.steps[k].schema.columns.clone(),
+        pk,
+        bk,
+        combine_and(left_match[k].clone()),
+        combine_and(residual),
+        JoinType::LeftOuter,
+    ));
+    let mut label = format!("HashJoin left rows≈{}", fmt_est(probe_est));
+    if !left_keys[k].0.is_empty() {
+        label.push_str(&format!(" ({} key cols)", left_keys[k].0.len()));
+    }
+    if !residual_sql.is_empty() {
+        label.push_str(&format!(" filter: [{}]", residual_sql.join(" AND ")));
+    }
+    st.expl = Some(ExplNode::with(
+        label,
+        vec![st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+    ));
+    st.cur_order.push(k); // FROM 序追加,天然规范(集合含表 0 → 全扁平)
+    st.col_shift = 0;
+    st.exec = Some(exec);
+    Ok(())
+}
+
+/// 连接后组合列的扁平下标重映射。
+///
+/// - 正常(build = 新表):组合列序 = 累计规范序 ++ t 局部;
+///   累计部分位置 = 扁平 - acc_shift,t 部分位置 = prefix_width + 扁平 - t_offset。
+/// - 交换(build = 累计):组合列序 = t 局部 ++ 累计规范序;
+///   t 部分 = 扁平 - t_offset,累计部分 = t_width + 扁平 - acc_shift。
+fn remap_for_join(
+    e: Expr,
+    t_offset: usize,
+    t_width: usize,
+    prefix_width: usize,
+    acc_shift: usize,
+    swapped: bool,
+) -> Result<Expr> {
+    match e {
+        Expr::Column(f) => {
+            let in_t = f >= t_offset && f < t_offset + t_width;
+            if swapped {
+                if in_t {
+                    Ok(Expr::Column(f - t_offset))
+                } else {
+                    Ok(Expr::Column(t_width + f - acc_shift))
+                }
+            } else if in_t {
+                Ok(Expr::Column(prefix_width + f - t_offset))
+            } else {
+                Ok(Expr::Column(f - acc_shift))
+            }
+        }
+        Expr::Binary { op, left, right } => Ok(Expr::binary(
+            op,
+            remap_for_join(*left, t_offset, t_width, prefix_width, acc_shift, swapped)?,
+            remap_for_join(*right, t_offset, t_width, prefix_width, acc_shift, swapped)?,
+        )),
+        Expr::Function { name, args } => Ok(Expr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| remap_for_join(a, t_offset, t_width, prefix_width, acc_shift, swapped))
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
+            expr: Box::new(remap_for_join(
+                *expr,
+                t_offset,
+                t_width,
+                prefix_width,
+                acc_shift,
+                swapped,
+            )?),
+            negated,
+        }),
+        other => Ok(other),
+    }
 }
 
 // ---------- FROM / JOIN 规划 ----------
@@ -874,99 +1501,6 @@ fn prefix_offsets(widths: &[usize]) -> Vec<usize> {
         out.push(acc);
     }
     out
-}
-
-/// AND 树拆合取项(嵌套展开;返回原表达式的引用)。
-fn split_conjuncts(e: &SE) -> Vec<&SE> {
-    match e {
-        SE::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            let mut v = split_conjuncts(left);
-            v.extend(split_conjuncts(right));
-            v
-        }
-        other => vec![other],
-    }
-}
-
-/// SQL 表达式引用到的表位置(去重升序);常量表达式返回空。
-fn sql_expr_tables(e: &SE, scope: &Scope) -> Result<Vec<usize>> {
-    let mut out = std::collections::BTreeSet::new();
-    collect_sql_tables(e, scope, &mut out)?;
-    Ok(out.into_iter().collect())
-}
-
-fn collect_sql_tables(
-    e: &SE,
-    scope: &Scope,
-    out: &mut std::collections::BTreeSet<usize>,
-) -> Result<()> {
-    match e {
-        SE::Identifier(ident) => {
-            // 非限定列:命中该列名的全部表(命中多表 → 视为跨表条件)
-            let mut any = false;
-            for (pos, (_, t)) in scope.tables.iter().enumerate() {
-                if find_column(t, &ident.value).is_some() {
-                    out.insert(pos);
-                    any = true;
-                }
-            }
-            if !any {
-                return Err(Error::catalog(format!(
-                    "column '{}' not found",
-                    ident.value
-                )));
-            }
-            Ok(())
-        }
-        SE::CompoundIdentifier(parts) => {
-            let [q, c] = parts.as_slice() else {
-                return Err(Error::not_supported("qualified identifier (>2 parts)"));
-            };
-            let pos = scope
-                .resolve_qualifier(&q.value)
-                .ok_or_else(|| Error::catalog(format!("unknown table alias '{}'", q.value)))?;
-            scope.resolve(Some(&q.value), &c.value)?;
-            out.insert(pos);
-            Ok(())
-        }
-        SE::BinaryOp { left, right, .. } => {
-            collect_sql_tables(left, scope, out)?;
-            collect_sql_tables(right, scope, out)
-        }
-        SE::Nested(inner) => collect_sql_tables(inner, scope, out),
-        SE::UnaryOp { expr, .. } => collect_sql_tables(expr, scope, out),
-        SE::Function(f) => {
-            for a in function_call_args(f)? {
-                collect_sql_tables(&a, scope, out)?;
-            }
-            Ok(())
-        }
-        SE::Like { expr, pattern, .. } => {
-            collect_sql_tables(expr, scope, out)?;
-            collect_sql_tables(pattern, scope, out)
-        }
-        SE::Extract { expr, .. } => collect_sql_tables(expr, scope, out),
-        SE::Substring {
-            expr,
-            substring_from,
-            substring_for,
-            ..
-        } => {
-            collect_sql_tables(expr, scope, out)?;
-            if let Some(f) = substring_from {
-                collect_sql_tables(f, scope, out)?;
-            }
-            if let Some(f) = substring_for {
-                collect_sql_tables(f, scope, out)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()), // 字面量 / 类型化字符串 / INTERVAL 等常量
-    }
 }
 
 /// 尝试把 `a = b` 形态的条件转成哈希连接键:两侧各只引用一张表 {i}/{j}
@@ -1823,7 +2357,7 @@ fn literal_string(v: &Value) -> Option<String> {
     }
 }
 
-fn value_to_scalar(v: &Value) -> Result<ScalarValue> {
+pub(crate) fn value_to_scalar(v: &Value) -> Result<ScalarValue> {
     match v {
         Value::Number(text, _long) => {
             if let Ok(i) = text.parse::<i64>() {

@@ -15,6 +15,7 @@ use catalog::{CatalogStore, InMemoryCatalog};
 use common::config::Config;
 use common::error::{Error, Result};
 use common::schema::{ColumnDesc, Row, TableSchema};
+use common::stats::TableStats;
 use common::types::ScalarValue;
 use exec::chunk::DataChunk;
 use exec::executor::ExecuteContext;
@@ -81,12 +82,78 @@ impl TxnBuffer {
     }
 }
 
+/// 表统计存储:table_id → 统计(内存缓存 + LSM 持久化)。
+/// 规划期经 `QueryDataSource::table_stats` 访问;缺失/过期时自动 ANALYZE。
+#[derive(Default)]
+pub(crate) struct StatsStore {
+    by_table: Mutex<std::collections::BTreeMap<u64, Arc<TableStats>>>,
+}
+
+impl StatsStore {
+    fn get(&self, id: u64) -> Option<Arc<TableStats>> {
+        self.by_table.lock().get(&id).cloned()
+    }
+
+    fn insert(&self, id: u64, stats: Arc<TableStats>) {
+        self.by_table.lock().insert(id, stats);
+    }
+
+    fn remove(&self, id: u64) {
+        self.by_table.lock().remove(&id);
+    }
+
+    /// 原地更新并返回更新后的快照(Arc::make_mut,共享时克隆-替换)。
+    fn update<F: FnOnce(&mut TableStats)>(&self, id: u64, f: F) -> Option<Arc<TableStats>> {
+        let mut map = self.by_table.lock();
+        let arc = map.get_mut(&id)?;
+        let stats = Arc::make_mut(arc);
+        f(stats);
+        Some(arc.clone())
+    }
+}
+
+/// 全量(或抽样)扫描重建统计(自动 ANALYZE 与 ANALYZE 语句共用)。
+/// 抽样目标 100 万行:超过时按等步长抽样,NDV 为样本下界估计。
+const ANALYZE_SAMPLE_ROWS: usize = 1 << 20;
+
+fn compute_table_stats(lsm: &Arc<LsmStore>, table: &TableSchema) -> TableStats {
+    let (from, to) = row_range(table.id);
+    let Ok(entries) = lsm.scan(&from, &to) else {
+        return TableStats::default();
+    };
+    let rows: Vec<Row> = entries
+        .into_iter()
+        .filter_map(|(_, _seq, v)| v)
+        .map(|bytes| {
+            let mut slice = bytes.as_slice();
+            let mut row = common::codec::decode_row(&mut slice)?;
+            // schema 前缀兼容
+            if row.len() < table.columns.len() {
+                row.resize(table.columns.len(), ScalarValue::Null);
+            } else if row.len() > table.columns.len() {
+                row.truncate(table.columns.len());
+            }
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>>>()
+        .unwrap_or_default();
+    common::stats::compute_from_rows(table, &rows, ANALYZE_SAMPLE_ROWS)
+}
+
+fn persist_stats(lsm: &Arc<LsmStore>, table: &TableSchema, stats: &TableStats) {
+    if let Err(e) = lsm.put(&storage::table::stats_key(&table.name), &stats.encode()) {
+        warn!(table = %table.name, error = %e, "stats persist failed");
+    }
+}
+
 /// LSM 表数据源:整表物化(v1 简化;流式/谓词下推见路线图)。
-/// 携带语句级快照(read_ts)与事务缓冲 overlay(写缓冲可见、删缓冲隐藏)。
+/// 携带语句级快照(read_ts)与事务缓冲 overlay(写缓冲可见、删缓冲隐藏),
+/// 以及表统计(规划期访问,缺失/过期时自动 ANALYZE)。
 struct LsmDataSource {
     lsm: Arc<LsmStore>,
     read_ts: u64,
     overlay: Arc<std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    stats: Arc<StatsStore>,
 }
 
 impl QueryDataSource for LsmDataSource {
@@ -118,6 +185,19 @@ impl QueryDataSource for LsmDataSource {
             })
             .collect()
     }
+
+    fn table_stats(&self, table: &TableSchema) -> Option<Arc<TableStats>> {
+        if let Some(s) = self.stats.get(table.id) {
+            if !s.needs_analyze() {
+                return Some(s);
+            }
+        }
+        // 自动 ANALYZE:全量(或抽样)重建 + 持久化
+        let fresh = Arc::new(compute_table_stats(&self.lsm, table));
+        self.stats.insert(table.id, fresh.clone());
+        persist_stats(&self.lsm, table, &fresh);
+        Some(fresh)
+    }
 }
 
 /// 引擎持有的活跃快照(GC 水位 = 最小活跃快照);语句结束自动注销。
@@ -147,6 +227,7 @@ pub struct Engine {
     catalog: Arc<InMemoryCatalog>,
     lsm: Arc<LsmStore>,
     columnar: Arc<InMemoryColumnarReplica>,
+    stats: Arc<StatsStore>,
     active_snapshots: Mutex<BTreeSet<u64>>,
     /// 提交锁:唯一性探测与写盘在同一把锁下串行,消除 check-then-write 竞争
     commit_lock: Mutex<()>,
@@ -164,11 +245,22 @@ impl Engine {
         let lsm = LsmStore::open(&config.storage.data_dir, opts, &memory.root())?;
 
         // 从目录区恢复表 schema(值 = serde_json 编码的 TableSchema)
+        // 与表统计(键带 0x01 标记;统计键排在 catalog 键之前 → 两阶段:
+        // 先收集,待 schema 全部恢复后再挂到表上)
         let catalog = Arc::new(InMemoryCatalog::new());
+        let stats = Arc::new(StatsStore::default());
         let (cfrom, cto) = catalog_range();
         let mut restored = 0u64;
+        let mut pending_stats: Vec<(String, Vec<u8>)> = Vec::new();
         for (key, _seq, value) in lsm.scan(&cfrom, &cto)? {
             let Some(bytes) = value else { continue };
+            if key.len() > 8 && key[8] == common::stats::STATS_MARKER {
+                let Ok(name) = storage::table::stats_name(&key) else {
+                    continue;
+                };
+                pending_stats.push((name.to_string(), bytes));
+                continue;
+            }
             let name = storage::table::catalog_name(&key)?.to_string();
             let Some(schema) = decode_schema(&bytes) else {
                 warn!(table = %name, "undecodable catalog entry skipped");
@@ -177,8 +269,21 @@ impl Engine {
             catalog.create_table(schema)?;
             restored += 1;
         }
+        let mut restored_stats = 0usize;
+        for (name, bytes) in pending_stats {
+            let Some(schema) = catalog.get_table(&name) else {
+                continue; // 统计键无对应表(残留)→ 丢弃
+            };
+            if let Some(s) = TableStats::decode(&bytes) {
+                stats.insert(schema.id, Arc::new(s));
+                restored_stats += 1;
+            }
+        }
         if restored > 0 {
             info!(tables = restored, "catalog restored from lsm");
+        }
+        if restored_stats > 0 {
+            info!(tables = restored_stats, "table stats restored from lsm");
         }
 
         let columnar = Arc::new(InMemoryColumnarReplica::new());
@@ -188,6 +293,7 @@ impl Engine {
             catalog,
             lsm,
             columnar,
+            stats,
             active_snapshots: Mutex::new(BTreeSet::new()),
             commit_lock: Mutex::new(()),
             _restored_tables: AtomicU64::new(restored),
@@ -242,6 +348,7 @@ impl Engine {
             lsm: self.lsm.clone(),
             read_ts,
             overlay,
+            stats: self.stats.clone(),
         })
     }
 
@@ -277,6 +384,34 @@ impl Engine {
     /// 手动转储:冻结 memtable 写成 L0 SST,重置 WAL。返回是否发生了 flush。
     pub fn flush(&self) -> Result<bool> {
         self.lsm.flush()
+    }
+
+    /// ANALYZE [TABLE]:全量(或抽样)重建表统计并持久化。
+    /// name 为 None 时分析全部表。
+    pub fn analyze_table(&self, name: Option<&str>) -> Result<Outcome> {
+        let targets: Vec<TableSchema> = match name {
+            Some(n) => vec![
+                self.catalog
+                    .get_table(n)
+                    .ok_or_else(|| Error::catalog(format!("table '{n}' not found")))?,
+            ],
+            None => self.catalog.list_tables(),
+        };
+        for table in &targets {
+            let fresh = Arc::new(compute_table_stats(&self.lsm, table));
+            self.stats.insert(table.id, fresh.clone());
+            persist_stats(&self.lsm, table, &fresh);
+            info!(table = %table.name, stats = %fresh, "analyzed");
+        }
+        Ok(Outcome::Tag {
+            prefix: "ANALYZE".into(),
+            rows: None,
+        })
+    }
+
+    /// 表统计只读访问(测试/诊断用)。
+    pub fn table_stats(&self, table_id: u64) -> Option<Arc<TableStats>> {
+        self.stats.get(table_id)
     }
 
     /// 存储概要(memtable 用量 / 各层文件数)。
@@ -353,6 +488,14 @@ impl Engine {
             } => self.exec_update(sctx, table, assignments, predicate),
             StatementPlan::Delete { table, predicate } => self.exec_delete(sctx, table, predicate),
             StatementPlan::CreateTable { schema } => self.exec_create_table(schema),
+            StatementPlan::Analyze { name } => self.analyze_table(name.as_deref()),
+            StatementPlan::Explain { schema, lines } => Ok(Outcome::Query {
+                schema,
+                rows: lines
+                    .into_iter()
+                    .map(|l| vec![ScalarValue::Utf8(l)])
+                    .collect(),
+            }),
             StatementPlan::AlterAddColumn {
                 name,
                 column,
@@ -561,6 +704,15 @@ impl Engine {
             &unique_encs,
             &Default::default(),
         )?;
+        // 统计增量(autocommit;事务路径由 commit_txn 统一标记过期)
+        if txn.is_none() {
+            let updated = self
+                .stats
+                .update(table.id, |s| s.record_insert(&table, &rows));
+            if let Some(s) = updated {
+                persist_stats(&self.lsm, &table, &s);
+            }
+        }
         debug!(table = %table.name, rows = rows.len(), base_seq = base, "inserted");
         Ok(Outcome::Tag {
             prefix: "INSERT 0".into(),
@@ -719,6 +871,18 @@ impl Engine {
             &unique_encs,
             &tombstones,
         )?;
+        // 统计增量:被赋值列的 min/max 扩张(autocommit)
+        if sctx.txn.is_none() {
+            let updated = self.stats.update(table.id, |s| {
+                for (pos, &(col_idx, _)) in assignments.iter().enumerate() {
+                    let vals = (0..selection.len()).map(|i| new_cols[pos].scalar_at(i));
+                    s.widen_column(&table.columns[col_idx].name, vals);
+                }
+            });
+            if let Some(s) = updated {
+                persist_stats(&self.lsm, &table, &s);
+            }
+        }
         debug!(table = %table.name, count = selection.len(), "updated");
         Ok(Outcome::Tag {
             prefix: "UPDATE".into(),
@@ -776,6 +940,15 @@ impl Engine {
             &empty_unique,
             &tombstones,
         )?;
+        // 统计增量:行数下调(autocommit;事务路径由 commit_txn 标记过期)
+        if sctx.txn.is_none() {
+            let updated = self
+                .stats
+                .update(table.id, |s| s.record_delete(selection.len() as u64));
+            if let Some(s) = updated {
+                persist_stats(&self.lsm, &table, &s);
+            }
+        }
         debug!(table = %table.name, count = selection.len(), "deleted");
         Ok(Outcome::Tag {
             prefix: "DELETE".into(),
@@ -878,7 +1051,7 @@ impl Engine {
 
     fn exec_drop_table(&self, name: &str) -> Result<Outcome> {
         let dropped = self.catalog.drop_table(name)?;
-        // 数据打墓碑 + 目录项删除,一并进一个写批
+        // 数据打墓碑 + 目录项删除 + 统计键删除,一并进一个写批
         let (from, to) = row_range(dropped.id);
         let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
             .lsm
@@ -887,7 +1060,9 @@ impl Engine {
             .map(|(key, _, _)| (key, None))
             .collect();
         batch.push((catalog_key(name), None));
+        batch.push((storage::table::stats_key(name), None));
         self.lsm.write_batch(&batch)?;
+        self.stats.remove(dropped.id);
         self.columnar.drop_table(common::ids::TableId(dropped.id))?;
         info!(table = name, "table dropped");
         Ok(Outcome::Tag {
@@ -945,6 +1120,19 @@ impl Engine {
             .map(|(_, k, v)| (k.clone(), v.clone()))
             .collect();
         self.lsm.write_batch(&entries)?;
+        // 统计:事务提交无法区分插入/更新对行数的影响 → 整体标记过期,
+        // 规划期自动重算(持久化标记,重启后仍生效)
+        let mut touched: std::collections::BTreeMap<u64, Arc<TableSchema>> = Default::default();
+        for (table, key, _) in &writes {
+            if key.len() == 16 {
+                touched.insert(table.id, table.clone());
+            }
+        }
+        for (id, table) in &touched {
+            if let Some(s) = self.stats.update(*id, |s| s.stale = true) {
+                persist_stats(&self.lsm, table, &s);
+            }
+        }
         for (table, key, value) in writes {
             if key.len() != 16 {
                 continue; // 索引条目不镜像列存

@@ -129,38 +129,9 @@ fn type_err(desc: &AggDesc, got: &ScalarValue) -> Error {
     ))
 }
 
-/// 标量值全序比较(同类型):Float64 用 total_cmp(NaN 排最大,PG 语义);
-/// Binary 按字节序;List 逐元素比较(短者在前,NULL 在最前);
-/// Vector 不可比较。SortExec 与聚合极值共用。
+/// 标量值全序比较(委托 common::types,SortExec 与聚合极值共用)。
 pub fn compare_values(l: &ScalarValue, r: &ScalarValue) -> Result<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-    match (l, r) {
-        (ScalarValue::Boolean(a), ScalarValue::Boolean(b)) => Ok(a.cmp(b)),
-        (ScalarValue::Int64(a), ScalarValue::Int64(b)) => Ok(a.cmp(b)),
-        (ScalarValue::Float64(a), ScalarValue::Float64(b)) => Ok(a.total_cmp(b)),
-        (ScalarValue::Utf8(a), ScalarValue::Utf8(b)) => Ok(a.cmp(b)),
-        (ScalarValue::Date(a), ScalarValue::Date(b)) => Ok(a.cmp(b)),
-        (ScalarValue::Binary(a), ScalarValue::Binary(b)) => Ok(a.cmp(b)),
-        (ScalarValue::List(a), ScalarValue::List(b)) => {
-            for (x, y) in a.iter().zip(b.iter()) {
-                let ord = match (x.is_null(), y.is_null()) {
-                    (true, true) => Ordering::Equal,
-                    (true, false) => Ordering::Less,
-                    (false, true) => Ordering::Greater,
-                    (false, false) => compare_values(x, y)?,
-                };
-                if ord != Ordering::Equal {
-                    return Ok(ord);
-                }
-            }
-            Ok(a.len().cmp(&b.len()))
-        }
-        _ => Err(Error::sql(format!(
-            "cannot compare {:?} with {:?}",
-            l.data_type(),
-            r.data_type()
-        ))),
-    }
+    common::types::compare_values(l, r)
 }
 
 pub struct AggHashExec {

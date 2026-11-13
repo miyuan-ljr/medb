@@ -292,6 +292,51 @@ impl std::fmt::Display for ScalarValue {
     }
 }
 
+/// 标量值全序比较(同类型):Float64 用 total_cmp(NaN 排最大,PG 语义);
+/// Date 按天数;Binary 按字节序;List 逐元素比较(短者在前,NULL 在最前);
+/// Vector 不可比较。SortExec、聚合极值与统计边界共用。
+pub fn compare_values(l: &ScalarValue, r: &ScalarValue) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    match (l, r) {
+        (ScalarValue::Boolean(a), ScalarValue::Boolean(b)) => Ok(a.cmp(b)),
+        (ScalarValue::Int64(a), ScalarValue::Int64(b)) => Ok(a.cmp(b)),
+        (ScalarValue::Float64(a), ScalarValue::Float64(b)) => Ok(a.total_cmp(b)),
+        (ScalarValue::Date(a), ScalarValue::Date(b)) => Ok(a.cmp(b)),
+        (ScalarValue::Utf8(a), ScalarValue::Utf8(b)) => Ok(a.cmp(b)),
+        (ScalarValue::Binary(a), ScalarValue::Binary(b)) => Ok(a.cmp(b)),
+        (ScalarValue::List(a), ScalarValue::List(b)) => {
+            for (x, y) in a.iter().zip(b.iter()) {
+                let ord = match (x.is_null(), y.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) => compare_values(x, y)?,
+                };
+                if ord != Ordering::Equal {
+                    return Ok(ord);
+                }
+            }
+            Ok(a.len().cmp(&b.len()))
+        }
+        _ => Err(Error::sql(format!(
+            "cannot compare {:?} with {:?}",
+            l.data_type(),
+            r.data_type()
+        ))),
+    }
+}
+
+/// 标量值 → f64(范围选择性插值用);不可转的返回 None。
+pub fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
+    match v {
+        ScalarValue::Int64(x) => Some(*x as f64),
+        ScalarValue::Float64(x) => Some(*x),
+        ScalarValue::Date(d) => Some(*d as f64),
+        ScalarValue::Boolean(b) => Some(i64::from(*b) as f64),
+        _ => None,
+    }
+}
+
 /// PG 数组文本格式:`{1,2,NULL}`,字符串元素含特殊字符时加引号转义。
 fn format_array(items: &[ScalarValue]) -> String {
     let mut out = String::from("{");

@@ -89,7 +89,7 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 ## 当前进度与路线图
 
-已完成(全部带测试,workspace 187 个测试):
+已完成(全部带测试,workspace 203 个测试):
 
 - 内存机制三层(mimalloc / 配额树 / arena)
 - LSM 完整闭环:WAL 恢复、SST 读写、flush、压缩、墓碑、并发单写者、序列水位恢复、
@@ -119,6 +119,18 @@ postgres=# DELETE FROM users WHERE id = 1;
   - **DECIMAL/NUMERIC → Float64**(无精确小数,v1 简化)
   - 字符串/数值函数:UPPER/LOWER/LENGTH/TRIM/REVERSE/CONCAT/COALESCE/IFNULL/NULLIF/
     ABS/ROUND/FLOOR/CEIL/SQRT/MOD/POWER/**SUBSTRING**
+- **代价优化器与统计信息(`sql::optimizer`,`server/tests/optimizer.rs`)**:
+  - **表统计**(`common::stats`):row_count 精确增量(INSERT/DELETE 记账)、
+    列 NDV / NULL 计数 / min-max 边界;ANALYZE [TABLE] 全量(>100 万行抽样)重建;
+    规划期发现缺失/过期自动 ANALYZE 并持久化(重启恢复)
+  - **选择性估算**:等值 1/NDV、范围按 min/max 线性插值、LIKE 启发式、
+    IS NULL 按 NULL 分数;连接基数 = 积 × 1/max(键 NDV)
+  - **连接顺序枚举**:≤10 表子集 DP(代价 = 读取 + 物化侧哈希表 + 输出),
+    每步选小侧物化(必要时交换 probe/build 并投影还原列序);>10 表贪心;
+    LEFT JOIN 为重排屏障(语义正确性优先)
+  - **EXPLAIN <SELECT>**:统计驱动的计划树(扫描估行/下推过滤/连接键/物化侧)
+  - 顺带修正:LEFT JOIN 空产侧谓词此前被错误下推(会改变 NULL 补齐语义),
+    统一路由后按"位置 ≥ 自身的 LEFT 步骤挡住下推"处理
 
 路线图(按依赖排序):
 
@@ -128,7 +140,8 @@ postgres=# DELETE FROM users WHERE id = 1;
   列存 segment 文件(字典/RLE 编码)+ 后台 compaction
 - **M2/M4/M5**:RIGHT/FULL JOIN、TPC-H 数据加载(dbgen tbl 导入)、
   extended query protocol(psql \d)、块缓存、
-  分级压缩、manifest 落盘、流式归并扫描、系统视图、DISTINCT/子查询/CASE WHEN
+  分级压缩、manifest 落盘、流式归并扫描、系统视图、DISTINCT/子查询/CASE WHEN、
+  直方图/多列统计、连接代价标定(benchmark)
 
 ## 已知简化(读代码前先看)
 
@@ -139,7 +152,8 @@ postgres=# DELETE FROM users WHERE id = 1;
 - extended query protocol 未接(psql 交互查询走 simple 协议不受影响)。
 - 事务无写冲突检测(后提交者覆盖,RC 语义下允许);无保存点;DDL 不能在事务内。
 - ORDER BY / 聚合为全量物化后排序(无外部排序/top-N 堆优化)。
-- HashJoin 构建侧整批物化;无连接顺序优化(按 FROM 顺序左深);无统计信息。
+- HashJoin 构建侧整批物化;代价模型未标定(权重为启发值);统计为
+  单列 NDV/min-max(无直方图、无相关性);NDV 写路径不增量(靠 ANALYZE)。
 - DECIMAL 收敛为 Float64(TPC-H 数值列够用,精确小数见路线图)。
 - CASE WHEN 暂不支持(sqlparser 0.64 语句化模型,待单独支持)。
 

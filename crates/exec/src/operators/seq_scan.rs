@@ -18,6 +18,13 @@ use crate::executor::{ExecuteContext, Executor};
 pub trait QueryDataSource: Send + Sync {
     /// 按 schema 拉取整表行(行内值类型应与 schema 一致)。
     fn scan_table(&self, table: &TableSchema) -> Result<Vec<Row>>;
+
+    /// 计划期表统计(代价优化器输入)。缺失/过期时实现方可以自动 ANALYZE;
+    /// 返回 None 表示无统计(计划器用默认基数估算)。
+    fn table_stats(&self, table: &TableSchema) -> Option<Arc<common::stats::TableStats>> {
+        let _ = table;
+        None
+    }
 }
 
 pub struct SeqScanExec {

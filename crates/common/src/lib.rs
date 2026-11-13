@@ -7,5 +7,6 @@ pub mod config;
 pub mod error;
 pub mod ids;
 pub mod schema;
+pub mod stats;
 pub mod types;
 pub mod util;

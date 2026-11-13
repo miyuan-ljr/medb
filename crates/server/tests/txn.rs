@@ -151,13 +151,16 @@ fn flush_tables_creates_sst_and_keeps_data() {
         true
     );
 
-    // 数据仍可读(来自 SST),再次 FLUSH 无脏数据 → FLUSH OK
+    // 数据仍可读(来自 SST);再次 FLUSH:通常无脏数据(FLUSH OK),
+    // 但查询计划可能触发自动 ANALYZE(统计持久化)产生脏数据 → FLUSH 也合法
     let outcomes = sess.execute_script("SELECT * FROM t ORDER BY id").unwrap();
     assert_eq!(rows_text(outcomes), vec![vec![s(1)], vec![s(2)]]);
     let outcomes = sess.execute_script("FLUSH TABLES").unwrap();
     match &outcomes[0] {
-        Outcome::Tag { prefix, .. } => assert_eq!(prefix, "FLUSH OK"),
-        other => panic!("expected flush-ok tag, got {other:?}"),
+        Outcome::Tag { prefix, .. } => {
+            assert!(prefix == "FLUSH OK" || prefix == "FLUSH", "got {prefix}");
+        }
+        other => panic!("expected flush tag, got {other:?}"),
     }
     // 继续写入照常
     sess.execute_script("INSERT INTO t VALUES (3)").unwrap();
