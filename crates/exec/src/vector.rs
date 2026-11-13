@@ -94,6 +94,8 @@ pub enum ColumnData {
     Bool(Vec<bool>),
     Int64(Vec<i64>),
     Float64(Vec<f64>),
+    /// 日期:距 1970-01-01 的天数。
+    Date(Vec<i32>),
     /// offsets.len() == len + 1,data ≤ 4GiB(u32 偏移)。
     Utf8 {
         data: Vec<u8>,
@@ -119,6 +121,7 @@ impl ColumnData {
             ColumnData::Bool(_) => DataType::Boolean,
             ColumnData::Int64(_) => DataType::Int64,
             ColumnData::Float64(_) => DataType::Float64,
+            ColumnData::Date(_) => DataType::Date,
             ColumnData::Utf8 { .. } => DataType::Utf8,
             ColumnData::Binary(_) => DataType::Binary,
             ColumnData::List { elem, .. } => DataType::Array(elem.clone()),
@@ -131,6 +134,7 @@ impl ColumnData {
             ColumnData::Bool(v) => v.len(),
             ColumnData::Int64(v) => v.len(),
             ColumnData::Float64(v) => v.len(),
+            ColumnData::Date(v) => v.len(),
             ColumnData::Utf8 { offsets, .. } => offsets.len().saturating_sub(1),
             ColumnData::Binary(v) => v.len(),
             ColumnData::List { values, .. } => values.len(),
@@ -148,6 +152,7 @@ impl ColumnData {
             ColumnData::Bool(v) => v.len(),
             ColumnData::Int64(v) => v.len() * 8,
             ColumnData::Float64(v) => v.len() * 8,
+            ColumnData::Date(v) => v.len() * 4,
             ColumnData::Utf8 { data, offsets } => data.len() + offsets.len() * 4,
             ColumnData::Binary(v) => v.iter().map(|b| b.len() + 8).sum(),
             ColumnData::List { values, .. } => values
@@ -173,6 +178,7 @@ pub enum Datum<'a> {
     Bool(bool),
     Int64(i64),
     Float64(f64),
+    Date(i32),
     Utf8(&'a str),
     Binary(&'a [u8]),
     List(&'a [ScalarValue]),
@@ -186,6 +192,7 @@ impl Datum<'_> {
             Datum::Bool(b) => ScalarValue::Boolean(*b),
             Datum::Int64(v) => ScalarValue::Int64(*v),
             Datum::Float64(v) => ScalarValue::Float64(*v),
+            Datum::Date(d) => ScalarValue::Date(*d),
             Datum::Utf8(s) => ScalarValue::Utf8(s.to_string()),
             Datum::Binary(b) => ScalarValue::Binary(b.to_vec()),
             Datum::List(items) => ScalarValue::List(items.to_vec()),
@@ -264,6 +271,7 @@ impl Vector {
             DataType::Boolean => ColumnData::Bool(vec![false; len]),
             DataType::Int64 => ColumnData::Int64(vec![0; len]),
             DataType::Float64 => ColumnData::Float64(vec![0.0; len]),
+            DataType::Date => ColumnData::Date(vec![0; len]),
             DataType::Utf8 => ColumnData::Utf8 {
                 data: Vec::new(),
                 offsets: vec![0; len + 1],
@@ -331,6 +339,16 @@ impl Vector {
                         ScalarValue::Float64(f) => *f,
                         ScalarValue::Null => 0.0,
                         other => panic!("expected float64 value, got {other:?}"),
+                    })
+                    .collect(),
+            ),
+            DataType::Date => ColumnData::Date(
+                values
+                    .iter()
+                    .map(|v| match v {
+                        ScalarValue::Date(d) => *d,
+                        ScalarValue::Null => 0,
+                        other => panic!("expected date value, got {other:?}"),
                     })
                     .collect(),
             ),
@@ -469,6 +487,7 @@ impl Vector {
             ColumnData::Bool(v) => Datum::Bool(v[i]),
             ColumnData::Int64(v) => Datum::Int64(v[i]),
             ColumnData::Float64(v) => Datum::Float64(v[i]),
+            ColumnData::Date(v) => Datum::Date(v[i]),
             ColumnData::Utf8 { data, offsets } => {
                 let start = offsets[i] as usize;
                 let end = offsets[i + 1] as usize;
@@ -552,6 +571,13 @@ impl Vector {
                     .map(|(x, _)| *x)
                     .collect(),
             ),
+            ColumnData::Date(v) => ColumnData::Date(
+                v.iter()
+                    .zip(selection)
+                    .filter(|(_, s)| **s)
+                    .map(|(x, _)| *x)
+                    .collect(),
+            ),
             ColumnData::Utf8 { data: d, offsets } => {
                 let mut out_data = Vec::with_capacity(d.len());
                 let mut out_offsets = Vec::with_capacity(n + 1);
@@ -623,6 +649,7 @@ impl Vector {
             ColumnData::Bool(v) => ColumnData::Bool(v[..n].to_vec()),
             ColumnData::Int64(v) => ColumnData::Int64(v[..n].to_vec()),
             ColumnData::Float64(v) => ColumnData::Float64(v[..n].to_vec()),
+            ColumnData::Date(v) => ColumnData::Date(v[..n].to_vec()),
             ColumnData::Utf8 { data, offsets } => ColumnData::Utf8 {
                 data: data[offsets[0] as usize..offsets[n] as usize].to_vec(),
                 offsets: offsets[..=n].iter().map(|o| o - offsets[0]).collect(),

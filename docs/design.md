@@ -106,12 +106,55 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
   算术 checked(溢出报错)、比较三值 null 传播、And/Or 暂按 false。
 - 算子:pull 式 `next_batch(ctx)`;`Ok(None)` 终止。混合类型算术按侧提升
   (v0 曾对已提升侧重复提升 panic)。
-- 计划器:语句级 `StatementPlan`(Query/Insert/Delete/CreateTable/DropTable);
-  查询 = SeqScan|Values → Filter? → Project → Limit;输出 schema 静态推导
+- 计划器:语句级 `StatementPlan`(Query/Insert/InsertSelect/Update/Delete/
+  CreateTable/AlterAddColumn/DropTable);查询流水线见 §4.8;输出 schema 静态推导
   (`Expr::return_type`)。计划器只读 catalog 与 `QueryDataSource` 接口
   (exec 定义、Engine 实现),保持 exec↔storage 解耦。
 - 列解析:先精确后大小写不敏感(PG 未加引号标识符折叠的宽松近似);
-  `t.col` 限定符只接受真实表名。
+  多表场景统一走 `Scope::resolve`(限定/非限定、扁平下标、歧义报错)。
+
+## 4.8 多表 FROM 与 JOIN 计划(TPC-H v1)
+
+以 TPC-H 查询形状为验收标准(`server/tests/tpch.rs`:Q1/Q3/Q6 简化形态)。
+
+- **Scope**:`Vec<(别名, TableSchema)>` 有序表集合。列引用解析成**扁平下标**
+  (表 k 占 `[offsets[k], offsets[k+1])`);非限定列在全部表中必须唯一命中,
+  否则报歧义。别名 = 显式 alias 或表名,重名报错。
+- **FROM 展开**:TableWithJoins 列表 → `Vec<RelationStep>`(第 0 个为驱动表,
+  后续每个 JOIN/逗号连接是一个步骤)。`JOIN`/`INNER JOIN` 同义
+  (sqlparser 0.64 是两个变体);USING/NATURAL 拒绝。
+- **连接执行**:逐表 `SeqScan(+下推过滤)→ HashJoinExec`(probe = 已组合流水线,
+  build = 新表)。等值条件 `a = b` 且两侧各只引用一张表(表达式亦可,如
+  `l_extendedprice*(1-l_discount) = x`)→ 哈希键:probe 侧按扁平下标求值,
+  build 侧列下标重基到表内(`rebase_columns`)。其余条件:
+  - `match_cond`:匹配期逐对判定(LEFT JOIN 下未过条件的左行仍 NULL 补齐
+    —— 若放 residual 会错误地把 NULL 补齐行过滤掉);
+  - `residual`:连接后整批过滤(WHERE 路由下来的条件,作用于含 NULL 补齐行
+    的完整结果 —— 这正是 WHERE 的语义位置)。
+- **WHERE 合取项路由**(按引用表集合):
+  1. 单表且其后无 LEFT 步骤 → 下推该表扫描;
+  2. 单表且其后有 LEFT 步骤(保留侧/空产侧条件)→ 挂该 LEFT 步骤 residual
+     (推扫描会改变 LEFT 语义:空产侧条件下推会把"不匹配"错误变成"匹配后过滤");
+  3. 常量谓词 → 第一张表扫描;
+  4. 跨表 `a = b`(INNER)→ 该步骤哈希键(在 `try_hash_eq` 中与 match_cond
+     共用解析);
+  5. 其余跨表条件 → 挂"引用的最大表位置"步骤 residual(该步之后两侧行都已
+     可见,语义 = WHERE 在 FROM 之后求值)。
+- **聚合走扁平 schema**:AggRewriter/AggHashExec 的输入是组合后的扁平列,
+  GROUP BY / 聚合 / HAVING / ORDER BY 全部用扁平下标,无需感知连接边界。
+- 已知限制:连接顺序按 FROM 书写(左深链),无代价优化;哈希键两侧类型不同时
+  不匹配(标量相等按类型);build 侧整批物化。
+
+## 4.9 DATE / DECIMAL / LIKE(v1 简化)
+
+- **DATE** = 距 1970-01-01 的天数(i32,Hinnant civil_from_days/days_from_civil,
+  有效范围约 ±500 万年)。`DATE 'YYYY-MM-DD'`(sqlparser TypedString)→ 字面量;
+  `d ± INTERVAL 'n' DAY` → Date±Int64 内核;`d1 - d2` → 天数;
+  `EXTRACT(YEAR/MONTH FROM d)` → year()/month() 标量函数;比较走 compare_values。
+  Date 列与裸字符串字面量比较:字符串按目标类型解析(coerce_nonscalar_side)。
+- **DECIMAL/NUMERIC(p,s) → Float64**:无精确小数类型,TPC-H 数值列够用;
+  精确小数是后续独立类型工作。
+- **LIKE / NOT LIKE**:`%`/`_` 带回溯匹配器;`ESCAPE`/`ILIKE` 暂不支持。
 
 ## 4.5 表数据布局与 Engine(M2)
 

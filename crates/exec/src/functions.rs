@@ -13,8 +13,26 @@ use crate::vector::Vector;
 
 /// 支持的标量函数名(小写)。
 pub const SCALAR_FUNCTIONS: &[&str] = &[
-    "upper", "lower", "length", "trim", "reverse", "concat", "coalesce", "ifnull", "nullif", "abs",
-    "round", "floor", "ceil", "ceiling", "sqrt", "mod", "power",
+    "upper",
+    "lower",
+    "length",
+    "trim",
+    "reverse",
+    "concat",
+    "coalesce",
+    "ifnull",
+    "nullif",
+    "abs",
+    "round",
+    "floor",
+    "ceil",
+    "ceiling",
+    "sqrt",
+    "mod",
+    "power",
+    "substring",
+    "year",
+    "month",
 ];
 
 pub fn is_scalar_function(name: &str) -> bool {
@@ -35,6 +53,34 @@ pub fn function_return_type(name: &str, args: &[Option<DataType>]) -> Result<Dat
                 return arity_err("1");
             }
             require_text(name, args[0].clone())
+        }
+        "substring" => {
+            if args.len() != 3 {
+                return arity_err("3 (string, start, length)");
+            }
+            for t in args.iter().take(3) {
+                match t {
+                    Some(DataType::Utf8) | Some(DataType::Int64) | None => {}
+                    Some(t) => {
+                        return Err(Error::sql(format!(
+                            "function substring() got incompatible argument {}",
+                            t.name()
+                        )));
+                    }
+                }
+            }
+            Ok(DataType::Utf8)
+        }
+        "year" | "month" => {
+            if args.len() != 1 {
+                return arity_err("1");
+            }
+            if !matches!(args[0], Some(DataType::Date) | None) {
+                return Err(Error::sql(format!(
+                    "function {name}() requires a DATE argument"
+                )));
+            }
+            Ok(DataType::Int64)
         }
         "length" => {
             if args.len() != 1 {
@@ -134,7 +180,7 @@ pub fn function_return_type(name: &str, args: &[Option<DataType>]) -> Result<Dat
 fn require_text(name: &str, t: Option<DataType>) -> Result<DataType> {
     match t {
         Some(DataType::Utf8) | None => Ok(DataType::Utf8),
-        Some(ref t) => Err(Error::sql(format!(
+        Some(t) => Err(Error::sql(format!(
             "function {name}() requires TEXT argument, got {}",
             t.name()
         ))),
@@ -226,6 +272,35 @@ fn dispatch(name: &str, vals: &[ScalarValue]) -> Result<ScalarValue> {
                 "length" => Ok(ScalarValue::Int64(
                     text_of(&vals[0], name)?.1.chars().count() as i64,
                 )),
+                "substring" => {
+                    // substring(s, start, len):1 基计数;start 可 < 1(按 PG 语义
+                    // 相当于从字符串之前开始,len 相应收缩);len 越过结尾自动截断
+                    let s = text_of(&vals[0], name)?.1;
+                    let ScalarValue::Int64(start) = vals[1] else {
+                        return Err(arg_err(name, &vals[1]));
+                    };
+                    let ScalarValue::Int64(len) = vals[2] else {
+                        return Err(arg_err(name, &vals[2]));
+                    };
+                    if len < 0 {
+                        return Err(Error::sql("substring length must not be negative"));
+                    }
+                    let chars: Vec<char> = s.chars().collect();
+                    let begin = (start - 1).clamp(0, chars.len() as i64) as usize;
+                    let end = (start - 1 + len).clamp(0, chars.len() as i64) as usize;
+                    Ok(ScalarValue::Utf8(chars[begin..end].iter().collect()))
+                }
+                "year" | "month" => match vals[0] {
+                    ScalarValue::Date(d) => {
+                        let (y, m, _dd) = common::types::civil_from_days(d);
+                        Ok(ScalarValue::Int64(if name == "year" {
+                            y as i64
+                        } else {
+                            m as i64
+                        }))
+                    }
+                    ref other => Err(arg_err(name, other)),
+                },
                 "abs" => match vals[0] {
                     ScalarValue::Int64(v) => v
                         .checked_abs()

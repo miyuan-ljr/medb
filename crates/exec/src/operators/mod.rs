@@ -2,6 +2,7 @@
 
 pub mod filter;
 pub mod hash_agg;
+pub mod hash_join;
 pub mod limit;
 pub mod project;
 pub mod seq_scan;

@@ -89,7 +89,7 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 ## 当前进度与路线图
 
-已完成(全部带测试,workspace 148 个测试):
+已完成(全部带测试,workspace 187 个测试):
 
 - 内存机制三层(mimalloc / 配额树 / arena)
 - LSM 完整闭环:WAL 恢复、SST 读写、flush、压缩、墓碑、并发单写者、序列水位恢复、
@@ -105,6 +105,20 @@ postgres=# DELETE FROM users WHERE id = 1;
 - PG 协议端到端:RowDescription/DataRow/CommandComplete/ErrorResponse、
   INSERT 0 n / UPDATE n / DELETE n / CREATE TABLE / BEGIN / COMMIT 命令标签
 - 列存副本 trait + 内存实现(CDC upsert/delete/drop_table/scan_column)
+- **TPC-H 基础(以 TPC-H 形状为验收标准,`server/tests/tpch.rs`)**:
+  - **多表 FROM + JOIN 计划**:FROM 展开为有序关系步骤(逗号连接 = CROSS JOIN),
+    每步 `SeqScan(下推过滤)→ HashJoin`;等值条件两侧各引一表 → 哈希键(probe 侧扁平下标、
+    build 侧重基到表内),非等值/跨多表条件 → 匹配期 match_cond / 连接后 residual;
+    WHERE 合取项按引用表路由(单表下推、跨表挂步骤、LEFT 保留侧延后)
+  - **HashJoinExec**:inner + left outer;NULL 键不匹配;LEFT 未命中补 NULL,
+    ON 非等值残余在匹配期判定(未过条件的左行仍 NULL 补齐)
+  - **DATE 类型**:i32 天数(1970-01-01 起),`DATE 'YYYY-MM-DD'` 字面量、日期比较
+    (含字符串字面量隐式解析)、`± INTERVAL 'n' DAY`、`EXTRACT(YEAR/MONTH)`、
+    PG DATE 线协议类型
+  - **LIKE / NOT LIKE**:带回溯的 `%`/`_` 匹配器
+  - **DECIMAL/NUMERIC → Float64**(无精确小数,v1 简化)
+  - 字符串/数值函数:UPPER/LOWER/LENGTH/TRIM/REVERSE/CONCAT/COALESCE/IFNULL/NULLIF/
+    ABS/ROUND/FLOOR/CEIL/SQRT/MOD/POWER/**SUBSTRING**
 
 路线图(按依赖排序):
 
@@ -112,8 +126,9 @@ postgres=# DELETE FROM users WHERE id = 1;
   隔离级别提升(快照隔离)
 - **M3 HTAP 落地**:AP 扫描走列存副本(行/列双跑一致性对照);
   列存 segment 文件(字典/RLE 编码)+ 后台 compaction
-- **M2/M4/M5**:JOIN、extended query protocol(psql \d)、块缓存、
-  分级压缩、manifest 落盘、流式归并扫描、系统视图
+- **M2/M4/M5**:RIGHT/FULL JOIN、TPC-H 数据加载(dbgen tbl 导入)、
+  extended query protocol(psql \d)、块缓存、
+  分级压缩、manifest 落盘、流式归并扫描、系统视图、DISTINCT/子查询/CASE WHEN
 
 ## 已知简化(读代码前先看)
 
@@ -124,6 +139,9 @@ postgres=# DELETE FROM users WHERE id = 1;
 - extended query protocol 未接(psql 交互查询走 simple 协议不受影响)。
 - 事务无写冲突检测(后提交者覆盖,RC 语义下允许);无保存点;DDL 不能在事务内。
 - ORDER BY / 聚合为全量物化后排序(无外部排序/top-N 堆优化)。
+- HashJoin 构建侧整批物化;无连接顺序优化(按 FROM 顺序左深);无统计信息。
+- DECIMAL 收敛为 Float64(TPC-H 数值列够用,精确小数见路线图)。
+- CASE WHEN 暂不支持(sqlparser 0.64 语句化模型,待单独支持)。
 
 ## 开发
 

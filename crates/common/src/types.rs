@@ -18,6 +18,8 @@ pub enum DataType {
     Int64,
     Float64,
     Utf8,
+    /// 日期(内部 = 距 1970-01-01 的天数,i32)。文本格式 YYYY-MM-DD。
+    Date,
     /// 二进制 LOB(BLOB / BYTEA / VARBINARY)。
     Binary,
     /// 一维数组(元素必须是标量类型;嵌套数组不支持)。
@@ -34,6 +36,7 @@ impl DataType {
             DataType::Int64 => "BIGINT".to_string(),
             DataType::Float64 => "DOUBLE PRECISION".to_string(),
             DataType::Utf8 => "TEXT".to_string(),
+            DataType::Date => "DATE".to_string(),
             DataType::Binary => "BYTEA".to_string(),
             DataType::Array(elem) => format!("{}[]", elem.name()),
             DataType::Vector(dim) => format!("VECTOR({dim})"),
@@ -44,7 +47,11 @@ impl DataType {
     pub fn is_scalar(&self) -> bool {
         matches!(
             self,
-            DataType::Boolean | DataType::Int64 | DataType::Float64 | DataType::Utf8
+            DataType::Boolean
+                | DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Date
         )
     }
 
@@ -54,6 +61,7 @@ impl DataType {
             "BIGINT" | "INT8" => Some(DataType::Int64),
             "DOUBLE PRECISION" | "FLOAT8" | "DOUBLE" => Some(DataType::Float64),
             "TEXT" | "VARCHAR" | "STRING" => Some(DataType::Utf8),
+            "DATE" => Some(DataType::Date),
             "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => Some(DataType::Binary),
             _ => None,
         }
@@ -68,6 +76,8 @@ pub enum ScalarValue {
     Int64(i64),
     Float64(f64),
     Utf8(String),
+    /// 日期:距 1970-01-01 的天数。
+    Date(i32),
     /// 二进制 LOB。
     Binary(Vec<u8>),
     /// 数组(元素可为 NULL)。
@@ -84,6 +94,7 @@ impl PartialEq for ScalarValue {
             (Self::Int64(a), Self::Int64(b)) => a == b,
             (Self::Float64(a), Self::Float64(b)) => a == b || (a.is_nan() && b.is_nan()),
             (Self::Utf8(a), Self::Utf8(b)) => a == b,
+            (Self::Date(a), Self::Date(b)) => a == b,
             (Self::Binary(a), Self::Binary(b)) => a == b,
             (Self::List(a), Self::List(b)) => a == b,
             (Self::Vector(a), Self::Vector(b)) => {
@@ -122,16 +133,20 @@ impl std::hash::Hash for ScalarValue {
                 state.write_u8(4);
                 s.hash(state);
             }
-            ScalarValue::Binary(b) => {
+            ScalarValue::Date(d) => {
                 state.write_u8(5);
+                d.hash(state);
+            }
+            ScalarValue::Binary(b) => {
+                state.write_u8(6);
                 b.hash(state);
             }
             ScalarValue::List(items) => {
-                state.write_u8(6);
+                state.write_u8(7);
                 items.hash(state);
             }
             ScalarValue::Vector(vs) => {
-                state.write_u8(7);
+                state.write_u8(8);
                 state.write_u64(vs.len() as u64);
                 for v in vs {
                     v.to_bits().hash(state);
@@ -154,6 +169,7 @@ impl ScalarValue {
             ScalarValue::Int64(_) => Some(DataType::Int64),
             ScalarValue::Float64(_) => Some(DataType::Float64),
             ScalarValue::Utf8(_) => Some(DataType::Utf8),
+            ScalarValue::Date(_) => Some(DataType::Date),
             ScalarValue::Binary(_) => Some(DataType::Binary),
             ScalarValue::List(items) => items
                 .iter()
@@ -171,6 +187,10 @@ impl ScalarValue {
             ScalarValue::Int64(v) => Some(v.to_string()),
             ScalarValue::Float64(v) => Some(format!("{v}")),
             ScalarValue::Utf8(s) => Some(s.clone()),
+            ScalarValue::Date(d) => {
+                let (y, m, dd) = civil_from_days(*d);
+                Some(format!("{y:04}-{m:02}-{dd:02}"))
+            }
             ScalarValue::Binary(b) => Some(format!(
                 "\\x{}",
                 b.iter()
@@ -203,11 +223,64 @@ impl ScalarValue {
                 .map(ScalarValue::Float64)
                 .map_err(|e| Error::invalid_argument(format!("bad value '{s}' for DOUBLE: {e}"))),
             DataType::Utf8 => Ok(ScalarValue::Utf8(s.to_string())),
+            DataType::Date => parse_date_text(s),
             DataType::Binary => parse_binary_text(s),
             DataType::Array(elem) => parse_array_text(&elem, s),
             DataType::Vector(dim) => parse_vector_text(dim, s),
         }
     }
+}
+
+// ---------- 公历日期 <-> 天数(Hinnant 算法;纪元 = 1970-01-01) ----------
+
+/// 天数 → (年, 月, 日)。该算法对任意 i32 天数有效(前推后拉 500 万年+)。
+pub fn civil_from_days(z: i32) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i32 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// (年, 月, 日) → 天数。
+pub fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
+    let y = if m <= 2 { y - 1 } else { y } as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    (era * 146_097 + doe as i64) as i32 - 719_468
+}
+
+/// `YYYY-MM-DD` → ScalarValue::Date。
+pub fn parse_date_text(s: &str) -> Result<ScalarValue> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return Err(Error::invalid_argument(format!(
+            "bad date literal '{s}' (expected YYYY-MM-DD)"
+        )));
+    }
+    let y: i32 = parts[0]
+        .parse()
+        .map_err(|_| Error::invalid_argument(format!("bad date literal '{s}': invalid year")))?;
+    let m: u32 = parts[1]
+        .parse()
+        .map_err(|_| Error::invalid_argument(format!("bad date literal '{s}': invalid month")))?;
+    let d: u32 = parts[2]
+        .parse()
+        .map_err(|_| Error::invalid_argument(format!("bad date literal '{s}': invalid day")))?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(Error::invalid_argument(format!(
+            "bad date literal '{s}': month/day out of range"
+        )));
+    }
+    Ok(ScalarValue::Date(days_from_civil(y, m, d)))
 }
 
 impl std::fmt::Display for ScalarValue {

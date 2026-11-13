@@ -25,6 +25,10 @@ pub enum BinaryOp {
     GtEq,
     And,
     Or,
+    /// SQL LIKE(% 任意序列,_ 单字符)
+    Like,
+    /// SQL NOT LIKE
+    NotLike,
 }
 
 impl BinaryOp {
@@ -42,6 +46,8 @@ impl BinaryOp {
             BinaryOp::GtEq => ">=",
             BinaryOp::And => "AND",
             BinaryOp::Or => "OR",
+            BinaryOp::Like => "LIKE",
+            BinaryOp::NotLike => "NOT LIKE",
         }
     }
 
@@ -55,6 +61,10 @@ impl BinaryOp {
                 | BinaryOp::Gt
                 | BinaryOp::GtEq
         )
+    }
+
+    pub fn is_like(&self) -> bool {
+        matches!(self, BinaryOp::Like | BinaryOp::NotLike)
     }
 
     pub fn is_logic(&self) -> bool {
@@ -90,6 +100,11 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// IS NULL / IS NOT NULL。
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
 }
 
 impl fmt::Display for Expr {
@@ -107,6 +122,13 @@ impl fmt::Display for Expr {
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
+            }
+            Expr::IsNull { expr, negated } => {
+                if *negated {
+                    write!(f, "({expr} IS NOT NULL)")
+                } else {
+                    write!(f, "({expr} IS NULL)")
+                }
             }
         }
     }
@@ -138,6 +160,11 @@ impl Expr {
                     .collect::<Result<Vec<_>>>()?;
                 crate::functions::eval_function(name, &cols)
             }
+            Expr::IsNull { expr, negated } => {
+                let v = expr.eval(chunk)?;
+                let out: Vec<bool> = (0..v.len()).map(|i| v.null_at(i) != *negated).collect();
+                Ok(Vector::bools(out))
+            }
         }
     }
 
@@ -158,10 +185,11 @@ impl Expr {
                     name, &arg_types,
                 )?))
             }
+            Expr::IsNull { .. } => Ok(Some(DataType::Boolean)),
             Expr::Binary { op, left, right } => {
                 let lt = left.return_type(input)?;
                 let rt = right.return_type(input)?;
-                if op.is_comparison() {
+                if op.is_comparison() || op.is_like() {
                     return Ok(Some(DataType::Boolean));
                 }
                 if op.is_logic() {
@@ -176,14 +204,30 @@ impl Expr {
                     }
                     return Ok(Some(DataType::Boolean));
                 }
-                // 算术:Int64 与 Float64 混算提升为 Float64
-                match (lt, rt) {
-                    (Some(DataType::Float64), _) | (_, Some(DataType::Float64)) => {
+                // 算术:Int64 与 Float64 混算提升为 Float64;日期 ± 整数天数
+                match (&lt, &rt) {
+                    (Some(DataType::Float64), _) | (_, Some(DataType::Float64))
+                        if op.is_arithmetic() =>
+                    {
                         Ok(Some(DataType::Float64))
                     }
-                    (Some(DataType::Int64), Some(DataType::Int64)) => Ok(Some(DataType::Int64)),
-                    (a, b) => Err(Error::sql(format!(
-                        "type mismatch in arithmetic: {a:?} {} {b:?}",
+                    (Some(DataType::Int64), Some(DataType::Int64)) if op.is_arithmetic() => {
+                        Ok(Some(DataType::Int64))
+                    }
+                    // 日期算术:DATE ± BIGINT(天)→ DATE;DATE - DATE → BIGINT 天数
+                    (Some(DataType::Date), Some(DataType::Int64))
+                        if matches!(op, BinaryOp::Add | BinaryOp::Sub) =>
+                    {
+                        Ok(Some(DataType::Date))
+                    }
+                    (Some(DataType::Int64), Some(DataType::Date)) if *op == BinaryOp::Add => {
+                        Ok(Some(DataType::Date))
+                    }
+                    (Some(DataType::Date), Some(DataType::Date)) if *op == BinaryOp::Sub => {
+                        Ok(Some(DataType::Int64))
+                    }
+                    _ => Err(Error::sql(format!(
+                        "type mismatch in arithmetic: {lt:?} {} {rt:?}",
                         op.symbol()
                     ))),
                 }
@@ -211,6 +255,9 @@ pub fn broadcast(v: &ScalarValue, len: usize) -> Result<Vector> {
         }
         ScalarValue::Float64(_) => {
             Vector::from_scalars(DataType::Float64, std::iter::repeat_n(v.clone(), len))
+        }
+        ScalarValue::Date(_) => {
+            Vector::from_scalars(DataType::Date, std::iter::repeat_n(v.clone(), len))
         }
         ScalarValue::Utf8(_) => {
             Vector::from_scalars(DataType::Utf8, std::iter::repeat_n(v.clone(), len))
@@ -259,6 +306,33 @@ pub fn eval_binary(op: BinaryOp, l: &Vector, r: &Vector) -> Result<Vector> {
             let r = promote_to_f64(r);
             eval_binary(op, l, &r)
         }
+        (DataType::Date, DataType::Int64) if op.is_arithmetic() || op == BinaryOp::Sub => {
+            date_shift_kernel(op, l, r)
+        }
+        (DataType::Int64, DataType::Date) if op == BinaryOp::Add => date_shift_kernel(op, r, l),
+        (DataType::Date, DataType::Date) if op == BinaryOp::Sub => {
+            // 日期差:返回天数(Int64)
+            let out: Vec<i64> = (0..l.len())
+                .map(|i| (l.datum(i).to_scalar(), r.datum(i).to_scalar()))
+                .map(|(a, b)| match (a, b) {
+                    (ScalarValue::Date(x), ScalarValue::Date(y)) => (x - y) as i64,
+                    _ => 0,
+                })
+                .collect();
+            let nulls = combine_null_masks(l, r, out.len());
+            Vector::new(ColumnData::Int64(out), nulls)
+        }
+        (DataType::Date, DataType::Date) if op.is_comparison() => values_compare_kernel(op, l, r),
+        // Date 列与字符串字面量比较:字符串按日期解析('1995-03-05' 风格)
+        (DataType::Date, DataType::Utf8) if op.is_comparison() => {
+            let r = coerce_nonscalar_side(r, &DataType::Date)?;
+            eval_binary(op, l, &r)
+        }
+        (DataType::Utf8, DataType::Date) if op.is_comparison() => {
+            let l = coerce_nonscalar_side(l, &DataType::Date)?;
+            eval_binary(op, &l, r)
+        }
+        (DataType::Utf8, DataType::Utf8) if op.is_like() => like_kernel(op, l, r),
         (DataType::Utf8, DataType::Utf8) if op.is_comparison() => utf8_compare_kernel(op, l, r),
         // Binary / 数组:相等与序比较走通用 compare_values(null 参与 → false)
         (DataType::Binary, DataType::Binary) if op.is_comparison() => {
@@ -302,6 +376,93 @@ fn coerce_nonscalar_side(v: &Vector, target: &DataType) -> Result<Vector> {
         }
     }
     Vector::from_scalars(target.clone(), items)
+}
+
+/// 日期 ± 整数天数(Date ± Int64 → Date;probe 侧 Int64 在左时交换后调用)。
+fn date_shift_kernel(op: BinaryOp, date_v: &Vector, days_v: &Vector) -> Result<Vector> {
+    let shift_right = matches!(op, BinaryOp::Add);
+    let mut out = Vec::with_capacity(date_v.len());
+    for i in 0..date_v.len() {
+        let (Datum::Date(d), Datum::Int64(n)) = (date_v.datum(i), days_v.datum(i)) else {
+            return Err(Error::invalid_argument(
+                "date arithmetic requires DATE and BIGINT operands",
+            ));
+        };
+        let shifted = if shift_right {
+            d.checked_add(n as i32)
+        } else {
+            d.checked_sub(n as i32)
+        };
+        out.push(ScalarValue::Date(
+            shifted.ok_or_else(|| Error::sql("date arithmetic out of range"))?,
+        ));
+    }
+    let nulls = combine_null_masks(date_v, days_v, out.len());
+    Vector::new(
+        ColumnData::Date(
+            out.iter()
+                .map(|v| match v {
+                    ScalarValue::Date(d) => *d,
+                    _ => 0,
+                })
+                .collect(),
+        ),
+        nulls,
+    )
+}
+
+/// LIKE 内核:% 任意序列、_ 单字符、`\` 转义下一字符;NULL 参与 → false/NULL。
+fn like_matches(text: &str, pattern: &str) -> bool {
+    let s: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let mut si = 0usize;
+    let mut pi = 0usize;
+    let mut star_pi = None;
+    let mut star_si = 0usize;
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == s[si]) {
+            si += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '\\' && pi + 1 < p.len() {
+            if p[pi + 1] == s[si] {
+                si += 1;
+                pi += 2;
+            } else if star_pi.is_some() {
+                si = star_si + 1;
+                pi = star_pi.unwrap();
+            } else {
+                return false;
+            }
+        } else if pi < p.len() && p[pi] == '%' {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            si = star_si + 1;
+            star_si += 1;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn like_kernel(op: BinaryOp, l: &Vector, r: &Vector) -> Result<Vector> {
+    let negated = op == BinaryOp::NotLike;
+    let mut out = Vec::with_capacity(l.len());
+    for i in 0..l.len() {
+        if l.null_at(i) || r.null_at(i) {
+            out.push(false);
+        } else {
+            let m = like_matches(l.utf8_value(i), r.utf8_value(i));
+            out.push(m != negated);
+        }
+    }
+    Ok(Vector::bools(out))
 }
 
 #[inline]

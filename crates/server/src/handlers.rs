@@ -122,6 +122,7 @@ fn pg_type(ty: DataType) -> Type {
         DataType::Boolean => Type::BOOL,
         DataType::Int64 => Type::INT8,
         DataType::Float64 => Type::FLOAT8,
+        DataType::Date => Type::DATE,
         DataType::Utf8 => Type::TEXT,
         DataType::Binary => Type::BYTEA,
         // 数组/向量以 PG 文本格式输出,声明为 TEXT 保证任意客户端可读

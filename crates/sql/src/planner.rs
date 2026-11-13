@@ -19,14 +19,16 @@ use exec::chunk::DataChunk;
 use exec::executor::BoxedExecutor;
 use exec::expr::{BinaryOp, Expr};
 use exec::operators::hash_agg::AggHashExec;
+use exec::operators::hash_join::{HashJoinExec, JoinType};
 use exec::operators::seq_scan::{QueryDataSource, SeqScanExec};
 use exec::operators::sort::{SortExec, SortKey};
 use exec::operators::values::ValuesExec;
 use exec::operators::{filter::FilterExec, limit::LimitExec, project::ProjectExec};
 use exec::vector::Vector;
 use sqlparser::ast::{
-    BinaryOperator, DataType as SqlType, Expr as SE, FromTable, LimitClause, ObjectName, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value,
+    BinaryOperator, DataType as SqlType, Expr as SE, FromTable, JoinConstraint, JoinOperator,
+    LimitClause, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableWithJoins, UnaryOperator, Value,
 };
 
 /// 计划上下文:批大小 + 元数据 + 表数据源。
@@ -36,16 +38,89 @@ pub struct PlanContext<'a> {
     pub data: Arc<dyn QueryDataSource>,
 }
 
+/// FROM 作用域:多表(别名, schema)的有序集合,列解析返回扁平下标。
+pub struct Scope {
+    pub tables: Vec<(String, TableSchema)>,
+}
+
+impl Scope {
+    pub fn empty() -> Self {
+        Self { tables: Vec::new() }
+    }
+
+    pub fn single(t: &TableSchema) -> Self {
+        Self {
+            tables: vec![(t.name.clone(), t.clone())],
+        }
+    }
+
+    pub fn push(&mut self, alias: String, t: &TableSchema) {
+        self.tables.push((alias, t.clone()));
+    }
+
+    /// 全部表列的扁平 schema(按连接顺序拼接)。
+    pub fn flat_schema(&self) -> Vec<ColumnDesc> {
+        self.tables
+            .iter()
+            .flat_map(|(_, t)| t.columns.iter().cloned())
+            .collect()
+    }
+
+    /// 每表列数(FROM 顺序)。
+    pub fn table_widths(&self) -> Vec<usize> {
+        self.tables.iter().map(|(_, t)| t.columns.len()).collect()
+    }
+
+    /// 解析列引用 → 扁平下标。qualifier 匹配别名或表名(大小写不敏感);
+    /// 非限定列在全部表中唯一命中,多表命中视为歧义错误。
+    pub fn resolve(&self, qual: Option<&str>, col: &str) -> Result<usize> {
+        // 收集 (表位置, 表内列下标)
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        for (pos, (alias, t)) in self.tables.iter().enumerate() {
+            if let Some(i) = t.column_index(col) {
+                let qual_match = qual.map(|q| alias.eq_ignore_ascii_case(q)).unwrap_or(true);
+                if qual_match {
+                    hits.push((pos, i));
+                    if qual.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+        match hits.len() {
+            1 => {
+                let (pos, i) = hits[0];
+                let start: usize = self.tables[..pos]
+                    .iter()
+                    .map(|(_, t)| t.columns.len())
+                    .sum();
+                Ok(start + i)
+            }
+            0 => Err(Error::catalog(format!("column '{col}' not found"))),
+            _ => Err(Error::catalog(format!(
+                "column reference '{col}' is ambiguous"
+            ))),
+        }
+    }
+
+    /// 限定符(别名/表名)→ 表位置;找不到返回 None。
+    pub fn resolve_qualifier(&self, qual: &str) -> Option<usize> {
+        self.tables
+            .iter()
+            .position(|(a, _)| a.eq_ignore_ascii_case(qual))
+    }
+}
+
 /// 语句计划产物。
 pub enum StatementPlan {
     /// SELECT:可直接拉取的执行流水线。
     Query(PlannedQuery),
-    /// INSERT VALUES:计划期已求值/收敛的整行集合。
+    /// INSERT VALUES:计划期已求值、收敛的整行集合。
     Insert {
         table: TableSchema,
         rows: Vec<Row>,
     },
-    /// INSERT SELECT:目标列下标 + 查询流水线(引擎执行后按列收敛)。
+    /// INSERT SELECT:目标列下标 + 查询流水线;引擎执行后按列收敛。
     InsertSelect {
         table: TableSchema,
         targets: Vec<usize>,
@@ -119,7 +194,7 @@ pub fn plan_statement(stmt: &Statement, ctx: &PlanContext<'_>) -> Result<Stateme
                 }
             }
             if !nullable {
-                // 尾部追加非空列会让历史行违反约束 → 要求可空(默认值 TODO)
+                // 尾部追加非空列会让历史行违反约束 → 要求可空(默认 true),TODO
                 return Err(Error::not_supported(
                     "ADD COLUMN requires a nullable column (existing rows become NULL)",
                 ));
@@ -318,20 +393,22 @@ fn plan_select(
         return Err(Error::not_supported("unsupported select clause"));
     }
 
-    // 单表扫描 or 无 FROM
-    let from_table = match select.from.as_slice() {
-        [] => None,
-        [twj] if twj.joins.is_empty() => {
-            let TableFactor::Table { name, .. } = &twj.relation else {
-                return Err(Error::not_supported("FROM clause (subquery / function)"));
-            };
-            let name = object_name_to_string(name)?;
-            Some(resolve_table(ctx.catalog, &name)?)
-        }
-        _ => return Err(Error::not_supported("multi-table FROM / JOIN")),
+    // FROM:多表 + JOIN 步骤(逗号连接视为 CROSS JOIN)→ 有序关系步骤
+    let steps = match select.from.as_slice() {
+        [] => Vec::new(),
+        from => plan_from(from, ctx)?,
     };
-    let scope = from_table.as_ref();
-    let input_schema: &[ColumnDesc] = scope.map(|t| t.columns.as_slice()).unwrap_or(&[]);
+    let mut scope = Scope::empty();
+    for s in &steps {
+        scope.push(s.alias.clone(), &s.schema);
+    }
+    let scope_ref = if steps.is_empty() { None } else { Some(&scope) };
+    let offsets = prefix_offsets(&scope.table_widths());
+    let input_schema: Vec<ColumnDesc> = if steps.is_empty() {
+        Vec::new()
+    } else {
+        scope.flat_schema()
+    };
 
     // GROUP BY 项(仅形状检查;聚合路径才解析)
     let group_items: &Vec<SE> = match &select.group_by {
@@ -350,7 +427,7 @@ fn plan_select(
     let mut visible: Vec<ProjectItem> = Vec::new();
 
     // 聚合改写器(仅聚合路径使用);GROUP BY 项必须先于任何改写注册
-    let mut rewriter = AggRewriter::new(scope, input_schema);
+    let mut rewriter = AggRewriter::new(scope_ref, &input_schema);
     if aggregate {
         for item in group_items {
             rewriter.add_group(item)?;
@@ -363,7 +440,7 @@ fn plan_select(
                 let expr = if aggregate {
                     rewriter.rewrite(e, false)?
                 } else {
-                    plan_expr(e, scope)?
+                    plan_expr(e, scope_ref)?
                 };
                 visible.push(ProjectItem {
                     planned_display: format!("{expr}"),
@@ -375,7 +452,7 @@ fn plan_select(
                 let e = if aggregate {
                     rewriter.rewrite(expr, false)?
                 } else {
-                    plan_expr(expr, scope)?
+                    plan_expr(expr, scope_ref)?
                 };
                 visible.push(ProjectItem {
                     planned_display: format!("{e}"),
@@ -387,7 +464,7 @@ fn plan_select(
                 let e = if aggregate {
                     rewriter.rewrite(expr, false)?
                 } else {
-                    plan_expr(expr, scope)?
+                    plan_expr(expr, scope_ref)?
                 };
                 let name = aliases
                     .first()
@@ -406,29 +483,32 @@ fn plan_select(
                         "SELECT * cannot be combined with GROUP BY / aggregates",
                     ));
                 }
-                let Some(t) = scope else {
+                if scope_ref.is_none() {
                     return Err(Error::not_supported("SELECT * without FROM clause"));
-                };
-                if let SelectItem::QualifiedWildcard(qualifier, _) = item {
-                    let sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(qname) =
-                        qualifier
-                    else {
-                        return Err(Error::not_supported("SELECT <expr>.*"));
-                    };
-                    let q = object_name_to_string(qname)?;
-                    if !q.eq_ignore_ascii_case(&t.name) {
-                        return Err(Error::catalog(format!(
-                            "unknown table qualifier '{q}' (expected '{}')",
-                            t.name
-                        )));
-                    }
                 }
-                for (i, c) in t.columns.iter().enumerate() {
-                    let expr = Expr::Column(i);
+                // 展开范围:全部表或限定别名的单表(扁平下标区间)
+                let (lo, hi) = match item {
+                    SelectItem::QualifiedWildcard(qualifier, _) => {
+                        let sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(qname) =
+                            qualifier
+                        else {
+                            return Err(Error::not_supported("SELECT <expr>.*"));
+                        };
+                        let q = object_name_to_string(qname)?;
+                        let pos = scope.resolve_qualifier(&q).ok_or_else(|| {
+                            Error::catalog(format!("unknown table qualifier '{q}'"))
+                        })?;
+                        (offsets[pos], offsets[pos + 1])
+                    }
+                    _ => (0, offsets[offsets.len() - 1]),
+                };
+                for idx in lo..hi {
+                    let expr = Expr::Column(idx);
+                    let name = input_schema[idx].name.clone();
                     visible.push(ProjectItem {
                         planned_display: format!("{expr}"),
                         expr,
-                        name: c.name.clone(),
+                        name,
                     });
                 }
             }
@@ -485,7 +565,7 @@ fn plan_select(
                         let expr = if aggregate {
                             rewriter.rewrite(&ob.expr, false)?
                         } else {
-                            plan_expr(&ob.expr, scope)?
+                            plan_expr(&ob.expr, scope_ref)?
                         };
                         hidden.push(expr);
                         visible.len() + hidden.len() - 1
@@ -497,7 +577,7 @@ fn plan_select(
                 let key = if aggregate {
                     rewriter.rewrite(other, false)?
                 } else {
-                    plan_expr(other, scope)?
+                    plan_expr(other, scope_ref)?
                 };
                 let display = format!("{key}");
                 match visible.iter().position(|p| p.planned_display == display) {
@@ -521,7 +601,7 @@ fn plan_select(
     let project_input_schema: Vec<ColumnDesc> = if aggregate {
         rewriter.agg_output_schema()
     } else {
-        input_schema.to_vec()
+        input_schema.clone()
     };
     let mut project_schema = Vec::with_capacity(visible.len() + hidden.len());
     for p in &visible {
@@ -534,42 +614,108 @@ fn plan_select(
     }
 
     // ---------- 流水线 ----------
-    // 无 FROM:提供单行占位批(plain 路径投影不引用列;聚合路径在其上聚合一组)
-    let (base_schema, base_dtypes): (Vec<ColumnDesc>, Vec<DataType>) = match &from_table {
-        Some(t) => (
-            t.columns.clone(),
-            t.columns.iter().map(|c| c.ty.clone()).collect(),
-        ),
-        None => {
-            let d = vec![ColumnDesc::new(
-                "__dummy".to_string(),
-                DataType::Int64,
-                true,
-            )];
-            let dtypes = d.iter().map(|c| c.ty.clone()).collect();
-            (d, dtypes)
-        }
-    };
-    let mut pipeline: BoxedExecutor = match &from_table {
-        Some(t) => Box::new(SeqScanExec::new(ctx.data.clone(), t.clone())),
-        None => Box::new(ValuesExec::one_row(base_schema)),
-    };
+    // 无 FROM:单行占位批(plain 路径投影不引用列;聚合路径在其上聚合一组)
+    let (mut pipeline, base_dtypes): (BoxedExecutor, Vec<DataType>) = if steps.is_empty() {
+        let d = vec![ColumnDesc::new(
+            "__dummy".to_string(),
+            DataType::Int64,
+            true,
+        )];
+        let dtypes = vec![DataType::Int64];
+        (Box::new(ValuesExec::one_row(d)), dtypes)
+    } else {
+        // WHERE 合取项路由:
+        // - 单表且其后无 LEFT JOIN 步骤 → 下推该表扫描(列下标重基到表内);
+        // - 单表且其后有 LEFT 步骤(保留侧/空产侧)→ 挂到该 LEFT 步骤 residual;
+        // - 常量谓词 → 挂第一张表扫描;
+        // - 跨表等值(两侧各引一表,INNER)→ 该步骤的哈希键;
+        // - 其余跨表条件 → 在其引用的最大表位置步骤之后过滤(residual)。
+        let mut scan_preds: Vec<Vec<Expr>> = vec![Vec::new(); steps.len()];
+        let mut step_keys: Vec<(Vec<Expr>, Vec<Expr>)> =
+            vec![(Vec::new(), Vec::new()); steps.len()];
+        let mut step_match: Vec<Vec<Expr>> = vec![Vec::new(); steps.len()];
+        let mut step_res: Vec<Vec<Expr>> = vec![Vec::new(); steps.len()];
 
-    // WHERE(在原始输入列上求值,聚合改写前)
-    if let Some(where_expr) = &select.selection {
-        if aggregate && is_aggregate_call(where_expr) {
-            return Err(Error::sql(
-                "aggregates are not allowed in WHERE (use HAVING)",
-            ));
-        }
-        let pred = plan_expr(where_expr, scope)?;
-        match pred.return_type(input_schema)? {
-            Some(DataType::Boolean) | None => {}
-            Some(t) => {
-                return Err(Error::sql(format!("WHERE must be boolean, got {t:?}")));
+        // ON 条件路由(连接步骤;非哈希部分进 match_cond,匹配期判定,
+        // 保证 LEFT JOIN 下未过条件的左行仍 NULL 补齐)
+        for (j, step) in steps.iter().enumerate().skip(1) {
+            if let Some(on) = &step.on {
+                for c in split_conjuncts(on) {
+                    if let Some((pk, bk)) = try_hash_eq(c, &scope, &offsets)? {
+                        step_keys[j].0.push(pk);
+                        step_keys[j].1.push(bk);
+                        continue;
+                    }
+                    let e = plan_expr(c, scope_ref)?;
+                    check_bool(&e, &input_schema, "join condition")?;
+                    step_match[j].push(e);
+                }
             }
         }
-        pipeline = Box::new(FilterExec::new(pipeline, pred));
+
+        // WHERE 路由
+        if let Some(where_expr) = &select.selection {
+            let first_left = steps
+                .iter()
+                .position(|s| s.join_type == JoinType::LeftOuter);
+            for c in split_conjuncts(where_expr) {
+                if aggregate && is_aggregate_call(c) {
+                    return Err(Error::sql(
+                        "aggregates are not allowed in WHERE (use HAVING)",
+                    ));
+                }
+                let touched = sql_expr_tables(c, &scope)?;
+                let e = plan_expr(c, scope_ref)?;
+                check_bool(&e, &input_schema, "WHERE")?;
+                match touched.as_slice() {
+                    [] => scan_preds[0].push(e),
+                    // 扁平下标入队;重基到表内局部由 table_scan 统一完成
+                    [pos] => match first_left {
+                        Some(l) if l > *pos => step_res[l].push(e),
+                        _ => scan_preds[*pos].push(e),
+                    },
+                    multi => {
+                        let j = *multi.last().expect("non-empty");
+                        step_res[j].push(e);
+                    }
+                }
+            }
+        }
+
+        // 逐表扫描(下推过滤)→ HashJoin 组合
+        let mut exec: BoxedExecutor = table_scan(&steps[0], &scan_preds[0], 0, ctx)?;
+        for j in 1..steps.len() {
+            let build = table_scan(&steps[j], &scan_preds[j], offsets[j], ctx)?;
+            let probe_schema = input_schema[..offsets[j]].to_vec();
+            let build_schema = steps[j].schema.columns.clone();
+            let (pk, bk) = step_keys[j].clone();
+            exec = Box::new(HashJoinExec::new(
+                exec,
+                build,
+                probe_schema,
+                build_schema,
+                pk,
+                bk,
+                combine_and(step_match[j].clone()),
+                combine_and(step_res[j].clone()),
+                steps[j].join_type,
+            ));
+        }
+        let dtypes = input_schema.iter().map(|c| c.ty.clone()).collect();
+        (exec, dtypes)
+    };
+
+    // 无 FROM 时的 WHERE(常量谓词直接过滤单行占位)
+    if steps.is_empty() {
+        if let Some(where_expr) = &select.selection {
+            if aggregate && is_aggregate_call(where_expr) {
+                return Err(Error::sql(
+                    "aggregates are not allowed in WHERE (use HAVING)",
+                ));
+            }
+            let pred = plan_expr(where_expr, None)?;
+            pipeline = Box::new(FilterExec::new(pipeline, pred));
+        }
     }
 
     // HAVING + 聚合
@@ -625,6 +771,271 @@ fn plan_select(
     })
 }
 
+// ---------- FROM / JOIN 规划 ----------
+
+/// FROM 中的一个关系步骤(第 0 个为驱动表;后续为连接步骤)。
+struct RelationStep {
+    alias: String,
+    schema: TableSchema,
+    join_type: JoinType,
+    on: Option<SE>,
+}
+
+/// FROM 子句解析:TableWithJoins 列表展开为有序步骤;逗号连接 = 无 ON 的内连接。
+fn plan_from(from: &[TableWithJoins], ctx: &PlanContext<'_>) -> Result<Vec<RelationStep>> {
+    fn push_relation(
+        relation: &TableFactor,
+        ctx: &PlanContext<'_>,
+        steps: &mut Vec<RelationStep>,
+    ) -> Result<()> {
+        let TableFactor::Table { name, alias, .. } = relation else {
+            return Err(Error::not_supported("FROM clause (subquery / function)"));
+        };
+        let tname = object_name_to_string(name)?;
+        let schema = resolve_table(ctx.catalog, &tname)?;
+        let alias = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| tname.clone());
+        if steps.iter().any(|s| s.alias.eq_ignore_ascii_case(&alias)) {
+            return Err(Error::sql(format!(
+                "duplicate table alias '{alias}' in FROM clause"
+            )));
+        }
+        steps.push(RelationStep {
+            alias,
+            schema,
+            join_type: JoinType::Inner,
+            on: None,
+        });
+        Ok(())
+    }
+
+    let mut steps: Vec<RelationStep> = Vec::new();
+    for twj in from {
+        // 第一个 TableWithJoins 的主关系是驱动表;后续的是逗号连接(CROSS JOIN)
+        push_relation(&twj.relation, ctx, &mut steps)?;
+        for join in &twj.joins {
+            let (jt, on) = match &join.join_operator {
+                // `JOIN` 与 `INNER JOIN` 同义(sqlparser 分列两个变体)
+                JoinOperator::Join(c) | JoinOperator::Inner(c) => {
+                    let JoinConstraint::On(e) = c else {
+                        return Err(Error::not_supported("JOIN ... USING / NATURAL JOIN"));
+                    };
+                    (JoinType::Inner, Some(e.clone()))
+                }
+                JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => {
+                    let JoinConstraint::On(e) = c else {
+                        return Err(Error::not_supported("JOIN ... USING / NATURAL JOIN"));
+                    };
+                    (JoinType::LeftOuter, Some(e.clone()))
+                }
+                JoinOperator::CrossJoin(_) => (JoinType::Inner, None),
+                other => {
+                    return Err(Error::not_supported(format!("join type {other:?}")));
+                }
+            };
+            push_relation(&join.relation, ctx, &mut steps)?;
+            let j = steps.len() - 1;
+            steps[j].join_type = jt;
+            steps[j].on = on;
+        }
+    }
+    Ok(steps)
+}
+
+/// 单表扫描(可选下推过滤,列下标重基到表内局部)。
+fn table_scan(
+    step: &RelationStep,
+    preds: &[Expr],
+    offset: usize,
+    ctx: &PlanContext<'_>,
+) -> Result<BoxedExecutor> {
+    let mut exec: BoxedExecutor = Box::new(SeqScanExec::new(ctx.data.clone(), step.schema.clone()));
+    if !preds.is_empty() {
+        let rebased = preds
+            .iter()
+            .map(|p| rebase_columns(p.clone(), offset))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(pred) = combine_and(rebased) {
+            exec = Box::new(FilterExec::new(exec, pred));
+        }
+    }
+    Ok(exec)
+}
+
+/// 宽度前缀和:表位置 k 的列占扁平区间 [offsets[k], offsets[k+1])。
+fn prefix_offsets(widths: &[usize]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(widths.len() + 1);
+    let mut acc = 0usize;
+    out.push(0);
+    for w in widths {
+        acc += w;
+        out.push(acc);
+    }
+    out
+}
+
+/// AND 树拆合取项(嵌套展开;返回原表达式的引用)。
+fn split_conjuncts(e: &SE) -> Vec<&SE> {
+    match e {
+        SE::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut v = split_conjuncts(left);
+            v.extend(split_conjuncts(right));
+            v
+        }
+        other => vec![other],
+    }
+}
+
+/// SQL 表达式引用到的表位置(去重升序);常量表达式返回空。
+fn sql_expr_tables(e: &SE, scope: &Scope) -> Result<Vec<usize>> {
+    let mut out = std::collections::BTreeSet::new();
+    collect_sql_tables(e, scope, &mut out)?;
+    Ok(out.into_iter().collect())
+}
+
+fn collect_sql_tables(
+    e: &SE,
+    scope: &Scope,
+    out: &mut std::collections::BTreeSet<usize>,
+) -> Result<()> {
+    match e {
+        SE::Identifier(ident) => {
+            // 非限定列:命中该列名的全部表(命中多表 → 视为跨表条件)
+            let mut any = false;
+            for (pos, (_, t)) in scope.tables.iter().enumerate() {
+                if find_column(t, &ident.value).is_some() {
+                    out.insert(pos);
+                    any = true;
+                }
+            }
+            if !any {
+                return Err(Error::catalog(format!(
+                    "column '{}' not found",
+                    ident.value
+                )));
+            }
+            Ok(())
+        }
+        SE::CompoundIdentifier(parts) => {
+            let [q, c] = parts.as_slice() else {
+                return Err(Error::not_supported("qualified identifier (>2 parts)"));
+            };
+            let pos = scope
+                .resolve_qualifier(&q.value)
+                .ok_or_else(|| Error::catalog(format!("unknown table alias '{}'", q.value)))?;
+            scope.resolve(Some(&q.value), &c.value)?;
+            out.insert(pos);
+            Ok(())
+        }
+        SE::BinaryOp { left, right, .. } => {
+            collect_sql_tables(left, scope, out)?;
+            collect_sql_tables(right, scope, out)
+        }
+        SE::Nested(inner) => collect_sql_tables(inner, scope, out),
+        SE::UnaryOp { expr, .. } => collect_sql_tables(expr, scope, out),
+        SE::Function(f) => {
+            for a in function_call_args(f)? {
+                collect_sql_tables(&a, scope, out)?;
+            }
+            Ok(())
+        }
+        SE::Like { expr, pattern, .. } => {
+            collect_sql_tables(expr, scope, out)?;
+            collect_sql_tables(pattern, scope, out)
+        }
+        SE::Extract { expr, .. } => collect_sql_tables(expr, scope, out),
+        SE::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_sql_tables(expr, scope, out)?;
+            if let Some(f) = substring_from {
+                collect_sql_tables(f, scope, out)?;
+            }
+            if let Some(f) = substring_for {
+                collect_sql_tables(f, scope, out)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()), // 字面量 / 类型化字符串 / INTERVAL 等常量
+    }
+}
+
+/// 尝试把 `a = b` 形态的条件转成哈希连接键:两侧各只引用一张表 {i}/{j}
+/// (i < j)→ (probe 键扁平等值, build 键列下标重基到表 j 局部)。
+fn try_hash_eq(c: &SE, scope: &Scope, offsets: &[usize]) -> Result<Option<(Expr, Expr)>> {
+    let SE::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = c
+    else {
+        return Ok(None);
+    };
+    let lt = sql_expr_tables(left, scope)?;
+    let rt = sql_expr_tables(right, scope)?;
+    let (probe_sql, build_sql, j) = match (lt.as_slice(), rt.as_slice()) {
+        ([i], [jj]) if i < jj => (left, right, *jj),
+        ([i], [jj]) if i > jj => (right, left, *i),
+        _ => return Ok(None),
+    };
+    let probe = plan_expr(probe_sql, Some(scope))?;
+    let build = rebase_columns(plan_expr(build_sql, Some(scope))?, offsets[j])?;
+    Ok(Some((probe, build)))
+}
+
+/// 表达式列下标整体平移(扁平 → 表内局部)。
+fn rebase_columns(e: Expr, delta: usize) -> Result<Expr> {
+    match e {
+        Expr::Column(i) => {
+            if i < delta {
+                return Err(Error::internal("column rebasing underflow"));
+            }
+            Ok(Expr::Column(i - delta))
+        }
+        Expr::Binary { op, left, right } => Ok(Expr::binary(
+            op,
+            rebase_columns(*left, delta)?,
+            rebase_columns(*right, delta)?,
+        )),
+        Expr::Function { name, args } => Ok(Expr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| rebase_columns(a, delta))
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
+            expr: Box::new(rebase_columns(*expr, delta)?),
+            negated,
+        }),
+        other => Ok(other),
+    }
+}
+
+/// 合取表达式列表 → AND 链;空列表返回 None。
+fn combine_and(exprs: Vec<Expr>) -> Option<Expr> {
+    let mut iter = exprs.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, e| Expr::binary(BinaryOp::And, acc, e)))
+}
+
+/// 谓词静态类型必须是布尔。
+fn check_bool(e: &Expr, input: &[ColumnDesc], what: &str) -> Result<()> {
+    match e.return_type(input)? {
+        Some(DataType::Boolean) | None => Ok(()),
+        Some(t) => Err(Error::sql(format!("{what} must be boolean, got {t:?}"))),
+    }
+}
+
 /// 收集表达式中引用的输入列下标。
 fn collect_column_refs(expr: &Expr, out: &mut std::collections::HashSet<usize>) {
     match expr {
@@ -641,6 +1052,7 @@ fn collect_column_refs(expr: &Expr, out: &mut std::collections::HashSet<usize>) 
                 collect_column_refs(a, out);
             }
         }
+        Expr::IsNull { expr, .. } => collect_column_refs(expr, out),
     }
 }
 
@@ -656,7 +1068,7 @@ fn expr_type(expr: &Expr, input: &[ColumnDesc]) -> Result<DataType> {
 /// - 与某 GROUP BY 项结构相同的子表达式 → Column(group_idx);
 /// - 其余节点递归改写,叶子按普通表达式解析。
 struct AggRewriter<'a> {
-    scope: Option<&'a TableSchema>,
+    scope: Option<&'a Scope>,
     input_schema: &'a [ColumnDesc],
     groups: Vec<(Expr, String)>,
     aggs: Vec<(AggDesc, String)>,
@@ -665,7 +1077,7 @@ struct AggRewriter<'a> {
 }
 
 impl<'a> AggRewriter<'a> {
-    fn new(scope: Option<&'a TableSchema>, input_schema: &'a [ColumnDesc]) -> Self {
+    fn new(scope: Option<&'a Scope>, input_schema: &'a [ColumnDesc]) -> Self {
         Self {
             scope,
             input_schema,
@@ -1068,7 +1480,7 @@ fn plan_update(update: &sqlparser::ast::Update, ctx: &PlanContext<'_>) -> Result
                 col_name
             )));
         }
-        let expr = plan_expr(&a.value, Some(&table))?;
+        let expr = plan_expr(&a.value, Some(&Scope::single(&table)))?;
         match expr.return_type(&table.columns)? {
             Some(t) if t == table.columns[idx].ty => {}
             // 字符串字面量赋给 LOB/数组/向量列:执行期按目标类型解析
@@ -1095,7 +1507,7 @@ fn plan_update(update: &sqlparser::ast::Update, ctx: &PlanContext<'_>) -> Result
 
     let predicate = match &update.selection {
         Some(e) => {
-            let expr = plan_expr(e, Some(&table))?;
+            let expr = plan_expr(e, Some(&Scope::single(&table)))?;
             match expr.return_type(&table.columns)? {
                 Some(DataType::Boolean) | None => {}
                 Some(t) => return Err(Error::sql(format!("WHERE must be boolean, got {t:?}"))),
@@ -1129,7 +1541,7 @@ fn plan_delete(delete: &sqlparser::ast::Delete, ctx: &PlanContext<'_>) -> Result
     let table = resolve_table(ctx.catalog, &object_name_to_string(name)?)?;
     let predicate = match &delete.selection {
         Some(e) => {
-            let expr = plan_expr(e, Some(&table))?;
+            let expr = plan_expr(e, Some(&Scope::single(&table)))?;
             match expr.return_type(&table.columns)? {
                 Some(DataType::Boolean) | None => {}
                 Some(t) => return Err(Error::sql(format!("WHERE must be boolean, got {t:?}"))),
@@ -1209,7 +1621,7 @@ fn plan_create_table(create: &sqlparser::ast::CreateTable) -> Result<StatementPl
         }
     }
     if !primary_key.is_empty() {
-        // 主键列必须存在且可排序(标量或 BLOB),并强制 NOT NULL
+        // 主键列必须存在且可排序(非 BLOB),并强制 NOT NULL
         for pk_name in &primary_key {
             let col_idx = columns
                 .iter()
@@ -1240,8 +1652,8 @@ fn plan_create_table(create: &sqlparser::ast::CreateTable) -> Result<StatementPl
 
 // ---------- 表达式 ----------
 
-/// SQL 表达式 → 执行表达式。`scope` 提供列解析(无 FROM 时不允许列引用)。
-pub fn plan_expr(e: &SE, scope: Option<&TableSchema>) -> Result<Expr> {
+/// SQL 表达式 → 执行表达式。`scope` 提供列解析;无 FROM 时不允许列引用。
+pub fn plan_expr(e: &SE, scope: Option<&Scope>) -> Result<Expr> {
     match e {
         SE::Value(v) => Ok(Expr::Literal(value_to_scalar(&v.value)?)),
         SE::Array(arr) => {
@@ -1259,6 +1671,91 @@ pub fn plan_expr(e: &SE, scope: Option<&TableSchema>) -> Result<Expr> {
                 }
             }
             Ok(Expr::Literal(ScalarValue::List(items)))
+        }
+        SE::TypedString(ts) => match ts.data_type {
+            SqlType::Date => {
+                let text = literal_string(&ts.value.value)
+                    .ok_or_else(|| Error::sql("DATE literal expects a string value"))?;
+                Ok(Expr::Literal(common::types::parse_date_text(&text)?))
+            }
+            ref other => Err(Error::not_supported(format!("typed literal {other}"))),
+        },
+        SE::Interval(iv) => {
+            // 仅支持 DATE 算术所需的单位:INTERVAL '<n>' DAY → Int64 天数
+            let Some(field) = iv.leading_field.as_ref() else {
+                return Err(Error::not_supported("INTERVAL requires an explicit unit"));
+            };
+            if !matches!(field, sqlparser::ast::DateTimeField::Day) {
+                return Err(Error::not_supported(format!("INTERVAL unit {field}")));
+            }
+            let SE::Value(v) = &*iv.value else {
+                return Err(Error::not_supported("INTERVAL value must be a literal"));
+            };
+            let text = literal_string(&v.value)
+                .ok_or_else(|| Error::sql("INTERVAL value expects a string literal"))?;
+            let days: i64 = text
+                .trim()
+                .parse()
+                .map_err(|_| Error::sql(format!("invalid INTERVAL day value '{text}'")))?;
+            Ok(Expr::Literal(ScalarValue::Int64(days)))
+        }
+        SE::Extract { field, expr, .. } => {
+            // EXTRACT(YEAR FROM d) → year(d);MONTH → month(d)
+            let fname = match field {
+                sqlparser::ast::DateTimeField::Year | sqlparser::ast::DateTimeField::Years => {
+                    "year"
+                }
+                sqlparser::ast::DateTimeField::Month | sqlparser::ast::DateTimeField::Months => {
+                    "month"
+                }
+                other => {
+                    return Err(Error::not_supported(format!("EXTRACT field {other}")));
+                }
+            };
+            let arg = plan_expr(expr, scope)?;
+            Ok(Expr::Function {
+                name: fname.to_string(),
+                args: vec![arg],
+            })
+        }
+        SE::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            // SUBSTRING(s [FROM a] [FOR b]) → substring(s, a, b);缺省 a=1,b=length(s)
+            let s = plan_expr(expr, scope)?;
+            let from = match substring_from {
+                Some(f) => plan_expr(f, scope)?,
+                None => Expr::Literal(ScalarValue::Int64(1)),
+            };
+            let for_len = match substring_for {
+                Some(f) => plan_expr(f, scope)?,
+                None => Expr::Function {
+                    name: "length".to_string(),
+                    args: vec![s.clone()],
+                },
+            };
+            Ok(Expr::Function {
+                name: "substring".to_string(),
+                args: vec![s, from, for_len],
+            })
+        }
+        SE::Like {
+            negated,
+            expr,
+            pattern,
+            ..
+        } => {
+            let l = plan_expr(expr, scope)?;
+            let r = plan_expr(pattern, scope)?;
+            let op = if *negated {
+                BinaryOp::NotLike
+            } else {
+                BinaryOp::Like
+            };
+            Ok(Expr::binary(op, l, r))
         }
         SE::Function(f) => {
             let name = object_name_to_string(&f.name)?.to_ascii_lowercase();
@@ -1280,32 +1777,22 @@ pub fn plan_expr(e: &SE, scope: Option<&TableSchema>) -> Result<Expr> {
         }
         SE::Nested(inner) => plan_expr(inner, scope),
         SE::Identifier(ident) => {
-            let Some(schema) = scope else {
+            let Some(scope) = scope else {
                 return Err(Error::not_implemented(
                     "column reference requires FROM clause",
                 ));
             };
-            let idx = find_column(schema, &ident.value).ok_or_else(|| {
-                Error::catalog(format!(
-                    "column '{}' not found in table '{}'",
-                    ident.value, schema.name
-                ))
-            })?;
+            let idx = scope.resolve(None, &ident.value)?;
             Ok(Expr::Column(idx))
         }
         SE::CompoundIdentifier(parts) => {
-            let Some(schema) = scope else {
+            let Some(scope) = scope else {
                 return Err(Error::not_implemented(
                     "column reference requires FROM clause",
                 ));
             };
-            if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case(&schema.name) {
-                let idx = find_column(schema, &parts[1].value).ok_or_else(|| {
-                    Error::catalog(format!(
-                        "column '{}' not found in table '{}'",
-                        parts[1].value, schema.name
-                    ))
-                })?;
+            if parts.len() == 2 {
+                let idx = scope.resolve(Some(&parts[0].value), &parts[1].value)?;
                 return Ok(Expr::Column(idx));
             }
             Err(Error::not_supported(format!(
@@ -1325,6 +1812,14 @@ pub fn plan_expr(e: &SE, scope: Option<&TableSchema>) -> Result<Expr> {
             other => Err(Error::not_supported(format!("unary operator {other:?}"))),
         },
         other => Err(Error::not_supported(format!("expression: {}", other))),
+    }
+}
+
+/// 字符串字面量取值(SingleQuoted/DoubleQuoted)。
+fn literal_string(v: &Value) -> Option<String> {
+    match v {
+        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -1393,7 +1888,7 @@ pub fn coerce_value(v: ScalarValue, col: &ColumnDesc) -> Result<ScalarValue> {
             ScalarValue::from_text(col.ty.clone(), &s)
         }
         v if v.data_type() == Some(col.ty.clone()) => Ok(v),
-        // 数组:逐元素收敛(字面量元素类型可能未知/含 NULL)
+        // 数组:逐元素收敛(字面量元素类型可能未知或 NULL)
         ScalarValue::List(items) if matches!(col.ty, DataType::Array(_)) => {
             let DataType::Array(elem) = &col.ty else {
                 unreachable!("guarded above");
@@ -1485,6 +1980,11 @@ fn map_sql_type(ty: &SqlType) -> Result<DataType> {
         | SqlType::Double(_)
         | SqlType::DoublePrecision
         | SqlType::DoublePrecisionUnsigned => Ok(DataType::Float64),
+        // DECIMAL/NUMERIC:无精确小数类型,统一收敛到 Float64(TPC-H 数值列够用)
+        SqlType::Decimal(_) | SqlType::Numeric(_) | SqlType::DecimalUnsigned(_) => {
+            Ok(DataType::Float64)
+        }
+        SqlType::Date | SqlType::Datetime(_) | SqlType::Timestamp(_, _) => Ok(DataType::Date),
         SqlType::Boolean | SqlType::Bool => Ok(DataType::Boolean),
         SqlType::Text
         | SqlType::Varchar(_)
@@ -1698,11 +2198,11 @@ mod tests {
             "SELECT UPPER(name) AS u, LENGTH(name) AS l FROM t WHERE LENGTH(name) >= 3",
             sample_rows(),
         );
-        // name: eng/eng/ops/ops — LENGTH 全为 3
+        // name: eng/eng/ops/ops → LENGTH 全为 3
         assert_eq!(out.len(), 4);
         assert_eq!(out[0][0], ScalarValue::Utf8("ENG".into()));
 
-        // COALESCE 对 NULL
+        // COALESCE 跳过 NULL
         let out = run_query_over(
             "SELECT COALESCE(score, 0.0) FROM t WHERE id = 3",
             sample_rows(),
@@ -1812,7 +2312,7 @@ mod tests {
             "SELECT id, score * 2 AS d FROM t ORDER BY score * 2",
             sample_rows(),
         );
-        // score: 100, 200, NULL, 50 → d: 200, 400, NULL(默认最后), 100
+        // score: 100, 200, NULL, 50 → d: 200, 400, NULL(默认最小), 100
         assert_eq!(out[0][1], ScalarValue::Float64(100.0));
         assert_eq!(out[2][1], ScalarValue::Float64(400.0));
         assert_eq!(out[3][1], ScalarValue::Null);

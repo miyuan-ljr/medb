@@ -17,6 +17,7 @@ const TAG_UTF8: u8 = 5;
 const TAG_BINARY: u8 = 6;
 const TAG_LIST: u8 = 7;
 const TAG_VECTOR: u8 = 8;
+const TAG_DATE: u8 = 9;
 
 pub fn encode_value(v: &ScalarValue, buf: &mut Vec<u8>) {
     match v {
@@ -35,6 +36,10 @@ pub fn encode_value(v: &ScalarValue, buf: &mut Vec<u8>) {
             buf.push(TAG_UTF8);
             put_varint_u64(s.len() as u64, buf);
             buf.extend_from_slice(s.as_bytes());
+        }
+        ScalarValue::Date(d) => {
+            buf.push(TAG_DATE);
+            buf.extend_from_slice(&d.to_be_bytes());
         }
         ScalarValue::Binary(b) => {
             buf.push(TAG_BINARY);
@@ -101,6 +106,15 @@ pub fn decode_value(buf: &mut &[u8]) -> Result<ScalarValue> {
             let bytes = buf[..len].to_vec();
             *buf = &buf[len..];
             Ok(ScalarValue::Binary(bytes))
+        }
+        TAG_DATE => {
+            if buf.len() < 4 {
+                return Err(short("date"));
+            }
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&buf[..4]);
+            *buf = &buf[4..];
+            Ok(ScalarValue::Date(i32::from_be_bytes(b)))
         }
         TAG_LIST => {
             let count = get_varint_u64(buf)? as usize;

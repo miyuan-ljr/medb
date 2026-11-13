@@ -156,7 +156,7 @@ impl ColumnarReplica for InMemoryColumnarReplica {
             DataType::Utf8 => ColumnVector::Utf8(Vec::new()),
             // 列存副本 v1 仅支持标量列;LOB/数组/向量列的 AP 扫描走行存路径,
             // 此处返回空(与未写入语义一致)
-            DataType::Binary | DataType::Array(_) | DataType::Vector(_) => {
+            DataType::Binary | DataType::Array(_) | DataType::Vector(_) | DataType::Date => {
                 return Ok(ColumnVector::Empty);
             }
         };

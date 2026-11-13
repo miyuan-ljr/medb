@@ -139,6 +139,7 @@ pub fn compare_values(l: &ScalarValue, r: &ScalarValue) -> Result<std::cmp::Orde
         (ScalarValue::Int64(a), ScalarValue::Int64(b)) => Ok(a.cmp(b)),
         (ScalarValue::Float64(a), ScalarValue::Float64(b)) => Ok(a.total_cmp(b)),
         (ScalarValue::Utf8(a), ScalarValue::Utf8(b)) => Ok(a.cmp(b)),
+        (ScalarValue::Date(a), ScalarValue::Date(b)) => Ok(a.cmp(b)),
         (ScalarValue::Binary(a), ScalarValue::Binary(b)) => Ok(a.cmp(b)),
         (ScalarValue::List(a), ScalarValue::List(b)) => {
             for (x, y) in a.iter().zip(b.iter()) {
