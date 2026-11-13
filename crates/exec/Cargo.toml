@@ -1,0 +1,14 @@
+[package]
+name = "medb-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "exec"
+
+[dependencies]
+medb-common = { workspace = true }
+medb-memory = { workspace = true }
+parking_lot.workspace = true
+tracing.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "medb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "medb"
+path = "src/main.rs"
+
+[dependencies]
+medb-common = { workspace = true }
+medb-memory = { workspace = true }
+medb-server = { workspace = true }
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true

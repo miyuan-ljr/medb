@@ -1,0 +1,27 @@
+[package]
+name = "medb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "server"
+
+[dependencies]
+medb-common = { workspace = true }
+medb-memory = { workspace = true }
+medb-exec = { workspace = true }
+medb-sql = { workspace = true }
+medb-catalog = { workspace = true }
+medb-storage = { workspace = true }
+parking_lot.workspace = true
+serde_json.workspace = true
+sqlparser.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+pgwire.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

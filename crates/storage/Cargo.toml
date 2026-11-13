@@ -1,0 +1,18 @@
+[package]
+name = "medb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "storage"
+
+[dependencies]
+medb-common = { workspace = true }
+medb-memory = { workspace = true }
+parking_lot.workspace = true
+tracing.workspace = true
+crossbeam-skiplist.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

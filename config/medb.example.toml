@@ -1,0 +1,32 @@
+# medb 配置示例。所有字段都有默认值,空文件即可启动。
+# 复制为 medb.toml 后 `medb --config medb.toml serve`。
+
+[server]
+# PG wire 监听地址。默认 55432,避开本机真实 PostgreSQL(5432)
+listen_addr = "127.0.0.1:55432"
+
+[memory]
+# 配额树根限额(字节);0 = 不限制
+global_limit_bytes = 1073741824    # 1 GiB
+query_limit_bytes = 268435456      # 256 MiB
+session_limit_bytes = 67108864     # 64 MiB
+# 查询 arena 的 chunk 大小(短命对象统一分配,整块归还)
+arena_chunk_bytes = 65536          # 64 KiB
+
+[engine]
+# 向量化批大小(行/批)
+batch_size = 2048
+
+[storage]
+data_dir = "./data"
+wal_segment_bytes = 67108864       # 64 MiB
+# memtable 限额,达到后触发 flush
+write_buffer_bytes = 33554432      # 32 MiB
+sst_block_size = 16384             # 16 KiB
+bloom_bits_per_key = 10            # 误报率 ~1%
+# L0 文件数达到该阈值触发全量压缩
+l0_compaction_threshold = 4
+
+[log]
+# 未设置 RUST_LOG 时的默认级别
+level = "info"

@@ -1,0 +1,11 @@
+{
+    // 使用 rustup 安装的本地 rust-analyzer,绕开扩展从 GitHub 下载二进制
+    "rust-analyzer.server.path": "C:\\Users\\Administrator\\.cargo\\bin\\rust-analyzer.exe",
+    // 保存时自动格式化
+    "editor.formatOnSave": true,
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer"
+    },
+    // 测试 CodeLens(每个 #[test] 上方出现 Run/Debug 按钮)
+    "rust-analyzer.showUnlinkedFileHint": true
+}

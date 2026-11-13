@@ -1,0 +1,17 @@
+[package]
+name = "medb-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sql"
+
+[dependencies]
+medb-common = { workspace = true }
+medb-catalog = { workspace = true }
+medb-exec = { workspace = true }
+sqlparser.workspace = true
+
+[dev-dependencies]
+medb-memory = { workspace = true }

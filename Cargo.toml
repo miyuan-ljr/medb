@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/memory",
+    "crates/exec",
+    "crates/storage",
+    "crates/catalog",
+    "crates/sql",
+    "crates/server",
+    "crates/medb",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# 内部 crate(lib 短名:common / memory / exec / storage / catalog / sql / server)
+medb-common = { path = "crates/common" }
+medb-memory = { path = "crates/memory" }
+medb-exec = { path = "crates/exec" }
+medb-storage = { path = "crates/storage" }
+medb-catalog = { path = "crates/catalog" }
+medb-sql = { path = "crates/sql" }
+medb-server = { path = "crates/server" }
+
+# 基础
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+clap = { version = "4", features = ["derive"] }
+
+# 存储引擎
+crc32fast = "1"
+crossbeam-skiplist = "0.1"
+
+# 执行/服务
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "macros",
+    "io-util",
+    "time",
+    "sync",
+    "signal",
+] }
+async-trait = "0.1"
+futures = "0.3"
+pgwire = "0.42"
+sqlparser = "0.64"
+
+# 内存分配器
+mimalloc = "0.1"
+
+# 测试
+tempfile = "3"
+
+[profile.release]
+debug = true   # 保留符号,方便 perf/火焰图
+lto = "thin"
