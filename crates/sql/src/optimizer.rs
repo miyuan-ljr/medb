@@ -398,9 +398,10 @@ pub struct PoolEntry<'a> {
     pub sel: f64,
 }
 
-/// OR 树展开为顶层析取分支列表。
+/// OR 树展开为顶层析取分支列表(剥掉 Nested 括号包装)。
 fn flatten_or<'a>(e: &'a SE, out: &mut Vec<&'a SE>) {
     match e {
+        SE::Nested(inner) => flatten_or(inner, out),
         SE::BinaryOp {
             left,
             op: BinaryOperator::Or,
@@ -930,5 +931,67 @@ mod tests {
         let plan = optimize_join_order(&[VIRTUAL, 1, 2], &base, &pool);
         assert_eq!(plan.order[0], VIRTUAL);
         assert_eq!(plan.steps.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod q19_regression {
+    use super::*;
+    use crate::parser::parse_single;
+    use common::schema::{ColumnDesc, TableSchema};
+    use common::types::DataType;
+    use sqlparser::ast::{SetExpr, Statement};
+
+    #[test]
+    fn or_common_pair_extracted_for_q19_shape() {
+        let mut s = Scope::empty();
+        let t = |id: u64, name: &str, cols: &[&str]| TableSchema {
+            id,
+            name: name.to_string(),
+            columns: cols
+                .iter()
+                .map(|c| ColumnDesc::new(c.to_string(), DataType::Int64, true))
+                .collect(),
+            primary_key: vec![],
+            version: 1,
+        };
+        s.push(
+            "lineitem".into(),
+            &t(
+                1,
+                "lineitem",
+                &[
+                    "l_orderkey",
+                    "l_partkey",
+                    "l_quantity",
+                    "l_extendedprice",
+                    "l_discount",
+                    "l_shipdate",
+                    "l_shipmode",
+                ],
+            ),
+        );
+        s.push(
+            "part".into(),
+            &t(
+                2,
+                "part",
+                &["p_partkey", "p_brand", "p_container", "p_size"],
+            ),
+        );
+        let sql = "SELECT SUM(l_extendedprice * l_discount) FROM lineitem, part WHERE (l_shipmode = 'AIR' AND l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_quantity >= 10 AND l_quantity <= 20 AND l_partkey = p_partkey AND p_brand = 'Brand#12' AND p_container IN ('SMALL CASE', 'SMALL BOX') AND p_size >= 1 AND p_size <= 5) OR (l_shipmode = 'AIR' AND l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_quantity >= 10 AND l_quantity <= 30 AND l_partkey = p_partkey AND p_brand = 'Brand#23' AND p_container IN ('MED BAG', 'MED BOX') AND p_size >= 1 AND p_size <= 10) OR (l_shipmode = 'AIR' AND l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_quantity >= 20 AND l_quantity <= 40 AND l_partkey = p_partkey AND p_brand = 'Brand#34' AND p_container IN ('LARGE CASE', 'LARGE PACK') AND p_size >= 1 AND p_size <= 15)";
+        let Statement::Query(q) = parse_single(sql).unwrap() else {
+            panic!()
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            panic!()
+        };
+        let where_expr = select.selection.as_ref().unwrap().clone();
+        let cs: Vec<&SE> = split_conjuncts(&where_expr);
+        let est = Estimator::collect(&s, &mut |_| None);
+        let pool = build_pool(&cs, &s, &est).unwrap();
+        assert_eq!(pool.len(), 1, "OR 合取项应入池");
+        assert!(pool[0].join_pair.is_some(), "OR 公共键应被提取");
+        assert!(pool[0].key_from_or);
     }
 }
