@@ -32,13 +32,15 @@ pub trait QueryDataSource: Send + Sync {
         None
     }
 
-    /// **谓词下推**:拉取满足 `pred`(列下标为表内局部下标)的行。
-    /// 默认实现 = 整表拉取 + 分批过滤;存储引擎应覆盖为"解码期过滤",
-    /// 使未命中行不进入物化。
+    /// **谓词下推 + 投影剪枝**:拉取满足 `pred`(可选;列下标为表内局部
+    /// 下标)且只物化 `needed` 标记列的行(未标记列 → Null 占位)。
+    /// 默认实现 = 整表拉取 + 分批过滤;存储引擎应覆盖为"解码期过滤 +
+    /// 部分物化",使未命中/未引用的列不产生分配。
     fn scan_table_filtered(
         &self,
         table: &TableSchema,
-        pred: &crate::expr::Expr,
+        pred: Option<&crate::expr::Expr>,
+        needed: &[bool],
     ) -> Result<Vec<Row>> {
         let rows = self.scan_table(table)?;
         let dtypes: Vec<common::types::DataType> =
@@ -46,10 +48,24 @@ pub trait QueryDataSource: Send + Sync {
         let mut out = Vec::with_capacity(rows.len() / 4);
         for slice in rows.chunks(2048) {
             let chunk = crate::chunk::DataChunk::from_rows(&dtypes, slice)?;
-            let mask = pred.eval(&chunk)?;
+            let selection: Vec<bool> = match pred {
+                Some(p) => {
+                    let mask = p.eval(&chunk)?;
+                    (0..slice.len())
+                        .map(|i| !mask.null_at(i) && mask.bool_values()[i])
+                        .collect()
+                }
+                None => vec![true; slice.len()],
+            };
             for i in 0..slice.len() {
-                if !mask.null_at(i) && mask.bool_values()[i] {
-                    out.push(slice[i].clone());
+                if selection[i] {
+                    let mut row = slice[i].clone();
+                    for (c, need) in needed.iter().enumerate() {
+                        if !need {
+                            row[c] = common::types::ScalarValue::Null;
+                        }
+                    }
+                    out.push(row);
                 }
             }
         }
@@ -72,6 +88,8 @@ pub struct SeqScanExec {
     table: TableSchema,
     /// 下推谓词(表内局部下标;解码期过滤,未命中行不进物化)
     pushdown: Option<Expr>,
+    /// 投影剪枝位图(表内局部下标;None = 全列需要)
+    needed: Option<Vec<bool>>,
     /// 行存路径:物化行集(下推过滤后)
     rows: Option<Vec<Row>>,
     /// 列存路径:整表列块(AP 路径;列向量由副本所有,块为查询内副本)
@@ -92,6 +110,16 @@ impl SeqScanExec {
         table: TableSchema,
         pushdown: Option<Expr>,
     ) -> Self {
+        Self::with_projection(source, table, pushdown, None)
+    }
+
+    /// 带下推谓词 + 投影剪枝构造(均针对表内局部下标)。
+    pub fn with_projection(
+        source: Arc<dyn QueryDataSource>,
+        table: TableSchema,
+        pushdown: Option<Expr>,
+        needed: Option<Vec<bool>>,
+    ) -> Self {
         let schema = table.columns.clone();
         let dtypes = schema.iter().map(|c| c.ty.clone()).collect();
         Self {
@@ -100,6 +128,7 @@ impl SeqScanExec {
             source,
             table,
             pushdown,
+            needed,
             rows: None,
             column_chunk: None,
             mem: None,
@@ -129,9 +158,20 @@ impl Executor for SeqScanExec {
                 }
                 self.column_chunk = Some(Some(DataChunk::new(columns)?));
             } else {
-                let rows = match &self.pushdown {
-                    Some(pred) => self.source.scan_table_filtered(&self.table, pred)?,
-                    None => self.source.scan_table(&self.table)?,
+                let rows = match (&self.pushdown, &self.needed) {
+                    (Some(pred), Some(needed)) => {
+                        self.source
+                            .scan_table_filtered(&self.table, Some(pred), needed)?
+                    }
+                    (None, Some(needed)) => {
+                        self.source.scan_table_filtered(&self.table, None, needed)?
+                    }
+                    (Some(pred), None) => {
+                        let all = vec![true; self.table.columns.len()];
+                        self.source
+                            .scan_table_filtered(&self.table, Some(pred), &all)?
+                    }
+                    (None, None) => self.source.scan_table(&self.table)?,
                 };
                 // 物化行集计入配额树(与 DataChunk 记账同一棵树)
                 let bytes = rows

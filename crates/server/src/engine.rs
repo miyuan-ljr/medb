@@ -123,15 +123,22 @@ const COLUMNAR_PERSIST_THRESHOLD: u64 = 100_000;
 fn decode_filtered_slice(
     slice: &[(Vec<u8>, Option<Vec<u8>>)],
     table: &TableSchema,
-    pred: &exec::expr::Expr,
+    pred: Option<&exec::expr::Expr>,
+    needed: &[bool],
 ) -> Result<Vec<Row>> {
     let dtypes: Vec<common::types::DataType> = table.columns.iter().map(|c| c.ty.clone()).collect();
+    let prune = !needed.is_empty();
     let mut out = Vec::with_capacity(slice.len() / 4);
     let mut batch: Vec<Row> = Vec::with_capacity(512);
     for (_, value) in slice {
         let Some(bytes) = value else { continue };
         let mut s = bytes.as_slice();
-        let mut row = common::codec::decode_row(&mut s)?;
+        // 投影剪枝:未标记列跳过字节不物化(槽位 Null 占位)
+        let mut row = if prune {
+            common::codec::decode_row_partial(&mut s, needed)?
+        } else {
+            common::codec::decode_row(&mut s)?
+        };
         // schema 前缀兼容
         if row.len() < table.columns.len() {
             row.resize(table.columns.len(), ScalarValue::Null);
@@ -141,9 +148,17 @@ fn decode_filtered_slice(
         batch.push(row);
         if batch.len() >= 512 {
             let chunk = DataChunk::from_rows(&dtypes, &batch)?;
-            let mask = pred.eval(&chunk)?;
+            let keep = match pred {
+                Some(p) => {
+                    let mask = p.eval(&chunk)?;
+                    (0..batch.len())
+                        .map(|i| !mask.null_at(i) && mask.bool_values()[i])
+                        .collect::<Vec<_>>()
+                }
+                None => vec![true; batch.len()],
+            };
             for i in 0..batch.len() {
-                if !mask.null_at(i) && mask.bool_values()[i] {
+                if keep[i] {
                     out.push(batch[i].clone());
                 }
             }
@@ -152,9 +167,17 @@ fn decode_filtered_slice(
     }
     if !batch.is_empty() {
         let chunk = DataChunk::from_rows(&dtypes, &batch)?;
-        let mask = pred.eval(&chunk)?;
+        let keep = match pred {
+            Some(p) => {
+                let mask = p.eval(&chunk)?;
+                (0..batch.len())
+                    .map(|i| !mask.null_at(i) && mask.bool_values()[i])
+                    .collect::<Vec<_>>()
+            }
+            None => vec![true; batch.len()],
+        };
         for i in 0..batch.len() {
-            if !mask.null_at(i) && mask.bool_values()[i] {
+            if keep[i] {
                 out.push(batch[i].clone());
             }
         }
@@ -303,11 +326,13 @@ impl QueryDataSource for LsmDataSource {
         Some(fresh)
     }
 
-    /// 谓词下推:解码期过滤(并行;未命中行不进物化)。
+    /// 谓词下推 + 投影剪枝:解码期过滤与部分物化(并行;未命中行/未引用列
+    /// 都不进物化)。needed 为空切片 = 全列需要。
     fn scan_table_filtered(
         &self,
         table: &TableSchema,
-        pred: &exec::expr::Expr,
+        pred: Option<&exec::expr::Expr>,
+        needed: &[bool],
     ) -> Result<Vec<Row>> {
         let (from, to) = row_range(table.id);
         let entries = self.lsm.scan_at(&from, &to, self.read_ts)?;
@@ -319,8 +344,15 @@ impl QueryDataSource for LsmDataSource {
         }
         let kv: Vec<(Vec<u8>, Option<Vec<u8>>)> = merged.into_iter().collect();
         // 并行解码 + 过滤:分片各自组批求值,按片序拼接(保插入序)
+        let prune = !needed.is_empty();
+        let pred_cloned = pred.cloned();
         let parts = exec::parallel::scope_map_try(&kv, self.threads, |slice| {
-            decode_filtered_slice(slice, table, pred)
+            decode_filtered_slice(
+                slice,
+                table,
+                pred_cloned.as_ref(),
+                if prune { needed } else { &[] },
+            )
         })?;
         Ok(parts.concat())
     }

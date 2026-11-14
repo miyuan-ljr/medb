@@ -170,6 +170,113 @@ pub(crate) fn collect_sql_tables(
     }
 }
 
+/// SQL 表达式引用到的列(表位置, 列名):投影剪枝用。
+/// 与 `collect_sql_tables` 同构的遍历,但收集的是列而不是表。
+pub(crate) fn collect_sql_columns(
+    e: &SE,
+    scope: &Scope,
+    out: &mut std::collections::BTreeSet<(usize, String)>,
+) -> Result<()> {
+    match e {
+        SE::Identifier(ident) => {
+            let mut any = false;
+            for (pos, (_, t)) in scope.tables.iter().enumerate() {
+                if let Some(ci) = t.column_index(&ident.value) {
+                    out.insert((pos, t.columns[ci].name.clone()));
+                    any = true;
+                }
+            }
+            if !any {
+                return Err(Error::catalog(format!(
+                    "column '{}' not found",
+                    ident.value
+                )));
+            }
+            Ok(())
+        }
+        SE::CompoundIdentifier(parts) => {
+            let [q, c] = parts.as_slice() else {
+                return Err(Error::not_supported("qualified identifier (>2 parts)"));
+            };
+            let pos = scope
+                .resolve_qualifier(&q.value)
+                .ok_or_else(|| Error::catalog(format!("unknown table alias '{}'", q.value)))?;
+            scope.resolve(Some(&q.value), &c.value)?;
+            out.insert((pos, c.value.clone()));
+            Ok(())
+        }
+        SE::BinaryOp { left, right, .. } => {
+            collect_sql_columns(left, scope, out)?;
+            collect_sql_columns(right, scope, out)
+        }
+        SE::Nested(inner) => collect_sql_columns(inner, scope, out),
+        SE::UnaryOp { expr, .. } => collect_sql_columns(expr, scope, out),
+        SE::Function(f) => {
+            for a in crate::planner::function_call_args(f)? {
+                collect_sql_columns(&a, scope, out)?;
+            }
+            Ok(())
+        }
+        SE::Like { expr, pattern, .. } => {
+            collect_sql_columns(expr, scope, out)?;
+            collect_sql_columns(pattern, scope, out)
+        }
+        SE::Extract { expr, .. } => collect_sql_columns(expr, scope, out),
+        SE::Between {
+            expr, low, high, ..
+        } => {
+            collect_sql_columns(expr, scope, out)?;
+            collect_sql_columns(low, scope, out)?;
+            collect_sql_columns(high, scope, out)
+        }
+        SE::In { expr, target, .. } => {
+            collect_sql_columns(expr, scope, out)?;
+            if let sqlparser::ast::InTarget::List(list) = target {
+                for e in list {
+                    collect_sql_columns(e, scope, out)?;
+                }
+            }
+            Ok(())
+        }
+        SE::IsNull(expr) => collect_sql_columns(expr, scope, out),
+        SE::IsNotNull(expr) => collect_sql_columns(expr, scope, out),
+        SE::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_sql_columns(op, scope, out)?;
+            }
+            for cw in conditions {
+                collect_sql_columns(&cw.condition, scope, out)?;
+                collect_sql_columns(&cw.result, scope, out)?;
+            }
+            if let Some(e) = else_result {
+                collect_sql_columns(e, scope, out)?;
+            }
+            Ok(())
+        }
+        SE::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_sql_columns(expr, scope, out)?;
+            if let Some(f) = substring_from {
+                collect_sql_columns(f, scope, out)?;
+            }
+            if let Some(f) = substring_for {
+                collect_sql_columns(f, scope, out)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 // ---------- 选择性估算 ----------
 
 /// 表达式选择性估算器:按谓词形状 + 列统计给出 0..1 的行分数。

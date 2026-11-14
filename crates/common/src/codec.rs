@@ -164,6 +164,71 @@ pub fn decode_row(buf: &mut &[u8]) -> Result<Row> {
     Ok(row)
 }
 
+/// 解码一行,但只物化 `needed` 标记的列;未标记列**跳过字节**不物化,
+/// 槽位填 Null(投影下推:省掉未引用列的分配,尤其 Utf8/Binary)。
+/// 跳过 = 读 tag + 越过载荷(编码自描述,游标可安全推进)。
+pub fn decode_row_partial(buf: &mut &[u8], needed: &[bool]) -> Result<Row> {
+    let mut row = Row::with_capacity(needed.len());
+    for need in needed {
+        if *need {
+            row.push(decode_value(buf)?);
+        } else {
+            skip_value(buf)?;
+            row.push(ScalarValue::Null);
+        }
+    }
+    Ok(row)
+}
+
+/// 越过一个编码值(不物化);仅推进游标。
+pub fn skip_value(buf: &mut &[u8]) -> Result<()> {
+    let tag = take_byte(buf)?;
+    match tag {
+        TAG_NULL | TAG_FALSE | TAG_TRUE => Ok(()),
+        TAG_INT64 | TAG_FLOAT64 => {
+            if buf.len() < 8 {
+                return Err(short("fixed 8B value"));
+            }
+            *buf = &buf[8..];
+            Ok(())
+        }
+        TAG_DATE => {
+            if buf.len() < 4 {
+                return Err(short("date value"));
+            }
+            *buf = &buf[4..];
+            Ok(())
+        }
+        TAG_UTF8 | TAG_BINARY => {
+            let len = get_varint_u64(buf)? as usize;
+            if buf.len() < len {
+                return Err(short("payload"));
+            }
+            *buf = &buf[len..];
+            Ok(())
+        }
+        TAG_LIST => {
+            let n = get_varint_u64(buf)? as usize;
+            for _ in 0..n {
+                skip_value(buf)?;
+            }
+            Ok(())
+        }
+        TAG_VECTOR => {
+            let n = get_varint_u64(buf)? as usize;
+            let bytes = n * 4; // f32 × 维度
+            if buf.len() < bytes {
+                return Err(short("vector payload"));
+            }
+            *buf = &buf[bytes..];
+            Ok(())
+        }
+        other => Err(Error::invalid_argument(format!(
+            "unknown value tag {other:#x}"
+        ))),
+    }
+}
+
 fn take_byte(buf: &mut &[u8]) -> Result<u8> {
     if buf.is_empty() {
         return Err(short("value tag"));
@@ -222,5 +287,83 @@ mod tests {
         let bytes = encode_row_to_vec(&row);
         assert!(decode_row(&mut &bytes[..bytes.len() - 1]).is_err());
         assert!(decode_row(&mut &[TAG_INT64][..]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod partial_tests {
+    use super::*;
+
+    #[test]
+    fn skip_value_advances_correctly() {
+        let mut buf = Vec::new();
+        encode_value(&ScalarValue::Int64(7), &mut buf);
+        encode_value(&ScalarValue::Utf8("hello".into()), &mut buf);
+        encode_value(&ScalarValue::Float64(1.5), &mut buf);
+        encode_value(&ScalarValue::Date(100), &mut buf);
+        let mut s = &buf[..];
+        // 跳过 Int64 和 Utf8,保留 Float64/Date
+        skip_value(&mut s).unwrap();
+        skip_value(&mut s).unwrap();
+        let v1 = decode_value(&mut s).unwrap();
+        let v2 = decode_value(&mut s).unwrap();
+        assert_eq!(v1, ScalarValue::Float64(1.5));
+        assert_eq!(v2, ScalarValue::Date(100));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn partial_decode_keeps_needed_cols_only() {
+        let row: Row = vec![
+            ScalarValue::Int64(1),
+            ScalarValue::Utf8("hello world".into()),
+            ScalarValue::Float64(2.5),
+            ScalarValue::Null,
+        ];
+        let mut buf = Vec::new();
+        encode_row(&row, &mut buf);
+        let needed = [true, false, true, false];
+        let mut s = &buf[..];
+        let partial = decode_row_partial(&mut s, &needed).unwrap();
+        assert_eq!(partial.len(), 4);
+        assert_eq!(partial[0], ScalarValue::Int64(1));
+        assert_eq!(partial[1], ScalarValue::Null, "剪枝列 → Null 占位");
+        assert_eq!(partial[2], ScalarValue::Float64(2.5));
+        assert_eq!(partial[3], ScalarValue::Null);
+    }
+}
+
+#[cfg(test)]
+mod partial_tests2 {
+    use super::*;
+
+    /// Date 是 4 字节列,验证剪枝含 Date 时游标推进正确。
+    #[test]
+    fn partial_decode_with_date_column() {
+        let row: Row = vec![
+            ScalarValue::Int64(1),
+            ScalarValue::Utf8("hello world".into()),
+            ScalarValue::Float64(2.5),
+            ScalarValue::Null,
+            ScalarValue::Date(100),
+            ScalarValue::Int64(9),
+        ];
+        // 剪枝含 4 字节的 Date 列(游标推进正确性);末列保留
+        let needed = [true, false, true, false, true, true];
+        let mut buf = Vec::new();
+        encode_row(&row, &mut buf);
+        let mut s = &buf[..];
+        let partial = decode_row_partial(&mut s, &needed).unwrap();
+        assert_eq!(partial.len(), 6);
+        assert_eq!(partial[0], ScalarValue::Int64(1));
+        assert_eq!(partial[1], ScalarValue::Null, "剪枝列 → Null 占位");
+        assert_eq!(partial[2], ScalarValue::Float64(2.5));
+        assert_eq!(partial[3], ScalarValue::Null);
+        assert_eq!(partial[4], ScalarValue::Date(100));
+        assert_eq!(
+            partial[5],
+            ScalarValue::Int64(9),
+            "末列(剪 Date 后)游标应精确推进"
+        );
     }
 }

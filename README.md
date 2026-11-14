@@ -89,7 +89,7 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 ## 当前进度与路线图
 
-已完成(全部带测试,workspace 240 个测试):
+已完成(全部带测试,workspace 242 个测试):
 
 - 内存机制三层(mimalloc / 配额树 / arena)
 - LSM 完整闭环:WAL 恢复、SST 读写、flush、压缩、墓碑、并发单写者、序列水位恢复、
@@ -139,6 +139,10 @@ postgres=# DELETE FROM users WHERE id = 1;
     公共子表达式消除(按子树文本键复用寄存器)
   - **单次使用移动**:寄存器消费计数,单次使用按移动取用(免整列拷贝)
   - SF0.1:合计 651ms → **590ms**(叠加上一轮累计 -40%)
+- **投影下推(解码剪枝)**:planner 收集全查询引用列(投影/排序/WHERE/
+  JOIN 键与残余/分组/聚合参数/HAVING)换算每表局部 needed 位图;
+  `decode_row_partial` 按列跳过字节(编码自描述,游标安全推进)——
+  未引用列(尤其 Utf8/Binary)零分配;SF0.1 合计 590 → **511ms**(-13%)
 - **类型化哈希键 + Top-N 排序**:
   - HashJoin:全部连接键为单列 Int64 时自动切换 **HashMap<Vec<i64>> 快速通道**
     (直取类型化列数组,免 Vec<ScalarValue> 逐行装箱;NULL 键经位图判空);

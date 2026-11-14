@@ -105,7 +105,10 @@ fn main() {
         "B JIT 编译: {:>10.1?}   (直线机器码:类型/常量/拓扑全部烘焙,零树遍历)",
         jit
     );
-    println!("加速比:     {:>10.1}x", interp.as_secs_f64() / jit.as_secs_f64());
+    println!(
+        "加速比:     {:>10.1}x",
+        interp.as_secs_f64() / jit.as_secs_f64()
+    );
     println!("校验: a = {acc_a:.0}, b = {acc_b:.0}");
 
     println!("\n但注意:B 之所以能做到,是因为表达式形状在【演示程序编译期】已知 ——");

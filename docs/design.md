@@ -275,7 +275,20 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 每节点带估行数 / 下推过滤 / 连接键 / 物化侧标签。planner 以 `ExplNode` 树
 累积、`flatten_expl` 摊平;LIMIT 在外层包装时整体缩进一级。
 
-#### 5.5.5b 类型化哈希键与 Top-N
+#### 5.5.5c 投影下推(解码剪枝)
+
+- **引用收集**(`optimizer::collect_sql_columns`):SQL 级列引用收集器,
+  与 collect_sql_tables 同构遍历但收集列;来源覆盖:扫描下推谓词(planned
+  flat)、延迟 WHERE、JOIN 键与残余(pool SQL)、投影 + 排序隐藏键、
+  分组 + 聚合参数(rewriter.pruning_exprs)、HAVING(SQL 级,先于重写收集)。
+- **解码剪枝**(`codec::decode_row_partial` + `skip_value`):编码自描述
+  (tag + 定长/变长载荷),未标记列只推进游标不物化 —— Utf8/Binary 的
+  String 分配完全省掉;剪枝含 Date(4B)时游标推进要精确(v1 踩过:
+  skip 把 4B Date 误当 8B 导致错位)。
+- **表示约定**:剪枝列槽位 = Null 占位(行仍全宽,下游扁平下标不变)。
+- 列存路径暂忽略剪枝(副本向量克隆本就廉价);slot 语义边界见路线图。
+
+### 5.5.5b 类型化哈希键与 Top-N
 
 - **HashJoin Int64 快速通道**:全部连接键为单列 `Expr::Column` 且两侧列类型
   均为 Int64 → build/探测均走 `HashMap<Vec<i64>>`:键从类型化列数组直取

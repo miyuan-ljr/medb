@@ -770,6 +770,61 @@ fn plan_select(
         let pool_refs: Vec<&SE> = pool_src.iter().collect();
         let pool = optimizer::build_pool(&pool_refs, &scope, &est)?;
 
+        // ---------- 投影剪枝:收集全查询引用列,换算每表局部 needed 位图 ----------
+        // 引用来源:扫描下推谓词 / 延迟 WHERE / JOIN 键与残余(pool)/
+        // 投影 + 排序隐藏键 / 分组 + 聚合参数 / HAVING(SQL 级)。
+        let mut refs: std::collections::HashSet<usize> = Default::default();
+        let mut collect_flat = |e: &Expr, out: &mut std::collections::HashSet<usize>| {
+            collect_column_refs(e, out);
+        };
+        for preds in &scan_preds {
+            for e in preds {
+                collect_flat(e, &mut refs);
+            }
+        }
+        for (_, e) in &deferred {
+            collect_flat(e, &mut refs);
+        }
+        for (keys, _) in &left_keys {
+            for e in keys {
+                collect_flat(e, &mut refs);
+            }
+        }
+        for ms in &left_match {
+            for e in ms {
+                collect_flat(e, &mut refs);
+            }
+        }
+        for p in &visible {
+            collect_column_refs(&p.expr, &mut refs);
+        }
+        for h in &hidden {
+            collect_column_refs(h, &mut refs);
+        }
+        for e in rewriter.pruning_exprs() {
+            collect_column_refs(e, &mut refs);
+        }
+        let mut sql_refs: std::collections::BTreeSet<(usize, String)> = Default::default();
+        for entry in &pool {
+            let _ = optimizer::collect_sql_columns(entry.expr, &scope, &mut sql_refs);
+        }
+        if let Some(h) = &select.having {
+            let _ = optimizer::collect_sql_columns(h, &scope, &mut sql_refs);
+        }
+        for (pos, cname) in &sql_refs {
+            if let Some(ci) = scope.tables[*pos].1.column_index(cname) {
+                refs.insert(offsets[*pos] + ci);
+            }
+        }
+        // 换算每表局部 needed 位图
+        let needed_cols: Vec<Vec<bool>> = (0..steps.len())
+            .map(|p| {
+                (0..steps[p].schema.columns.len())
+                    .map(|c| refs.contains(&(offsets[p] + c)))
+                    .collect()
+            })
+            .collect();
+
         // ---------- 发射:连续 INNER 段 DP 枚举连接顺序;LEFT 步骤为屏障 ----------
         let em = EmitCtx {
             steps: &steps,
@@ -778,6 +833,7 @@ fn plan_select(
             scan_preds: &scan_preds,
             scan_sql: &scan_sql,
             scan_sels: &scan_sels,
+            needed: &needed_cols,
             pool: &pool,
             est: &est,
             scope_ref,
@@ -971,6 +1027,8 @@ struct EmitCtx<'a> {
     scan_preds: &'a [Vec<Expr>],
     scan_sql: &'a [Vec<String>],
     scan_sels: &'a [Vec<f64>],
+    /// 每表投影剪枝位图(表内局部下标;true = 需要物化)
+    needed: &'a [Vec<bool>],
     pool: &'a [optimizer::PoolEntry<'a>],
     est: &'a Estimator<'a>,
     scope_ref: Option<&'a Scope>,
@@ -1077,6 +1135,7 @@ fn flush_group(
                 &em.steps[node],
                 &em.scan_preds[node],
                 em.offsets[node],
+                &em.needed[node],
                 em.plan_ctx,
             )?);
             st.cur_order = vec![node];
@@ -1252,7 +1311,13 @@ fn emit_inner_join(
         .map(|&f| em.input_schema[f].clone())
         .collect();
     let (probe_exec, build_exec, probe_schema, build_schema, children) = if build_accumulated {
-        let probe = table_scan(&em.steps[t], &em.scan_preds[t], t_offset, em.plan_ctx)?;
+        let probe = table_scan(
+            &em.steps[t],
+            &em.scan_preds[t],
+            t_offset,
+            &em.needed[t],
+            em.plan_ctx,
+        )?;
         let build = st.exec.take().expect("accumulated pipeline");
         let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
         (
@@ -1263,7 +1328,13 @@ fn emit_inner_join(
             vec![ExplNode::leaf(scan_label(em, t, base_of(em, t))), expl_prev],
         )
     } else {
-        let build = table_scan(&em.steps[t], &em.scan_preds[t], t_offset, em.plan_ctx)?;
+        let build = table_scan(
+            &em.steps[t],
+            &em.scan_preds[t],
+            t_offset,
+            &em.needed[t],
+            em.plan_ctx,
+        )?;
         let probe = st.exec.take().expect("accumulated pipeline");
         let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
         (
@@ -1348,7 +1419,7 @@ fn emit_left_join(
         .iter()
         .map(|&f| em.input_schema[f].clone())
         .collect();
-    let build = table_scan(&em.steps[k], &[], em.offsets[k], em.plan_ctx)?;
+    let build = table_scan(&em.steps[k], &[], em.offsets[k], &em.needed[k], em.plan_ctx)?;
 
     let mut residual: Vec<Expr> = Vec::new();
     let mut residual_sql: Vec<String> = Vec::new();
@@ -1565,6 +1636,7 @@ fn table_scan(
     step: &RelationStep,
     preds: &[Expr],
     offset: usize,
+    needed: &[bool],
     ctx: &PlanContext<'_>,
 ) -> Result<BoxedExecutor> {
     // 谓词下推:随解码过滤(列存路径则在列块上求值),不再叠加 FilterExec
@@ -1577,13 +1649,26 @@ fn table_scan(
             .collect::<Result<Vec<_>>>()?;
         combine_and(rebased)
     };
-    let exec: BoxedExecutor = match pushdown {
-        Some(pred) => Box::new(SeqScanExec::with_pushdown(
+    // 投影剪枝:needed 全 true 时不启用(decode 路径等价)
+    let all_true = needed.iter().all(|b| *b);
+    let needed = if all_true {
+        None
+    } else {
+        Some(needed.to_vec())
+    };
+    let exec: BoxedExecutor = match (pushdown, needed) {
+        (Some(pred), n) => Box::new(SeqScanExec::with_projection(
             ctx.data.clone(),
             step.schema.clone(),
             Some(pred),
+            n,
         )),
-        None => Box::new(SeqScanExec::new(ctx.data.clone(), step.schema.clone())),
+        (None, n) => Box::new(SeqScanExec::with_projection(
+            ctx.data.clone(),
+            step.schema.clone(),
+            None,
+            n,
+        )),
     };
     Ok(exec)
 }
@@ -2026,6 +2111,17 @@ impl<'a> AggRewriter<'a> {
                 desc.out_type.clone(),
                 true,
             ));
+        }
+        out
+    }
+
+    /// 投影剪枝:分组表达式 + 聚合参数引用到的输入列表达式。
+    pub(crate) fn pruning_exprs(&self) -> Vec<&Expr> {
+        let mut out: Vec<&Expr> = self.groups.iter().map(|(e, _)| e).collect();
+        for (desc, _) in &self.aggs {
+            if let Some(a) = &desc.arg {
+                out.push(a);
+            }
         }
         out
     }
