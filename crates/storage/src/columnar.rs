@@ -1,12 +1,16 @@
-//! HTAP 列存副本(v1 钩子)。
+//! HTAP 列存副本(v1)。
 //!
 //! 定位:行存(LSM)是 TP 主库;本模块按表维护一份"键 → 行"的列视图,
 //! TP 写入经 CDC 应用到这里,AP 扫描按列读取。
 //!
-//! v1 是全量行的内存映射,足以打通链路;生产化方向(路线图 M4):
-//! 列式 segment 文件 + 增量 delta 行 + 后台 merge,以及字典/RLE 编码。
+//! - **NULL 语义**:每列带 null 位图(Some(mask) / None=全非空),null 不再
+//!   被静默替换为默认值 —— 列存路径与行存路径行为一致;
+//! - **类型支持**:Boolean/Int64/Float64/Utf8/Date;Binary/Array/Vector 列
+//!   暂不入列存(scan_column 返回 Empty,AP 扫描回退行存路径);
+//! - 扫描顺序:按键排序(BTreeMap),同一表两次 scan_column 列内对齐。
 //!
-//! 扫描顺序:按键排序(BTreeMap),保证同一表两次 scan_column 列内对齐。
+//! 生产化方向(路线图 M4):列式 segment 文件 + 增量 delta 行 + 后台 merge,
+//! 以及字典/RLE 编码。
 
 use std::collections::BTreeMap;
 
@@ -16,44 +20,75 @@ use common::schema::{Row, TableSchema};
 use common::types::DataType;
 use parking_lot::Mutex;
 
-/// 列的简单向量表示(与 exec::Vector 解耦,避免 storage 反向依赖执行引擎;
-/// AP 路径在 exec 侧转换)。
+/// 列的向量表示(值 + 可选 null 位图;与 exec::Vector 解耦,避免 storage
+/// 反向依赖执行引擎,AP 路径在 exec 侧转换)。
 #[derive(Debug, Clone, PartialEq)]
-pub enum ColumnVector {
+pub struct ColumnVector {
+    pub values: ColumnValues,
+    /// Some(mask):位图(true = 该行为 null);None = 全部非空。
+    /// mask 长度恒等于 values 长度。
+    pub nulls: Option<Vec<bool>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnValues {
     Bool(Vec<bool>),
     Int64(Vec<i64>),
     Float64(Vec<f64>),
     Utf8(Vec<String>),
-    /// 整列尚未写入(空表/未应用)。
+    /// 日期列(距 1970-01-01 天数)。
+    Date(Vec<i32>),
+    /// 整列尚未写入(空表/不支持的类型)。
     Empty,
 }
 
 impl ColumnVector {
-    pub fn len(&self) -> usize {
-        match self {
-            ColumnVector::Bool(v) => v.len(),
-            ColumnVector::Int64(v) => v.len(),
-            ColumnVector::Float64(v) => v.len(),
-            ColumnVector::Utf8(v) => v.len(),
-            ColumnVector::Empty => 0,
+    pub fn values_len(&self) -> usize {
+        match &self.values {
+            ColumnValues::Bool(v) => v.len(),
+            ColumnValues::Int64(v) => v.len(),
+            ColumnValues::Float64(v) => v.len(),
+            ColumnValues::Utf8(v) => v.len(),
+            ColumnValues::Date(v) => v.len(),
+            ColumnValues::Empty => 0,
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn len(&self) -> usize {
+        self.values_len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.values_len() == 0
+    }
+
+    /// 追加一个值;null 只置位图并压入类型默认值(保持值/位图对齐)。
     fn push_scalar(&mut self, v: &common::types::ScalarValue) -> Result<()> {
         use common::types::ScalarValue as SV;
-        match (self, v) {
-            (ColumnVector::Bool(vec), SV::Boolean(b)) => vec.push(*b),
-            (ColumnVector::Int64(vec), SV::Int64(i)) => vec.push(*i),
-            (ColumnVector::Float64(vec), SV::Float64(f)) => vec.push(*f),
-            (ColumnVector::Utf8(vec), SV::Utf8(s)) => vec.push(s.clone()),
-            (col, SV::Null) => {
-                let _ = col;
-                // v1 不支持可空列副本(null 由行内默认值替代),TODO 支持位图
+        if v.is_null() {
+            let len = self.len();
+            let nulls = self.nulls.get_or_insert_with(|| vec![false; len]);
+            nulls.push(true);
+            match &mut self.values {
+                ColumnValues::Bool(vec) => vec.push(false),
+                ColumnValues::Int64(vec) => vec.push(0),
+                ColumnValues::Float64(vec) => vec.push(0.0),
+                ColumnValues::Utf8(vec) => vec.push(String::new()),
+                ColumnValues::Date(vec) => vec.push(0),
+                ColumnValues::Empty => {}
             }
+            return Ok(());
+        }
+        // 非空值:若此前已有 null,位图补一个 false
+        if let Some(nulls) = &mut self.nulls {
+            nulls.push(false);
+        }
+        match (&mut self.values, v) {
+            (ColumnValues::Bool(vec), SV::Boolean(b)) => vec.push(*b),
+            (ColumnValues::Int64(vec), SV::Int64(i)) => vec.push(*i),
+            (ColumnValues::Float64(vec), SV::Float64(f)) => vec.push(*f),
+            (ColumnValues::Utf8(vec), SV::Utf8(s)) => vec.push(s.clone()),
+            (ColumnValues::Date(vec), SV::Date(d)) => vec.push(*d),
             (col, v) => {
                 return Err(Error::invalid_argument(format!(
                     "columnar type mismatch: {:?} vs {:?}",
@@ -73,8 +108,9 @@ pub trait ColumnarReplica: Send + Sync {
     /// CDC delete。
     fn delete(&self, table: TableId, key: &[u8]) -> Result<()>;
 
-    /// 读取某列(键序对齐)。列号越界返回错误。
-    fn scan_column(&self, table: TableId, column: usize) -> Result<ColumnVector>;
+    /// 按声明类型读取某列(键序对齐;null 由位图表达)。列号越界返回错误。
+    /// Binary/Array/Vector 列返回 Empty(AP 扫描回退行存路径)。
+    fn scan_column(&self, table: TableId, column: usize, ty: &DataType) -> Result<ColumnVector>;
 
     /// 整表移除(DROP TABLE 时调用)。
     fn drop_table(&self, table: TableId) -> Result<()>;
@@ -131,33 +167,47 @@ impl ColumnarReplica for InMemoryColumnarReplica {
         Ok(())
     }
 
-    fn scan_column(&self, table: TableId, column: usize) -> Result<ColumnVector> {
+    fn scan_column(&self, table: TableId, column: usize, ty: &DataType) -> Result<ColumnVector> {
         let tables = self.tables.lock();
         let Some(t) = tables.get(&table.0) else {
-            return Ok(ColumnVector::Empty);
+            return Ok(ColumnVector {
+                values: ColumnValues::Empty,
+                nulls: None,
+            });
         };
         if t.rows.is_empty() {
-            return Ok(ColumnVector::Empty);
+            return Ok(ColumnVector {
+                values: ColumnValues::Empty,
+                nulls: None,
+            });
         }
-        // 列号越界检查 + 类型推断(以首行为准;v1 要求列内类型一致,可空列见路线图)
-        let first = t.rows.values().next().unwrap();
-        let Some(v) = first.get(column) else {
-            return Err(Error::invalid_argument(format!(
-                "column {column} out of range"
-            )));
-        };
-        let ty = v.data_type().ok_or_else(|| {
-            Error::invalid_argument(format!("cannot infer type of column {column}"))
-        })?;
         let mut out = match ty {
-            DataType::Boolean => ColumnVector::Bool(Vec::new()),
-            DataType::Int64 => ColumnVector::Int64(Vec::new()),
-            DataType::Float64 => ColumnVector::Float64(Vec::new()),
-            DataType::Utf8 => ColumnVector::Utf8(Vec::new()),
-            // 列存副本 v1 仅支持标量列;LOB/数组/向量列的 AP 扫描走行存路径,
-            // 此处返回空(与未写入语义一致)
-            DataType::Binary | DataType::Array(_) | DataType::Vector(_) | DataType::Date => {
-                return Ok(ColumnVector::Empty);
+            DataType::Boolean => ColumnVector {
+                values: ColumnValues::Bool(Vec::new()),
+                nulls: None,
+            },
+            DataType::Int64 => ColumnVector {
+                values: ColumnValues::Int64(Vec::new()),
+                nulls: None,
+            },
+            DataType::Float64 => ColumnVector {
+                values: ColumnValues::Float64(Vec::new()),
+                nulls: None,
+            },
+            DataType::Utf8 => ColumnVector {
+                values: ColumnValues::Utf8(Vec::new()),
+                nulls: None,
+            },
+            DataType::Date => ColumnVector {
+                values: ColumnValues::Date(Vec::new()),
+                nulls: None,
+            },
+            // LOB/数组/向量列暂不入列存:返回 Empty(AP 扫描回退行存路径)
+            DataType::Binary | DataType::Array(_) | DataType::Vector(_) => {
+                return Ok(ColumnVector {
+                    values: ColumnValues::Empty,
+                    nulls: None,
+                });
             }
         };
         for row in t.rows.values() {
@@ -165,6 +215,10 @@ impl ColumnarReplica for InMemoryColumnarReplica {
                 .get(column)
                 .ok_or_else(|| Error::invalid_argument(format!("column {column} out of range")))?;
             out.push_scalar(v)?;
+        }
+        // 位图全 false → 丢弃(None 表示全非空)
+        if out.nulls.as_ref().is_some_and(|m| !m.iter().any(|b| *b)) {
+            out.nulls = None;
         }
         Ok(out)
     }
@@ -186,6 +240,7 @@ impl ColumnarReplica for InMemoryColumnarReplica {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::schema::ColumnDesc;
     use common::types::ScalarValue;
 
     fn schema() -> TableSchema {
@@ -193,8 +248,9 @@ mod tests {
             id: 1,
             name: "t".into(),
             columns: vec![
-                common::schema::ColumnDesc::new("id", DataType::Int64, false),
-                common::schema::ColumnDesc::new("name", DataType::Utf8, true),
+                ColumnDesc::new("id", DataType::Int64, false),
+                ColumnDesc::new("name", DataType::Utf8, true),
+                ColumnDesc::new("d", DataType::Date, true),
             ],
             primary_key: Vec::new(),
             version: 1,
@@ -202,21 +258,29 @@ mod tests {
     }
 
     #[test]
-    fn upsert_delete_scan() {
+    fn upsert_delete_scan_with_nulls() {
         let replica = InMemoryColumnarReplica::new();
         let s = schema();
         replica
             .upsert(
                 &s,
                 b"k1",
-                vec![ScalarValue::Int64(1), ScalarValue::Utf8("a".into())],
+                vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::Utf8("a".into()),
+                    ScalarValue::Date(100),
+                ],
             )
             .unwrap();
         replica
             .upsert(
                 &s,
                 b"k2",
-                vec![ScalarValue::Int64(2), ScalarValue::Utf8("b".into())],
+                vec![
+                    ScalarValue::Int64(2),
+                    ScalarValue::Null,
+                    ScalarValue::Date(200),
+                ],
             )
             .unwrap();
         // 覆盖写
@@ -224,25 +288,49 @@ mod tests {
             .upsert(
                 &s,
                 b"k1",
-                vec![ScalarValue::Int64(10), ScalarValue::Utf8("z".into())],
+                vec![
+                    ScalarValue::Int64(10),
+                    ScalarValue::Utf8("z".into()),
+                    ScalarValue::Null,
+                ],
             )
             .unwrap();
         assert_eq!(replica.row_count(TableId(1)), 2);
 
-        let ids = replica.scan_column(TableId(1), 0).unwrap();
-        assert_eq!(ids, ColumnVector::Int64(vec![10, 2])); // 键序 k1 < k2
-        let names = replica.scan_column(TableId(1), 1).unwrap();
-        assert_eq!(names, ColumnVector::Utf8(vec!["z".into(), "b".into()]));
+        let ids = replica
+            .scan_column(TableId(1), 0, &DataType::Int64)
+            .unwrap();
+        assert_eq!(ids.values, ColumnValues::Int64(vec![10, 2])); // 键序 k1 < k2
+        assert_eq!(ids.nulls, None);
+
+        let names = replica.scan_column(TableId(1), 1, &DataType::Utf8).unwrap();
+        assert_eq!(
+            names.values,
+            ColumnValues::Utf8(vec!["z".into(), String::new()])
+        );
+        let nulls = names.nulls.expect("name 列应含 null 位图");
+        assert_eq!(nulls, vec![false, true]);
+
+        let dates = replica.scan_column(TableId(1), 2, &DataType::Date).unwrap();
+        assert_eq!(dates.values, ColumnValues::Date(vec![0, 200]));
+        assert_eq!(
+            dates.nulls.expect("date 列应含 null 位图"),
+            vec![true, false]
+        );
 
         replica.delete(TableId(1), b"k1").unwrap();
         assert_eq!(replica.row_count(TableId(1)), 1);
-        assert_eq!(
-            replica.scan_column(TableId(1), 0).unwrap(),
-            ColumnVector::Int64(vec![2])
-        );
-        assert_eq!(
-            replica.scan_column(TableId(99), 0).unwrap(),
-            ColumnVector::Empty
+        let ids = replica
+            .scan_column(TableId(1), 0, &DataType::Int64)
+            .unwrap();
+        assert_eq!(ids.values, ColumnValues::Int64(vec![2]));
+
+        // 空表/未知表 → Empty
+        assert!(
+            replica
+                .scan_column(TableId(99), 0, &DataType::Int64)
+                .unwrap()
+                .is_empty()
         );
     }
 

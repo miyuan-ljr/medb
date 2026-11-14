@@ -89,7 +89,7 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 ## 当前进度与路线图
 
-已完成(全部带测试,workspace 222 个测试):
+已完成(全部带测试,workspace 228 个测试):
 
 - 内存机制三层(mimalloc / 配额树 / arena)
 - LSM 完整闭环:WAL 恢复、SST 读写、flush、压缩、墓碑、并发单写者、序列水位恢复、
@@ -131,6 +131,18 @@ postgres=# DELETE FROM users WHERE id = 1;
   - **EXPLAIN <SELECT>**:统计驱动的计划树(扫描估行/下推过滤/连接键/物化侧)
   - 顺带修正:LEFT JOIN 空产侧谓词此前被错误下推(会改变 NULL 补齐语义),
     统一路由后按"位置 ≥ 自身的 LEFT 步骤挡住下推"处理
+- **谓词下推 + AP 列存路径 + 并行执行(读写路径性能优化)**:
+  - **谓词下推**:扫描谓词随解码过滤(`scan_table_filtered`),未命中行不进
+    物化 —— JOIN build 侧、聚合输入、内存占用同步缩小;
+  - **AP 列存路径**:标量表(Boolean/Int64/Float64/Utf8/Date)自动提交读
+    走列存副本(整列向量,免逐行解码);列存副本补齐 **null 位图**与
+    **Date 列**支持,与行存 NULL 语义一致;门控:事务内读回退行存
+    (副本只镜像已提交状态,保证读己之写)、LOB/数组/向量列回退;
+    **重启从 LSM 全量重建副本**(空副本不再被误当可信);
+  - **并行框架**(`exec::parallel`):`scope_map` 作用域线程分片(保序拼接),
+    应用于 LSM 解码过滤与 HashJoin 探测行组装;`engine.parallelism` 配置
+    (默认 CPU 核数,上限 8);
+  - SF0.1 基准:11 条合计 976ms → **651ms**(-33%),Q6 -60%、Q10 -62%。
 - **内存控制(30 GiB 上限)**:
   - 配额树根默认限额提升到 **30 GiB**(`memory.global_limit_bytes`,0 = 不限);
     memtable / arena / chunk / 哈希表 / 物化行集全在同一棵树上记账

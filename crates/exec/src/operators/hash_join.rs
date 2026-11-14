@@ -147,24 +147,60 @@ impl HashJoinExec {
                 .map(|e| e.eval(&batch))
                 .collect::<Result<Vec<_>>>()?;
             // 按探测行分组收集候选组合行;null_ext 记录直接 NULL 补齐的探测行
-            let mut cand: Vec<Vec<Row>> = vec![Vec::new(); batch.num_rows()];
-            let mut null_ext: Vec<bool> = vec![false; batch.num_rows()];
-            for i in 0..batch.num_rows() {
-                let key: Vec<ScalarValue> = key_cols.iter().map(|c| c.scalar_at(i)).collect();
-                if key.iter().any(|v| v.is_null()) {
-                    null_ext[i] = left;
-                    continue;
-                }
-                match table.get(&key) {
-                    Some(matches) if !matches.is_empty() => {
-                        let probe_row = batch.row(i);
-                        for build_row in matches {
-                            let mut row = probe_row.clone();
-                            row.extend(build_row.iter().cloned());
-                            cand[i].push(row);
+            // (行组装并行化:分片各自构建,按片序拼接保序)
+            let n_rows = batch.num_rows();
+            let mut cand: Vec<Vec<Row>> = vec![Vec::new(); n_rows];
+            let mut null_ext: Vec<bool> = vec![false; n_rows];
+            if ctx.threads > 1 && n_rows >= 256 {
+                // 并行:行下标分片,各片独立查表组装
+                let idx: Vec<usize> = (0..n_rows).collect();
+                let parts = crate::parallel::scope_map_try(&idx, ctx.threads, |sl| {
+                    let mut rows: Vec<(usize, Vec<Row>, bool)> = Vec::with_capacity(sl.len());
+                    for &i in sl {
+                        let key: Vec<ScalarValue> =
+                            key_cols.iter().map(|c| c.scalar_at(i)).collect();
+                        if key.iter().any(|v| v.is_null()) {
+                            rows.push((i, Vec::new(), left));
+                            continue;
+                        }
+                        match table.get(&key) {
+                            Some(matches) if !matches.is_empty() => {
+                                let probe_row = batch.row(i);
+                                let mut combos = Vec::with_capacity(matches.len());
+                                for build_row in matches {
+                                    let mut row = probe_row.clone();
+                                    row.extend(build_row.iter().cloned());
+                                    combos.push(row);
+                                }
+                                rows.push((i, combos, false));
+                            }
+                            _ => rows.push((i, Vec::new(), left)),
                         }
                     }
-                    _ => null_ext[i] = left,
+                    Ok(rows)
+                })?;
+                for (i, rows, null_flag) in parts.into_iter().flatten() {
+                    cand[i] = rows;
+                    null_ext[i] = null_flag;
+                }
+            } else {
+                for i in 0..n_rows {
+                    let key: Vec<ScalarValue> = key_cols.iter().map(|c| c.scalar_at(i)).collect();
+                    if key.iter().any(|v| v.is_null()) {
+                        null_ext[i] = left;
+                        continue;
+                    }
+                    match table.get(&key) {
+                        Some(matches) if !matches.is_empty() => {
+                            let probe_row = batch.row(i);
+                            for build_row in matches {
+                                let mut row = probe_row.clone();
+                                row.extend(build_row.iter().cloned());
+                                cand[i].push(row);
+                            }
+                        }
+                        _ => null_ext[i] = left,
+                    }
                 }
             }
             // match_cond:候选整批求值,按探测行保留通过者

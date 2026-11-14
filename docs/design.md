@@ -275,7 +275,29 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 每节点带估行数 / 下推过滤 / 连接键 / 物化侧标签。planner 以 `ExplNode` 树
 累积、`flatten_expl` 摊平;LIMIT 在外层包装时整体缩进一级。
 
-### 5.5.5 内存上限与物化记账
+#### 5.5.5 读取路径:谓词下推 / AP 列存 / 并行
+
+- **谓词下推**:`QueryDataSource::scan_table_filtered(table, pred)`(pred 为
+  表内局部下标)。引擎实现 = LSM 扫描 + **并行解码过滤**:entries 分片 →
+  各线程解码组批(512 行)→ 向量化求值 → 按片序拼接(保插入序)。
+  planner 的 `table_scan` 把合取谓词直接传给 SeqScan(不再叠加 FilterExec)。
+  收益:未命中行不进物化,JOIN build 侧/聚合输入/内存同步缩小。
+- **AP 列存路径**:`QueryDataSource::scan_columns(table) -> Option<Vec<Vector>>`。
+  引擎实现:列存副本逐列读出 → 转 exec Vector(含 null 位图转换)。
+  - 门控(任一不满足即回退行存):事务内读(副本只镜像已提交状态,
+    必须保读己之写)、LOB/数组/向量列、副本缺失;
+  - **重启重建**:副本是内存镜像,Engine::open 时从 LSM 全量重建 ——
+    空副本不可信,否则重启后新写入的行会"遮蔽"历史行(v1 踩过);
+  - 列存副本 v1.1:每列带 null 位图(与行存 NULL 语义一致),Date 列支持;
+  - 列间长度一致性校验(misalignment = corruption 错误)。
+- **并行框架**(`exec::parallel`):`scope_map` / `scope_map_try` ——
+  `std::thread::scope` 分片借用(无需 'static),连续分片保序拼接。
+  应用:LSM 解码过滤(engine)、HashJoin 探测行组装(≥256 行才并行,
+  避免小批线程开销)。`ExecuteContext.threads` / `config.engine.parallelism`
+  (默认 CPU 核数,上限 8)向下传递。路线图:morsel-driven 流水线并行、
+  并行哈希聚合(分区归并)、并行排序。
+
+## 5.5.5 内存上限与物化记账
 
 - **限额层级**:全局(默认 30 GiB)→ 会话 → 查询 → 执行器,任一层超限即
   `MemoryLimitExceeded`(SQLSTATE 53200),整条链路原子回滚记账。

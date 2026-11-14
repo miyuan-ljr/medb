@@ -54,6 +54,11 @@ impl DataChunk {
         &self.columns
     }
 
+    /// 取出全部列(消耗 chunk;列存路径组装用)。
+    pub fn into_columns(self) -> Vec<Vector> {
+        self.columns
+    }
+
     pub fn column(&self, i: usize) -> &Vector {
         &self.columns[i]
     }

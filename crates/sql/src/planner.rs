@@ -1557,16 +1557,24 @@ fn table_scan(
     offset: usize,
     ctx: &PlanContext<'_>,
 ) -> Result<BoxedExecutor> {
-    let mut exec: BoxedExecutor = Box::new(SeqScanExec::new(ctx.data.clone(), step.schema.clone()));
-    if !preds.is_empty() {
+    // 谓词下推:随解码过滤(列存路径则在列块上求值),不再叠加 FilterExec
+    let pushdown = if preds.is_empty() {
+        None
+    } else {
         let rebased = preds
             .iter()
             .map(|p| rebase_columns(p.clone(), offset))
             .collect::<Result<Vec<_>>>()?;
-        if let Some(pred) = combine_and(rebased) {
-            exec = Box::new(FilterExec::new(exec, pred));
-        }
-    }
+        combine_and(rebased)
+    };
+    let exec: BoxedExecutor = match pushdown {
+        Some(pred) => Box::new(SeqScanExec::with_pushdown(
+            ctx.data.clone(),
+            step.schema.clone(),
+            Some(pred),
+        )),
+        None => Box::new(SeqScanExec::new(ctx.data.clone(), step.schema.clone())),
+    };
     Ok(exec)
 }
 

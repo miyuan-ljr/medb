@@ -14,6 +14,7 @@ pub mod executor;
 pub mod expr;
 pub mod functions;
 pub mod operators;
+pub mod parallel;
 pub mod vector;
 
 pub use chunk::DataChunk;

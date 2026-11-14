@@ -183,3 +183,85 @@ fn exists_subquery_end_to_end() {
         .unwrap();
     assert_eq!(rows_text(outcomes2), vec![vec![s(5)]]);
 }
+
+// ---------- 谓词下推 + AP 列存路径(读路径正确性) ----------
+
+/// 列存路径(全标量表,自动提交):SELECT/WHERE/GROUP BY 走列式读取,
+/// 结果与行存一致(含 NULL 语义 —— 列存位图)。
+#[test]
+fn columnar_path_matches_row_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    engine
+        .execute_script(
+            "CREATE TABLE ap_t (id BIGINT NOT NULL, grp TEXT NOT NULL, val DOUBLE, d DATE)",
+        )
+        .unwrap();
+    engine
+        .execute_script(
+            "INSERT INTO ap_t VALUES \
+             (1, 'a', 1.5, DATE '2024-01-01'), \
+             (2, 'b', NULL, DATE '2024-01-02'), \
+             (3, 'a', 3.0, NULL), \
+             (4, 'a', NULL, NULL)",
+        )
+        .unwrap();
+    // 全标量表 → 列存路径;过滤 + NULL 语义
+    let outcomes = engine
+        .execute_script(
+            "SELECT grp, COUNT(val) AS n, SUM(val) AS s FROM ap_t WHERE id >= 2 GROUP BY grp ORDER BY grp",
+        )
+        .unwrap();
+    assert_eq!(
+        rows_text(outcomes),
+        vec![
+            vec![t("a"), s(1), f(3.0)],
+            vec![t("b"), s(0), ScalarValue::Null],
+        ]
+    );
+    // 点查(谓词下推到解码/列块)
+    let outcomes = engine
+        .execute_script("SELECT val FROM ap_t WHERE d = DATE '2024-01-02'")
+        .unwrap();
+    assert_eq!(rows_text(outcomes), vec![vec![ScalarValue::Null]]);
+}
+
+/// 列存回退行存:事务内(副本看不到本事务写缓冲)读己之写仍正确。
+#[test]
+fn txn_reads_fall_back_to_row_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    engine
+        .execute_script("CREATE TABLE ap_t2 (id BIGINT NOT NULL, v BIGINT NOT NULL)")
+        .unwrap();
+    engine
+        .execute_script("INSERT INTO ap_t2 VALUES (1, 10)")
+        .unwrap();
+    // BEGIN 内写入(列存副本不含)→ 读己之写必须走行存回退
+    let mut sess = server::session::Session::new(engine.clone());
+    sess.execute_script("BEGIN").unwrap();
+    sess.execute_script("INSERT INTO ap_t2 VALUES (2, 20)")
+        .unwrap();
+    let outcomes = sess.execute_script("SELECT SUM(v) FROM ap_t2").unwrap();
+    assert_eq!(rows_text(outcomes), vec![vec![s(30)]], "读己之写");
+    sess.execute_script("COMMIT").unwrap();
+    let outcomes = engine.execute_script("SELECT SUM(v) FROM ap_t2").unwrap();
+    assert_eq!(rows_text(outcomes), vec![vec![s(30)]], "提交后可见");
+}
+
+/// LOB 列(不可列式)自动回退行存,行为不变。
+#[test]
+fn lob_columns_fall_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    engine
+        .execute_script("CREATE TABLE lob_t (id BIGINT NOT NULL, blob BYTEA NOT NULL)")
+        .unwrap();
+    engine
+        .execute_script("INSERT INTO lob_t VALUES (1, '\\xDEADBEEF')")
+        .unwrap();
+    let outcomes = engine
+        .execute_script("SELECT COUNT(*) FROM lob_t WHERE id = 1")
+        .unwrap();
+    assert_eq!(rows_text(outcomes), vec![vec![s(1)]]);
+}

@@ -13,6 +13,8 @@ pub const DEFAULT_QUERY_LIMIT_BYTES: u64 = 256 << 20; // 256 MiB
 pub const DEFAULT_SESSION_LIMIT_BYTES: u64 = 64 << 20; // 64 MiB
 pub const DEFAULT_ARENA_CHUNK_BYTES: usize = 64 << 10; // 64 KiB
 pub const DEFAULT_BATCH_SIZE: usize = 2048;
+/// 并行度上限(v1 单机多线程:扫描解码 / JOIN 探测)。
+pub const DEFAULT_PARALLELISM: usize = 8;
 pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 << 20;
 pub const DEFAULT_WRITE_BUFFER_BYTES: u64 = 32 << 20;
 pub const DEFAULT_SST_BLOCK_SIZE: usize = 16 << 10;
@@ -103,12 +105,15 @@ impl Default for MemoryConfig {
 pub struct EngineConfig {
     /// 向量化批大小(行/批)。
     pub batch_size: usize,
+    /// 并行度(扫描解码 / JOIN 探测构建的线程数)。默认 = CPU 核数,上限 8。
+    pub parallelism: usize,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             batch_size: DEFAULT_BATCH_SIZE,
+            parallelism: DEFAULT_PARALLELISM,
         }
     }
 }

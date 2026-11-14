@@ -14,11 +14,26 @@ use memory::MemoryContext;
 pub struct ExecuteContext {
     pub batch_size: usize,
     pub mem: MemoryContext,
+    /// 并行度(扫描解码 / JOIN 探测组装的线程数);默认 1 = 串行。
+    pub threads: usize,
 }
 
 impl ExecuteContext {
     pub fn new(batch_size: usize, mem: MemoryContext) -> Self {
-        Self { batch_size, mem }
+        Self {
+            batch_size,
+            mem,
+            threads: 1,
+        }
+    }
+
+    /// 指定并行度构造。
+    pub fn with_threads(batch_size: usize, mem: MemoryContext, threads: usize) -> Self {
+        Self {
+            batch_size,
+            mem,
+            threads: threads.max(1),
+        }
     }
 }
 

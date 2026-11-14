@@ -116,6 +116,104 @@ impl StatsStore {
 /// 抽样目标 100 万行:超过时按等步长抽样,NDV 为样本下界估计。
 const ANALYZE_SAMPLE_ROWS: usize = 1 << 20;
 
+/// 解码一片 entry 并按谓词过滤(并行解码的工作单元)。
+/// 组批(512 行)向量化求值谓词,命中行按序返回。
+fn decode_filtered_slice(
+    slice: &[(Vec<u8>, Option<Vec<u8>>)],
+    table: &TableSchema,
+    pred: &exec::expr::Expr,
+) -> Result<Vec<Row>> {
+    let dtypes: Vec<common::types::DataType> = table.columns.iter().map(|c| c.ty.clone()).collect();
+    let mut out = Vec::with_capacity(slice.len() / 4);
+    let mut batch: Vec<Row> = Vec::with_capacity(512);
+    for (_, value) in slice {
+        let Some(bytes) = value else { continue };
+        let mut s = bytes.as_slice();
+        let mut row = common::codec::decode_row(&mut s)?;
+        // schema 前缀兼容
+        if row.len() < table.columns.len() {
+            row.resize(table.columns.len(), ScalarValue::Null);
+        } else if row.len() > table.columns.len() {
+            row.truncate(table.columns.len());
+        }
+        batch.push(row);
+        if batch.len() >= 512 {
+            let chunk = DataChunk::from_rows(&dtypes, &batch)?;
+            let mask = pred.eval(&chunk)?;
+            for i in 0..batch.len() {
+                if !mask.null_at(i) && mask.bool_values()[i] {
+                    out.push(batch[i].clone());
+                }
+            }
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        let chunk = DataChunk::from_rows(&dtypes, &batch)?;
+        let mask = pred.eval(&chunk)?;
+        for i in 0..batch.len() {
+            if !mask.null_at(i) && mask.bool_values()[i] {
+                out.push(batch[i].clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 列存 ColumnVector → exec Vector;Empty(空表/不支持)→ None。
+fn column_vector_to_exec(
+    cv: storage::columnar::ColumnVector,
+    _ty: common::types::DataType,
+) -> Result<Option<Vector>> {
+    use storage::columnar::ColumnValues;
+    fn to_validity(nulls: Option<Vec<bool>>, len: usize) -> Option<exec::vector::Validity> {
+        nulls.map(|mask| {
+            let mut v = exec::vector::Validity::all_valid(len);
+            for (i, is_null) in mask.iter().enumerate() {
+                if *is_null {
+                    v.unset(i);
+                }
+            }
+            v
+        })
+    }
+    // nulls 先于 values 消费(避免借用冲突)
+    let values_len = cv.values_len();
+    let validity = to_validity(cv.nulls, values_len);
+    let v = match cv.values {
+        ColumnValues::Bool(values) => {
+            Vector::new(exec::vector::ColumnData::Bool(values), validity)?
+        }
+        ColumnValues::Int64(values) => {
+            Vector::new(exec::vector::ColumnData::Int64(values), validity)?
+        }
+        ColumnValues::Float64(values) => {
+            Vector::new(exec::vector::ColumnData::Float64(values), validity)?
+        }
+        ColumnValues::Utf8(values) => Vector::new(
+            exec::vector::ColumnData::Utf8 {
+                data: values.concat().into_bytes(),
+                offsets: {
+                    let mut o = Vec::with_capacity(values.len() + 1);
+                    let mut acc = 0u32;
+                    o.push(0);
+                    for s in &values {
+                        acc += s.len() as u32;
+                        o.push(acc);
+                    }
+                    o
+                },
+            },
+            validity,
+        )?,
+        ColumnValues::Date(values) => {
+            Vector::new(exec::vector::ColumnData::Date(values), validity)?
+        }
+        ColumnValues::Empty => return Ok(None),
+    };
+    Ok(Some(v))
+}
+
 fn compute_table_stats(lsm: &Arc<LsmStore>, table: &TableSchema) -> TableStats {
     let (from, to) = row_range(table.id);
     let Ok(entries) = lsm.scan(&from, &to) else {
@@ -154,6 +252,10 @@ struct LsmDataSource {
     read_ts: u64,
     overlay: Arc<std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
     stats: Arc<StatsStore>,
+    /// AP 列存副本句柄;None = 事务内(副本只见已提交状态,回退行存)
+    columnar: Option<Arc<InMemoryColumnarReplica>>,
+    /// 并行度(解码/过滤线程数)
+    threads: usize,
 }
 
 impl QueryDataSource for LsmDataSource {
@@ -197,6 +299,61 @@ impl QueryDataSource for LsmDataSource {
         self.stats.insert(table.id, fresh.clone());
         persist_stats(&self.lsm, table, &fresh);
         Some(fresh)
+    }
+
+    /// 谓词下推:解码期过滤(并行;未命中行不进物化)。
+    fn scan_table_filtered(
+        &self,
+        table: &TableSchema,
+        pred: &exec::expr::Expr,
+    ) -> Result<Vec<Row>> {
+        let (from, to) = row_range(table.id);
+        let entries = self.lsm.scan_at(&from, &to, self.read_ts)?;
+        // 事务缓冲覆盖(BTreeMap 有序,与扫描输出同序归并)
+        let mut merged: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            entries.into_iter().map(|(k, _seq, v)| (k, v)).collect();
+        for (k, v) in self.overlay.range(from..to) {
+            merged.insert(k.clone(), v.clone());
+        }
+        let kv: Vec<(Vec<u8>, Option<Vec<u8>>)> = merged.into_iter().collect();
+        // 并行解码 + 过滤:分片各自组批求值,按片序拼接(保插入序)
+        let parts = exec::parallel::scope_map_try(&kv, self.threads, |slice| {
+            decode_filtered_slice(slice, table, pred)
+        })?;
+        Ok(parts.concat())
+    }
+
+    /// AP 列存路径:标量表 + 无事务门控;Date 列已支持;LOB/数组/向量回退。
+    fn scan_columns(&self, table: &TableSchema) -> Result<Option<Vec<Vector>>> {
+        let Some(replica) = &self.columnar else {
+            return Ok(None);
+        };
+        for c in &table.columns {
+            if !matches!(
+                c.ty,
+                common::types::DataType::Boolean
+                    | common::types::DataType::Int64
+                    | common::types::DataType::Float64
+                    | common::types::DataType::Utf8
+                    | common::types::DataType::Date
+            ) {
+                return Ok(None);
+            }
+        }
+        let mut cols = Vec::with_capacity(table.columns.len());
+        for (i, c) in table.columns.iter().enumerate() {
+            let cv = replica.scan_column(common::ids::TableId(table.id), i, &c.ty)?;
+            let Some(v) = column_vector_to_exec(cv, c.ty.clone())? else {
+                return Ok(None); // 空表(或类型不符)→ 行存路径
+            };
+            cols.push(v);
+        }
+        // 列间长度一致性(副本损坏防护)
+        let len = cols[0].len();
+        if cols.iter().any(|v| v.len() != len) {
+            return Err(Error::corruption("columnar columns misaligned"));
+        }
+        Ok(Some(cols))
     }
 }
 
@@ -286,7 +443,37 @@ impl Engine {
             info!(tables = restored_stats, "table stats restored from lsm");
         }
 
+        // 列存副本是内存镜像,重启即失 —— 从 LSM 全量重建,
+        // 使 AP 列存路径与行存始终一致(增量 CDC 见路线图)
         let columnar = Arc::new(InMemoryColumnarReplica::new());
+        let mut mirrored_rows = 0u64;
+        for schema in catalog.list_tables() {
+            let (from, to) = row_range(schema.id);
+            let Ok(entries) = lsm.scan(&from, &to) else {
+                continue;
+            };
+            let schema_arc = Arc::new(schema.clone());
+            for (key, _seq, value) in entries {
+                let Some(bytes) = value else { continue };
+                let mut slice = bytes.as_slice();
+                let Ok(mut row) = common::codec::decode_row(&mut slice) else {
+                    continue;
+                };
+                if row.len() < schema.columns.len() {
+                    row.resize(schema.columns.len(), ScalarValue::Null);
+                } else if row.len() > schema.columns.len() {
+                    row.truncate(schema.columns.len());
+                }
+                if let Err(e) = columnar.upsert(&schema_arc, &key, row) {
+                    warn!(table = %schema.name, error = %e, "columnar rebuild failed");
+                    break;
+                }
+                mirrored_rows += 1;
+            }
+        }
+        if mirrored_rows > 0 {
+            info!(rows = mirrored_rows, "columnar replica rebuilt from lsm");
+        }
         Ok(Arc::new(Self {
             config,
             memory,
@@ -343,18 +530,23 @@ impl Engine {
         &self,
         read_ts: u64,
         overlay: Arc<std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+        columnar_ok: bool,
     ) -> Arc<dyn QueryDataSource> {
         Arc::new(LsmDataSource {
             lsm: self.lsm.clone(),
             read_ts,
             overlay,
             stats: self.stats.clone(),
+            // 事务内回退行存:副本只镜像已提交状态,看不到本事务写缓冲
+            columnar: columnar_ok.then_some(self.columnar.clone()),
+            threads: self.config.engine.parallelism,
         })
     }
 
-    /// 语句上下文的数据源(快照 + overlay)。
+    /// 语句上下文的数据源(快照 + overlay;无事务时允许 AP 列存路径)。
     pub(crate) fn data_source_for_ctx(&self, sctx: &StatementCtx<'_>) -> Arc<dyn QueryDataSource> {
-        self.data_source_for(sctx.read_ts, sctx.overlay.clone())
+        let columnar_ok = sctx.txn.is_none() && sctx.overlay.is_empty();
+        self.data_source_for(sctx.read_ts, sctx.overlay.clone(), columnar_ok)
     }
 
     /// 语句开始:RC 语义下取当前 last_seq 为快照并注册(语句结束注销)。
@@ -441,7 +633,7 @@ impl Engine {
         let ctx = PlanContext {
             batch_size: self.config.engine.batch_size,
             catalog: &*self.catalog,
-            data: self.data_source_for(self.lsm.last_sequence(), overlay),
+            data: self.data_source_for(self.lsm.last_sequence(), overlay, true),
         };
         plan_statement(stmt, &ctx)
     }
@@ -512,7 +704,11 @@ impl Engine {
 
     fn run_query(&self, pq: PlannedQuery) -> Result<Outcome> {
         let mem = self.new_query_context();
-        let mut ctx = ExecuteContext::new(self.config.engine.batch_size, mem);
+        let mut ctx = ExecuteContext::with_threads(
+            self.config.engine.batch_size,
+            mem,
+            self.config.engine.parallelism,
+        );
         let mut exec = pq.executor;
         let dtypes: Vec<common::types::DataType> = pq.schema.iter().map(|c| c.ty.clone()).collect();
         let mut rows: Vec<Row> = Vec::new();
