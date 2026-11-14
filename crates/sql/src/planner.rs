@@ -16,7 +16,7 @@ use common::schema::{ColumnDesc, Row, TableSchema};
 use common::types::{DataType, ScalarValue};
 use exec::agg::{AggDesc, AggFunc};
 use exec::chunk::DataChunk;
-use exec::executor::BoxedExecutor;
+use exec::executor::{BoxedExecutor, ExecuteContext};
 use exec::expr::{BinaryOp, Expr};
 use exec::operators::hash_agg::AggHashExec;
 use exec::operators::hash_join::{HashJoinExec, JoinType};
@@ -473,7 +473,7 @@ fn plan_select(
     let mut visible: Vec<ProjectItem> = Vec::new();
 
     // 聚合改写器(仅聚合路径使用);GROUP BY 项必须先于任何改写注册
-    let mut rewriter = AggRewriter::new(scope_ref, &input_schema);
+    let mut rewriter = AggRewriter::new(scope_ref, &input_schema, ctx);
     if aggregate {
         for item in group_items {
             rewriter.add_group(item)?;
@@ -486,7 +486,7 @@ fn plan_select(
                 let expr = if aggregate {
                     rewriter.rewrite(e, false)?
                 } else {
-                    plan_expr(e, scope_ref)?
+                    plan_expr(e, scope_ref, ctx)?
                 };
                 visible.push(ProjectItem {
                     planned_display: format!("{expr}"),
@@ -498,7 +498,7 @@ fn plan_select(
                 let e = if aggregate {
                     rewriter.rewrite(expr, false)?
                 } else {
-                    plan_expr(expr, scope_ref)?
+                    plan_expr(expr, scope_ref, ctx)?
                 };
                 visible.push(ProjectItem {
                     planned_display: format!("{e}"),
@@ -510,7 +510,7 @@ fn plan_select(
                 let e = if aggregate {
                     rewriter.rewrite(expr, false)?
                 } else {
-                    plan_expr(expr, scope_ref)?
+                    plan_expr(expr, scope_ref, ctx)?
                 };
                 let name = aliases
                     .first()
@@ -611,7 +611,7 @@ fn plan_select(
                         let expr = if aggregate {
                             rewriter.rewrite(&ob.expr, false)?
                         } else {
-                            plan_expr(&ob.expr, scope_ref)?
+                            plan_expr(&ob.expr, scope_ref, ctx)?
                         };
                         hidden.push(expr);
                         visible.len() + hidden.len() - 1
@@ -623,7 +623,7 @@ fn plan_select(
                 let key = if aggregate {
                     rewriter.rewrite(other, false)?
                 } else {
-                    plan_expr(other, scope_ref)?
+                    plan_expr(other, scope_ref, ctx)?
                 };
                 let display = format!("{key}");
                 match visible.iter().position(|p| p.planned_display == display) {
@@ -643,8 +643,10 @@ fn plan_select(
     }
 
     // ---------- 输出 schema(Project 全列 = 可见 + 隐藏)----------
-    // 聚合路径的"输入"是 agg 输出(groups + aggs)
-    let project_input_schema: Vec<ColumnDesc> = if aggregate {
+    // 聚合路径的"输入"是 agg 输出(groups + aggs);HAVING 若引入新聚合会追加,
+    // 故声明为可变并在 HAVING 改写后重算
+    #[allow(unused_assignments)]
+    let mut project_input_schema: Vec<ColumnDesc> = if aggregate {
         rewriter.agg_output_schema()
     } else {
         input_schema.clone()
@@ -704,7 +706,7 @@ fn plan_select(
             let touched = sql_expr_tables(c, &scope)?;
             match touched.as_slice() {
                 [] => {
-                    let e = plan_expr(c, scope_ref)?;
+                    let e = plan_expr(c, scope_ref, ctx)?;
                     check_bool(&e, &input_schema, "WHERE")?;
                     scan_preds[0].push(e);
                     scan_sql[0].push(format!("{c}"));
@@ -717,13 +719,13 @@ fn plan_select(
                         .map(|off| off + pos);
                     if from_where {
                         if let Some(l) = first_left {
-                            let e = plan_expr(c, scope_ref)?;
+                            let e = plan_expr(c, scope_ref, ctx)?;
                             check_bool(&e, &input_schema, "WHERE")?;
                             deferred.push((l, e));
                             return Ok(());
                         }
                     }
-                    let e = plan_expr(c, scope_ref)?;
+                    let e = plan_expr(c, scope_ref, ctx)?;
                     check_bool(&e, &input_schema, "filter")?;
                     scan_preds[*pos].push(e);
                     scan_sql[*pos].push(format!("{c}"));
@@ -738,12 +740,12 @@ fn plan_select(
             if step.join_type == JoinType::LeftOuter {
                 if let Some(on) = &step.on {
                     for c in split_conjuncts(on) {
-                        if let Some((pk, bk)) = try_hash_eq(c, &scope, &offsets)? {
+                        if let Some((pk, bk)) = try_hash_eq(c, &scope, &offsets, ctx)? {
                             left_keys[j].0.push(pk);
                             left_keys[j].1.push(bk);
                             continue;
                         }
-                        let e = plan_expr(c, scope_ref)?;
+                        let e = plan_expr(c, scope_ref, ctx)?;
                         check_bool(&e, &input_schema, "join condition")?;
                         left_match[j].push(e);
                     }
@@ -804,7 +806,7 @@ fn plan_select(
             if applied.contains(&pi) {
                 continue;
             }
-            let e = plan_expr(entry.expr, scope_ref)?;
+            let e = plan_expr(entry.expr, scope_ref, ctx)?;
             check_bool(&e, &input_schema, "WHERE")?;
             exec = Box::new(FilterExec::new(exec, e));
             expl = Some(ExplNode::with(
@@ -824,7 +826,7 @@ fn plan_select(
                     "aggregates are not allowed in WHERE (use HAVING)",
                 ));
             }
-            let pred = plan_expr(where_expr, None)?;
+            let pred = plan_expr(where_expr, None, ctx)?;
             pipeline = Box::new(FilterExec::new(pipeline, pred));
             expl = Some(ExplNode::with(
                 "Filter".to_string(),
@@ -835,6 +837,20 @@ fn plan_select(
 
     // HAVING + 聚合
     if aggregate {
+        // HAVING 先改写(可能注册投影中没有的新聚合),再取 agg 部件
+        let mut having_pred: Option<Expr> = None;
+        if let Some(having) = &select.having {
+            let pred = rewriter.rewrite(having, false)?;
+            // HAVING 改写可能注册新的聚合 → 重算输入 schema
+            project_input_schema = rewriter.agg_output_schema();
+            match pred.return_type(&project_input_schema)? {
+                Some(DataType::Boolean) | None => {}
+                Some(t) => {
+                    return Err(Error::sql(format!("HAVING must be boolean, got {t:?}")));
+                }
+            }
+            having_pred = Some(pred);
+        }
         let (group_exprs, aggs, agg_out_schema) = rewriter.take_pipeline_parts();
         let n_groups = group_exprs.len();
         let n_aggs = aggs.len();
@@ -849,14 +865,7 @@ fn plan_select(
             format!("Aggregate (groups={n_groups} aggs={n_aggs})"),
             vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
         ));
-        if let Some(having) = &select.having {
-            let pred = rewriter.rewrite(having, false)?;
-            match pred.return_type(&project_input_schema)? {
-                Some(DataType::Boolean) | None => {}
-                Some(t) => {
-                    return Err(Error::sql(format!("HAVING must be boolean, got {t:?}")));
-                }
-            }
+        if let Some(pred) = having_pred {
             pipeline = Box::new(FilterExec::new(pipeline, pred));
             expl = Some(ExplNode::with(
                 "Filter (HAVING)".to_string(),
@@ -1143,11 +1152,11 @@ fn emit_inner_join(
                 let probe_side = pair_side(pair, prefix_member(&prefix, pair));
                 let build_side = pair_side(pair, t);
                 probe_keys.push(rebase_columns(
-                    plan_expr(probe_side, em.scope_ref)?,
+                    plan_expr(probe_side, em.scope_ref, em.plan_ctx)?,
                     acc_shift,
                 )?);
                 build_keys.push(rebase_columns(
-                    plan_expr(build_side, em.scope_ref)?,
+                    plan_expr(build_side, em.scope_ref, em.plan_ctx)?,
                     t_offset,
                 )?);
                 key_sql.push(format!("{probe_side} = {build_side}"));
@@ -1158,11 +1167,11 @@ fn emit_inner_join(
             let probe_side = pair_side(pair, t);
             let build_side = pair_side(pair, prefix_member(&prefix, pair));
             probe_keys.push(rebase_columns(
-                plan_expr(probe_side, em.scope_ref)?,
+                plan_expr(probe_side, em.scope_ref, em.plan_ctx)?,
                 t_offset,
             )?);
             build_keys.push(rebase_columns(
-                plan_expr(build_side, em.scope_ref)?,
+                plan_expr(build_side, em.scope_ref, em.plan_ctx)?,
                 acc_shift,
             )?);
             key_sql.push(format!("{probe_side} = {build_side}"));
@@ -1170,7 +1179,7 @@ fn emit_inner_join(
             continue;
         }
         // 非等值/跨多表条件:连接后过滤(组合列序见 remap_for_join)
-        let e = plan_expr(entry.expr, em.scope_ref)?;
+        let e = plan_expr(entry.expr, em.scope_ref, em.plan_ctx)?;
         check_bool(&e, em.input_schema, "join condition")?;
         let prefix_width = prefix
             .iter()
@@ -1305,7 +1314,7 @@ fn emit_left_join(
         if !(complete && newly && entry.tables.contains(&k)) {
             continue;
         }
-        let e = plan_expr(entry.expr, em.scope_ref)?;
+        let e = plan_expr(entry.expr, em.scope_ref, em.plan_ctx)?;
         check_bool(&e, em.input_schema, "WHERE")?;
         residual.push(e);
         residual_sql.push(format!("{}", entry.expr));
@@ -1392,6 +1401,37 @@ fn remap_for_join(
                 acc_shift,
                 swapped,
             )?),
+            negated,
+        }),
+        Expr::Case { whens, else_expr } => Ok(Expr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, r)| {
+                    Ok((
+                        remap_for_join(c, t_offset, t_width, prefix_width, acc_shift, swapped)?,
+                        remap_for_join(r, t_offset, t_width, prefix_width, acc_shift, swapped)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_expr: else_expr
+                .map(|e| remap_for_join(*e, t_offset, t_width, prefix_width, acc_shift, swapped))
+                .transpose()?
+                .map(Box::new),
+        }),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(Expr::InList {
+            expr: Box::new(remap_for_join(
+                *expr,
+                t_offset,
+                t_width,
+                prefix_width,
+                acc_shift,
+                swapped,
+            )?),
+            list,
             negated,
         }),
         other => Ok(other),
@@ -1505,7 +1545,12 @@ fn prefix_offsets(widths: &[usize]) -> Vec<usize> {
 
 /// 尝试把 `a = b` 形态的条件转成哈希连接键:两侧各只引用一张表 {i}/{j}
 /// (i < j)→ (probe 键扁平等值, build 键列下标重基到表 j 局部)。
-fn try_hash_eq(c: &SE, scope: &Scope, offsets: &[usize]) -> Result<Option<(Expr, Expr)>> {
+fn try_hash_eq(
+    c: &SE,
+    scope: &Scope,
+    offsets: &[usize],
+    ctx: &PlanContext<'_>,
+) -> Result<Option<(Expr, Expr)>> {
     let SE::BinaryOp {
         left,
         op: BinaryOperator::Eq,
@@ -1521,8 +1566,8 @@ fn try_hash_eq(c: &SE, scope: &Scope, offsets: &[usize]) -> Result<Option<(Expr,
         ([i], [jj]) if i > jj => (right, left, *i),
         _ => return Ok(None),
     };
-    let probe = plan_expr(probe_sql, Some(scope))?;
-    let build = rebase_columns(plan_expr(build_sql, Some(scope))?, offsets[j])?;
+    let probe = plan_expr(probe_sql, Some(scope), ctx)?;
+    let build = rebase_columns(plan_expr(build_sql, Some(scope), ctx)?, offsets[j])?;
     Ok(Some((probe, build)))
 }
 
@@ -1549,6 +1594,25 @@ fn rebase_columns(e: Expr, delta: usize) -> Result<Expr> {
         }),
         Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
             expr: Box::new(rebase_columns(*expr, delta)?),
+            negated,
+        }),
+        Expr::Case { whens, else_expr } => Ok(Expr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, r)| Ok((rebase_columns(c, delta)?, rebase_columns(r, delta)?)))
+                .collect::<Result<Vec<_>>>()?,
+            else_expr: else_expr
+                .map(|e| rebase_columns(*e, delta))
+                .transpose()?
+                .map(Box::new),
+        }),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(Expr::InList {
+            expr: Box::new(rebase_columns(*expr, delta)?),
+            list,
             negated,
         }),
         other => Ok(other),
@@ -1587,6 +1651,16 @@ fn collect_column_refs(expr: &Expr, out: &mut std::collections::HashSet<usize>) 
             }
         }
         Expr::IsNull { expr, .. } => collect_column_refs(expr, out),
+        Expr::Case { whens, else_expr } => {
+            for (c, r) in whens {
+                collect_column_refs(c, out);
+                collect_column_refs(r, out);
+            }
+            if let Some(e) = else_expr {
+                collect_column_refs(e, out);
+            }
+        }
+        Expr::InList { expr, .. } => collect_column_refs(expr, out),
     }
 }
 
@@ -1604,6 +1678,8 @@ fn expr_type(expr: &Expr, input: &[ColumnDesc]) -> Result<DataType> {
 struct AggRewriter<'a> {
     scope: Option<&'a Scope>,
     input_schema: &'a [ColumnDesc],
+    /// 计划上下文(子查询等需要数据源的表达式用)
+    ctx: &'a PlanContext<'a>,
     groups: Vec<(Expr, String)>,
     aggs: Vec<(AggDesc, String)>,
     /// 所有 GROUP BY 项引用到的输入列(允许在投影/HAVING 中出现)
@@ -1611,10 +1687,15 @@ struct AggRewriter<'a> {
 }
 
 impl<'a> AggRewriter<'a> {
-    fn new(scope: Option<&'a Scope>, input_schema: &'a [ColumnDesc]) -> Self {
+    fn new(
+        scope: Option<&'a Scope>,
+        input_schema: &'a [ColumnDesc],
+        ctx: &'a PlanContext<'a>,
+    ) -> Self {
         Self {
             scope,
             input_schema,
+            ctx,
             groups: Vec::new(),
             aggs: Vec::new(),
             group_ref_cols: std::collections::HashSet::new(),
@@ -1623,7 +1704,7 @@ impl<'a> AggRewriter<'a> {
 
     /// GROUP BY 项解析(纯普通表达式;不允许聚合)。
     fn add_group(&mut self, e: &SE) -> Result<()> {
-        let expr = plan_expr(e, self.scope)?;
+        let expr = plan_expr(e, self.scope, self.ctx)?;
         if is_aggregate_call(e) {
             return Err(Error::sql(
                 "aggregate functions are not allowed in GROUP BY",
@@ -1792,6 +1873,32 @@ impl<'a> AggRewriter<'a> {
                 self.rewrite(right, inside_agg)?,
             ),
             SE::Nested(inner) => self.rewrite(inner, inside_agg)?,
+            SE::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                // CASE 递归改写(SUM(CASE WHEN ...) 的 Q7/Q9 形状);
+                // 不含聚合的条件/结果子树在此路径下要求叶子命中 GROUP BY 项
+                if operand.is_some() {
+                    return Err(Error::not_supported(
+                        "CASE <operand> WHEN (simple form); use searched CASE",
+                    ));
+                }
+                let mut whens = Vec::with_capacity(conditions.len());
+                for cw in conditions {
+                    let c = self.rewrite(&cw.condition, inside_agg)?;
+                    let r = self.rewrite(&cw.result, inside_agg)?;
+                    whens.push((c, r));
+                }
+                let else_expr = else_result
+                    .as_ref()
+                    .map(|e| self.rewrite(e, inside_agg))
+                    .transpose()?
+                    .map(Box::new);
+                Expr::Case { whens, else_expr }
+            }
             SE::UnaryOp { op, expr } => {
                 let inner = self.rewrite(expr, inside_agg)?;
                 match op {
@@ -1810,7 +1917,7 @@ impl<'a> AggRewriter<'a> {
                     }
                 }
             }
-            other => plan_expr(other, self.scope)?,
+            other => plan_expr(other, self.scope, self.ctx)?,
         };
         Ok(planned)
     }
@@ -1841,7 +1948,7 @@ impl<'a> AggRewriter<'a> {
                     _ => None,
                 }
             }
-            other => plan_expr(other, self.scope).ok(),
+            other => plan_expr(other, self.scope, self.ctx).ok(),
         }
     }
 
@@ -1922,7 +2029,7 @@ fn plan_insert(insert: &sqlparser::ast::Insert, ctx: &PlanContext<'_>) -> Result
                 }
                 let mut full: Row = vec![ScalarValue::Null; table.columns.len()];
                 for (col_idx, e) in targets.iter().zip(tuple) {
-                    let expr = plan_expr(e, None)?;
+                    let expr = plan_expr(e, None, ctx)?;
                     let value = eval_const_scalar(&expr)?;
                     full[*col_idx] = coerce_value(value, &table.columns[*col_idx])?;
                 }
@@ -2014,7 +2121,7 @@ fn plan_update(update: &sqlparser::ast::Update, ctx: &PlanContext<'_>) -> Result
                 col_name
             )));
         }
-        let expr = plan_expr(&a.value, Some(&Scope::single(&table)))?;
+        let expr = plan_expr(&a.value, Some(&Scope::single(&table)), ctx)?;
         match expr.return_type(&table.columns)? {
             Some(t) if t == table.columns[idx].ty => {}
             // 字符串字面量赋给 LOB/数组/向量列:执行期按目标类型解析
@@ -2041,7 +2148,7 @@ fn plan_update(update: &sqlparser::ast::Update, ctx: &PlanContext<'_>) -> Result
 
     let predicate = match &update.selection {
         Some(e) => {
-            let expr = plan_expr(e, Some(&Scope::single(&table)))?;
+            let expr = plan_expr(e, Some(&Scope::single(&table)), ctx)?;
             match expr.return_type(&table.columns)? {
                 Some(DataType::Boolean) | None => {}
                 Some(t) => return Err(Error::sql(format!("WHERE must be boolean, got {t:?}"))),
@@ -2075,7 +2182,7 @@ fn plan_delete(delete: &sqlparser::ast::Delete, ctx: &PlanContext<'_>) -> Result
     let table = resolve_table(ctx.catalog, &object_name_to_string(name)?)?;
     let predicate = match &delete.selection {
         Some(e) => {
-            let expr = plan_expr(e, Some(&Scope::single(&table)))?;
+            let expr = plan_expr(e, Some(&Scope::single(&table)), ctx)?;
             match expr.return_type(&table.columns)? {
                 Some(DataType::Boolean) | None => {}
                 Some(t) => return Err(Error::sql(format!("WHERE must be boolean, got {t:?}"))),
@@ -2187,14 +2294,14 @@ fn plan_create_table(create: &sqlparser::ast::CreateTable) -> Result<StatementPl
 // ---------- 表达式 ----------
 
 /// SQL 表达式 → 执行表达式。`scope` 提供列解析;无 FROM 时不允许列引用。
-pub fn plan_expr(e: &SE, scope: Option<&Scope>) -> Result<Expr> {
+pub fn plan_expr(e: &SE, scope: Option<&Scope>, ctx: &PlanContext<'_>) -> Result<Expr> {
     match e {
         SE::Value(v) => Ok(Expr::Literal(value_to_scalar(&v.value)?)),
         SE::Array(arr) => {
             // 数组字面量:元素必须为常量(列引用/聚合在数组里不支持)
             let mut items = Vec::with_capacity(arr.elem.len());
             for elem in &arr.elem {
-                let expr = plan_expr(elem, None)?;
+                let expr = plan_expr(elem, None, ctx)?;
                 match expr {
                     Expr::Literal(v) => items.push(v),
                     other => {
@@ -2246,11 +2353,132 @@ pub fn plan_expr(e: &SE, scope: Option<&Scope>) -> Result<Expr> {
                     return Err(Error::not_supported(format!("EXTRACT field {other}")));
                 }
             };
-            let arg = plan_expr(expr, scope)?;
+            let arg = plan_expr(expr, scope, ctx)?;
             Ok(Expr::Function {
                 name: fname.to_string(),
                 args: vec![arg],
             })
+        }
+        SE::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            // 仅支持搜索式 CASE WHEN cond THEN result ... [ELSE ...] END
+            if operand.is_some() {
+                return Err(Error::not_supported(
+                    "CASE <operand> WHEN (simple form); use searched CASE WHEN <cond> THEN",
+                ));
+            }
+            if conditions.is_empty() {
+                return Err(Error::sql("CASE requires at least one WHEN branch"));
+            }
+            let mut whens = Vec::with_capacity(conditions.len());
+            for cw in conditions {
+                let c = plan_expr(&cw.condition, scope, ctx)?;
+                let r = plan_expr(&cw.result, scope, ctx)?;
+                whens.push((c, r));
+            }
+            let else_expr = else_result
+                .as_ref()
+                .map(|e| plan_expr(e, scope, ctx))
+                .transpose()?
+                .map(Box::new);
+            Ok(Expr::Case { whens, else_expr })
+        }
+        SE::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            // BETWEEN 改写为比较合取/析取:e >= lo AND e <= hi(或 e < lo OR e > hi)
+            let v = plan_expr(expr, scope, ctx)?;
+            let lo = plan_expr(low, scope, ctx)?;
+            let hi = plan_expr(high, scope, ctx)?;
+            if *negated {
+                Ok(Expr::binary(
+                    BinaryOp::Or,
+                    Expr::binary(BinaryOp::Lt, v.clone(), lo),
+                    Expr::binary(BinaryOp::Gt, v, hi),
+                ))
+            } else {
+                Ok(Expr::binary(
+                    BinaryOp::And,
+                    Expr::binary(BinaryOp::GtEq, v.clone(), lo),
+                    Expr::binary(BinaryOp::LtEq, v, hi),
+                ))
+            }
+        }
+        SE::In {
+            expr,
+            target,
+            negated,
+            global,
+        } => {
+            if *global {
+                return Err(Error::not_supported("GLOBAL IN"));
+            }
+            let inner = plan_expr(expr, scope, ctx)?;
+            let values: Vec<ScalarValue> = match target {
+                sqlparser::ast::InTarget::List(list) => {
+                    let mut out = Vec::with_capacity(list.len());
+                    for e in list {
+                        // 常量元素:无列上下文解析后单批求值
+                        let planned = plan_expr(e, None, ctx)?;
+                        out.push(eval_const_scalar(&planned)?);
+                    }
+                    out
+                }
+                sqlparser::ast::InTarget::Subquery(q) => {
+                    let (rows, width) = eval_subquery_rows(q, ctx, false)?;
+                    if width != 1 {
+                        return Err(Error::sql(format!(
+                            "IN subquery must return exactly one column, got {width}"
+                        )));
+                    }
+                    rows.into_iter()
+                        .map(|r| r.into_iter().next().unwrap_or(ScalarValue::Null))
+                        .collect()
+                }
+                other => {
+                    return Err(Error::not_supported(format!("IN target {other}")));
+                }
+            };
+            Ok(Expr::InList {
+                expr: Box::new(inner),
+                list: std::sync::Arc::new(values),
+                negated: *negated,
+            })
+        }
+        SE::Subquery(q) => {
+            // 非相关标量子查询:计划期执行,恰好 1 行 × 1 列
+            let (rows, width) = eval_subquery_rows(q, ctx, true)?;
+            if width != 1 {
+                return Err(Error::sql(format!(
+                    "scalar subquery must return exactly one column, got {width}"
+                )));
+            }
+            if rows.len() != 1 {
+                return Err(Error::sql(format!(
+                    "scalar subquery returned {} rows, expected exactly 1",
+                    rows.len()
+                )));
+            }
+            Ok(Expr::Literal(
+                rows.into_iter().next().unwrap().into_iter().next().unwrap(),
+            ))
+        }
+        SE::Exists { subquery, negated } => {
+            // 非相关 EXISTS:计划期执行(取到首行即停),物化为布尔字面量
+            let (rows, _) = eval_subquery_rows(subquery, ctx, true)?;
+            let exists = !rows.is_empty();
+            Ok(Expr::Literal(ScalarValue::Boolean(if *negated {
+                !exists
+            } else {
+                exists
+            })))
         }
         SE::Substring {
             expr,
@@ -2259,13 +2487,13 @@ pub fn plan_expr(e: &SE, scope: Option<&Scope>) -> Result<Expr> {
             ..
         } => {
             // SUBSTRING(s [FROM a] [FOR b]) → substring(s, a, b);缺省 a=1,b=length(s)
-            let s = plan_expr(expr, scope)?;
+            let s = plan_expr(expr, scope, ctx)?;
             let from = match substring_from {
-                Some(f) => plan_expr(f, scope)?,
+                Some(f) => plan_expr(f, scope, ctx)?,
                 None => Expr::Literal(ScalarValue::Int64(1)),
             };
             let for_len = match substring_for {
-                Some(f) => plan_expr(f, scope)?,
+                Some(f) => plan_expr(f, scope, ctx)?,
                 None => Expr::Function {
                     name: "length".to_string(),
                     args: vec![s.clone()],
@@ -2282,8 +2510,8 @@ pub fn plan_expr(e: &SE, scope: Option<&Scope>) -> Result<Expr> {
             pattern,
             ..
         } => {
-            let l = plan_expr(expr, scope)?;
-            let r = plan_expr(pattern, scope)?;
+            let l = plan_expr(expr, scope, ctx)?;
+            let r = plan_expr(pattern, scope, ctx)?;
             let op = if *negated {
                 BinaryOp::NotLike
             } else {
@@ -2301,15 +2529,15 @@ pub fn plan_expr(e: &SE, scope: Option<&Scope>) -> Result<Expr> {
             if !exec::functions::is_scalar_function(&name) {
                 return Err(Error::not_supported(format!("function {name}()")));
             }
-            let args = scalar_function_args(f, |e| plan_expr(e, scope))?;
+            let args = scalar_function_args(f, |e| plan_expr(e, scope, ctx))?;
             Ok(Expr::Function { name, args })
         }
         SE::BinaryOp { left, op, right } => {
-            let l = plan_expr(left, scope)?;
-            let r = plan_expr(right, scope)?;
+            let l = plan_expr(left, scope, ctx)?;
+            let r = plan_expr(right, scope, ctx)?;
             Ok(Expr::binary(map_binary_op(op)?, l, r))
         }
-        SE::Nested(inner) => plan_expr(inner, scope),
+        SE::Nested(inner) => plan_expr(inner, scope, ctx),
         SE::Identifier(ident) => {
             let Some(scope) = scope else {
                 return Err(Error::not_implemented(
@@ -2335,8 +2563,8 @@ pub fn plan_expr(e: &SE, scope: Option<&Scope>) -> Result<Expr> {
             )))
         }
         SE::UnaryOp { op, expr } => match op {
-            UnaryOperator::Plus => plan_expr(expr, scope),
-            UnaryOperator::Minus => match plan_expr(expr, scope)? {
+            UnaryOperator::Plus => plan_expr(expr, scope, ctx),
+            UnaryOperator::Minus => match plan_expr(expr, scope, ctx)? {
                 Expr::Literal(ScalarValue::Int64(v)) => Ok(Expr::Literal(ScalarValue::Int64(-v))),
                 Expr::Literal(ScalarValue::Float64(v)) => {
                     Ok(Expr::Literal(ScalarValue::Float64(-v)))
@@ -2400,6 +2628,37 @@ fn eval_const_scalar(e: &Expr) -> Result<ScalarValue> {
         Vector::from_scalars(DataType::Int64, std::iter::once(ScalarValue::Null)).unwrap(),
     ])?;
     Ok(e.eval(&chunk)?.scalar_at(0))
+}
+
+/// 计划并执行**非相关**子查询:返回结果行与列数。
+/// 相关引用会因空 scope 解析失败而报"column not found"(相关子查询见路线图)。
+/// `stop_at_first_row` 用于 EXISTS(取到首行即停,不物化全量)。
+fn eval_subquery_rows(
+    query: &Query,
+    ctx: &PlanContext<'_>,
+    stop_at_first_row: bool,
+) -> Result<(Vec<Row>, usize)> {
+    let planned = plan_query(query, ctx)?;
+    let width = planned.schema.len();
+    let root = memory::MemoryTracker::new_root("subquery", None);
+    let mem = memory::MemoryContext::new(&root, "subquery", 1 << 20);
+    let mut exec_ctx = ExecuteContext::new(ctx.batch_size, mem);
+    let mut exec = planned.executor;
+    let mut rows: Vec<Row> = Vec::new();
+    loop {
+        let Some(chunk) = exec.next_batch(&mut exec_ctx)? else {
+            break;
+        };
+        if chunk.num_rows() > 0 {
+            for i in 0..chunk.num_rows() {
+                rows.push(chunk.row(i));
+            }
+            if stop_at_first_row {
+                break;
+            }
+        }
+    }
+    Ok((rows, width))
 }
 
 /// 按列类型收敛值:精确匹配 / Int64→Float64 提升 / NULL 检查 / 字符串字面量
@@ -2969,5 +3228,195 @@ mod tests {
                 "应被拒绝: {sql}"
             );
         }
+    }
+
+    // ---------- IN / CASE / 非相关子查询 ----------
+
+    fn query_error(sql: &str) -> String {
+        let catalog = InMemoryCatalog::new();
+        catalog.create_table(table_t()).unwrap();
+        let stmt = parse_single(sql).unwrap();
+        plan_statement(
+            &stmt,
+            &make_ctx(&catalog, Arc::new(RowsSource(sample_rows()))),
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| panic!("expected error: {sql}"))
+    }
+
+    #[test]
+    fn in_list_and_not_in_predicate() {
+        let out = run_query_over(
+            "SELECT id FROM t WHERE name IN ('eng') AND id > 1",
+            sample_rows(),
+        );
+        assert_eq!(out, vec![vec![ScalarValue::Int64(2)]]);
+        let out2 = run_query_over("SELECT id FROM t WHERE name NOT IN ('eng')", sample_rows());
+        assert_eq!(
+            out2,
+            vec![vec![ScalarValue::Int64(3)], vec![ScalarValue::Int64(4)]]
+        );
+    }
+
+    #[test]
+    fn between_desugars_to_range_conjunct() {
+        let out = run_query_over("SELECT id FROM t WHERE id BETWEEN 2 AND 3", sample_rows());
+        assert_eq!(
+            out,
+            vec![vec![ScalarValue::Int64(2)], vec![ScalarValue::Int64(3)]]
+        );
+    }
+
+    #[test]
+    fn case_when_projection() {
+        let out = run_query_over(
+            "SELECT CASE WHEN score >= 100 THEN 'hi' ELSE 'lo' END FROM t ORDER BY 1",
+            sample_rows(),
+        );
+        // score 100/200 → hi;NULL(条件未命中)/50 → lo;排序后 hi 在前
+        assert_eq!(
+            out,
+            vec![
+                vec![ScalarValue::Utf8("hi".into())],
+                vec![ScalarValue::Utf8("hi".into())],
+                vec![ScalarValue::Utf8("lo".into())],
+                vec![ScalarValue::Utf8("lo".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn case_inside_sum_aggregate() {
+        // Q7/Q9 形状:SUM(CASE WHEN cond THEN x ELSE 0 END)
+        let out = run_query_over(
+            "SELECT name, SUM(CASE WHEN score >= 100 THEN 1 ELSE 0 END) AS cnt \
+             FROM t GROUP BY name ORDER BY name",
+            sample_rows(),
+        );
+        assert_eq!(
+            out,
+            vec![
+                vec![ScalarValue::Utf8("eng".into()), ScalarValue::Int64(2)],
+                vec![ScalarValue::Utf8("ops".into()), ScalarValue::Int64(0)],
+            ]
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_in_where() {
+        // MIN 忽略 NULL → 50.0 → 命中 id 4
+        let out = run_query_over(
+            "SELECT id FROM t WHERE score = (SELECT MIN(score) FROM t)",
+            sample_rows(),
+        );
+        assert_eq!(out, vec![vec![ScalarValue::Int64(4)]]);
+    }
+
+    #[test]
+    fn in_subquery() {
+        let out = run_query_over(
+            "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE id >= 3)",
+            sample_rows(),
+        );
+        assert_eq!(
+            out,
+            vec![vec![ScalarValue::Int64(3)], vec![ScalarValue::Int64(4)]]
+        );
+    }
+
+    #[test]
+    fn exists_subquery() {
+        let out = run_query_over(
+            "SELECT id FROM t WHERE EXISTS (SELECT id FROM t WHERE id > 3)",
+            sample_rows(),
+        );
+        assert_eq!(out.len(), 4, "EXISTS 为真 → 保留全部外层行");
+        let out2 = run_query_over(
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT id FROM t WHERE id > 99)",
+            sample_rows(),
+        );
+        assert_eq!(out2.len(), 4);
+    }
+
+    #[test]
+    fn correlated_subquery_rejected_with_column_error() {
+        // 子查询引用外层别名 → 空 scope 解析失败(相关子查询暂不支持)
+        let err =
+            query_error("SELECT id FROM t WHERE EXISTS (SELECT id FROM t WHERE t.id > outer_t.id)");
+        assert!(
+            err.contains("unknown table alias") || err.contains("not found"),
+            "{err}"
+        );
+        // 标量子查询返回多列 → 明确报错
+        let err2 = query_error("SELECT id FROM t WHERE id = (SELECT id, name FROM t)");
+        assert!(err2.contains("one column"), "{err2}");
+    }
+    #[test]
+    fn having_aggregate_not_in_projection() {
+        // HAVING 引入投影中没有的聚合 → 该聚合须进 agg 输出后再过滤
+        let out = run_query_over(
+            "SELECT name FROM t GROUP BY name HAVING SUM(score) > (SELECT MIN(score) FROM t) ORDER BY name",
+            sample_rows(),
+        );
+        // eng = 300,ops = 50;MIN = 50 → ops 被滤掉,只剩 eng
+        assert_eq!(out, vec![vec![ScalarValue::Utf8("eng".into())]]);
+    }
+    #[test]
+    fn in_subquery_with_group_having_semantics() {
+        // Q18 形状( planners 层):IN 子查询含 GROUP BY + HAVING 的聚合;
+        // DATE/TEXT 列在表中,子查询在计划期物化为值集合
+        let catalog = InMemoryCatalog::new();
+        let schema = TableSchema {
+            id: 1,
+            name: "lineitem".into(),
+            columns: vec![
+                ColumnDesc::new("l_orderkey".to_string(), DataType::Int64, false),
+                ColumnDesc::new("l_extendedprice".to_string(), DataType::Float64, false),
+                ColumnDesc::new("l_shipdate".to_string(), DataType::Date, false),
+                ColumnDesc::new("l_nation".to_string(), DataType::Utf8, false),
+            ],
+            primary_key: Vec::new(),
+            version: 1,
+        };
+        catalog.create_table(schema).unwrap();
+        let sql = "SELECT SUM(l_extendedprice) AS big_orders FROM lineitem WHERE l_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING COUNT(*) > 1)";
+        let stmt = parse_single(sql).unwrap();
+        let rows: Vec<Row> = vec![
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Float64(100.0),
+                ScalarValue::Date(9213),
+                ScalarValue::Utf8("FRANCE".into()),
+            ],
+            vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Float64(50.0),
+                ScalarValue::Date(9213),
+                ScalarValue::Utf8("GERMANY".into()),
+            ],
+            vec![
+                ScalarValue::Int64(2),
+                ScalarValue::Float64(200.0),
+                ScalarValue::Date(9213),
+                ScalarValue::Utf8("GERMANY".into()),
+            ],
+        ];
+        let StatementPlan::Query(pq) =
+            plan_statement(&stmt, &make_ctx(&catalog, Arc::new(RowsSource(rows)))).unwrap()
+        else {
+            panic!("expected query");
+        };
+        let root = MemoryTracker::new_root("t", None);
+        let mut ctx = ExecuteContext::new(1024, MemoryContext::new(&root, "q", 4096));
+        let mut exec = pq.executor;
+        let mut out = Vec::new();
+        while let Some(chunk) = exec.next_batch(&mut ctx).unwrap() {
+            for i in 0..chunk.num_rows() {
+                out.push(chunk.row(i));
+            }
+        }
+        // 仅 orderkey 1 是"大订单"(2 行)→ 100 + 50
+        assert_eq!(out, vec![vec![ScalarValue::Float64(150.0)]]);
     }
 }

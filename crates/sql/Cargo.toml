@@ -11,7 +11,5 @@ name = "sql"
 medb-common = { workspace = true }
 medb-catalog = { workspace = true }
 medb-exec = { workspace = true }
-sqlparser.workspace = true
-
-[dev-dependencies]
 medb-memory = { workspace = true }
+sqlparser.workspace = true

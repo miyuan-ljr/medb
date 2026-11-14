@@ -89,7 +89,7 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 ## 当前进度与路线图
 
-已完成(全部带测试,workspace 203 个测试):
+已完成(全部带测试,workspace 221 个测试):
 
 - 内存机制三层(mimalloc / 配额树 / arena)
 - LSM 完整闭环:WAL 恢复、SST 读写、flush、压缩、墓碑、并发单写者、序列水位恢复、
@@ -131,6 +131,16 @@ postgres=# DELETE FROM users WHERE id = 1;
   - **EXPLAIN <SELECT>**:统计驱动的计划树(扫描估行/下推过滤/连接键/物化侧)
   - 顺带修正:LEFT JOIN 空产侧谓词此前被错误下推(会改变 NULL 补齐语义),
     统一路由后按"位置 ≥ 自身的 LEFT 步骤挡住下推"处理
+- **表达式补全(CASE / IN / 非相关子查询,`server/tests/expressions.rs`)**:
+  - **CASE WHEN**(搜索式):投影、WHERE、`SUM(CASE WHEN ...)` 聚合内均可
+    (Q7/Q9/Q12/Q14 形状);结果类型统一(任一分支 Float64 → Int64 提升);
+    条件 null 按未命中;BETWEEN 改写为范围比较
+  - **IN 值列表 / NOT IN**:执行为哈希集合成员判定(非 OR 展开)
+  - **非相关子查询**(计划期执行物化):标量 `(SELECT ...)`、
+    `IN (SELECT ...)`、`[NOT] EXISTS (...)`;IN 子查询内部可含 GROUP BY + HAVING
+    (Q18 形状);相关引用(引用外层别名)明确报错
+  - 顺带修正存量 bug:HAVING 引入投影中没有的聚合(如 `HAVING SUM(...) > 子查询`)
+    会因 agg 输出 schema 计算过早而失败 —— HAVING 改写提前到 AggHashExec 构建前
 
 路线图(按依赖排序):
 
@@ -138,9 +148,10 @@ postgres=# DELETE FROM users WHERE id = 1;
   隔离级别提升(快照隔离)
 - **M3 HTAP 落地**:AP 扫描走列存副本(行/列双跑一致性对照);
   列存 segment 文件(字典/RLE 编码)+ 后台 compaction
-- **M2/M4/M5**:RIGHT/FULL JOIN、TPC-H 数据加载(dbgen tbl 导入)、
+- **M2/M4/M5**:RIGHT/FULL JOIN、**相关子查询**(EXISTS/IN 引用外层列)与
+  FROM 派生表、CREATE VIEW、COUNT(DISTINCT)、TPC-H 数据加载(dbgen tbl 导入)、
   extended query protocol(psql \d)、块缓存、
-  分级压缩、manifest 落盘、流式归并扫描、系统视图、DISTINCT/子查询/CASE WHEN、
+  分级压缩、manifest 落盘、流式归并扫描、系统视图、DISTINCT、
   直方图/多列统计、连接代价标定(benchmark)
 
 ## 已知简化(读代码前先看)
@@ -155,7 +166,11 @@ postgres=# DELETE FROM users WHERE id = 1;
 - HashJoin 构建侧整批物化;代价模型未标定(权重为启发值);统计为
   单列 NDV/min-max(无直方图、无相关性);NDV 写路径不增量(靠 ANALYZE)。
 - DECIMAL 收敛为 Float64(TPC-H 数值列够用,精确小数见路线图)。
-- CASE WHEN 暂不支持(sqlparser 0.64 语句化模型,待单独支持)。
+- CASE WHEN 仅搜索式(`CASE WHEN cond THEN ...`),简单式 `CASE <operand>` 拒绝;
+  子查询为**非相关**(计划期执行一次);EXISTS 不提前终止于首条匹配但仍按批
+  拉取(实现为"取到首个非空批即停")。
+- IN 的成员判定按标量精确相等(Int64 与 Float64 不跨类型匹配);IN 子查询结果
+  整体物化(大结果集走半连接见路线图)。
 
 ## 开发
 

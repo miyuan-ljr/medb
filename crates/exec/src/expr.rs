@@ -7,7 +7,9 @@
 
 use common::error::{Error, Result};
 use common::types::{DataType, ScalarValue};
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::vector::{ColumnData, Datum, Vector};
 
@@ -105,6 +107,59 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    /// 搜索式 CASE:WHEN c THEN r ... [ELSE e]。
+    /// 条件为 null 按未命中处理(与 And/Or 的 null 简化一致);
+    /// 结果类型统一:任一分支 Float64 → Float64(Int64 字面量自动提升)。
+    Case {
+        whens: Vec<(Expr, Expr)>,
+        else_expr: Option<Box<Expr>>,
+    },
+    /// IN 常量值集合(解析期字面量列表,或计划期物化的非相关子查询结果)。
+    /// 成员判定按标量精确相等(跨类型不隐式匹配);null 表达式 → false。
+    InList {
+        expr: Box<Expr>,
+        list: Arc<Vec<ScalarValue>>,
+        negated: bool,
+    },
+}
+
+/// CASE 分支类型统一:任一 Float64 → Float64;否则取首个已知类型;全未知 → Int64。
+fn unify_case_type(ty: impl Iterator<Item = Option<DataType>>) -> DataType {
+    let mut has_f64 = false;
+    let mut first: Option<DataType> = None;
+    for t in ty.flatten() {
+        if t == DataType::Float64 {
+            has_f64 = true;
+        }
+        if first.is_none() {
+            first = Some(t);
+        }
+    }
+    if has_f64 {
+        DataType::Float64
+    } else {
+        first.unwrap_or(DataType::Int64)
+    }
+}
+
+/// 把分支值收敛到统一类型(仅做 Int64 → Float64 提升;其余方向不匹配报错)。
+fn coerce_case_value(v: ScalarValue, ty: &DataType) -> Result<ScalarValue> {
+    if v.is_null() {
+        return Ok(ScalarValue::Null);
+    }
+    match ty {
+        DataType::Float64 => match v {
+            ScalarValue::Int64(i) => Ok(ScalarValue::Float64(i as f64)),
+            ScalarValue::Float64(_) => Ok(v),
+            other => Err(Error::sql(format!(
+                "CASE branch type mismatch: expected Float64, got {other:?}"
+            ))),
+        },
+        t if v.data_type().is_some_and(|vt| vt == *t) => Ok(v),
+        _ => Err(Error::sql(format!(
+            "CASE branch type mismatch: expected {ty:?}, got {v:?}"
+        ))),
+    }
 }
 
 impl fmt::Display for Expr {
@@ -129,6 +184,31 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "({expr} IS NULL)")
                 }
+            }
+            Expr::Case { whens, else_expr } => {
+                f.write_str("CASE")?;
+                for (c, r) in whens {
+                    write!(f, " WHEN {c} THEN {r}")?;
+                }
+                if let Some(e) = else_expr {
+                    write!(f, " ELSE {e}")?;
+                }
+                f.write_str(" END")
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                write!(
+                    f,
+                    "({expr} {}IN ({}))",
+                    if *negated { "NOT " } else { "" },
+                    list.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
         }
     }
@@ -165,6 +245,70 @@ impl Expr {
                 let out: Vec<bool> = (0..v.len()).map(|i| v.null_at(i) != *negated).collect();
                 Ok(Vector::bools(out))
             }
+            Expr::Case { whens, else_expr } => {
+                if whens.is_empty() {
+                    return Err(Error::sql("CASE requires at least one WHEN branch"));
+                }
+                let n = chunk.num_rows();
+                let mut conds = Vec::with_capacity(whens.len());
+                let mut results = Vec::with_capacity(whens.len());
+                for (c, r) in whens {
+                    let cv = c.eval(chunk)?;
+                    if cv.data_type() != DataType::Boolean {
+                        return Err(Error::sql(format!(
+                            "CASE WHEN condition must be boolean, got {:?}",
+                            cv.data_type()
+                        )));
+                    }
+                    conds.push(cv);
+                    results.push(r.eval(chunk)?);
+                }
+                let else_vec = match else_expr {
+                    Some(e) => Some(e.eval(chunk)?),
+                    None => None,
+                };
+                // 类型统一与值收敛(Int64 字面量臂 → Float64 提升)
+                let ty = unify_case_type(
+                    results
+                        .iter()
+                        .chain(else_vec.iter())
+                        .map(|v| Some(v.data_type())),
+                );
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let mut picked = None;
+                    for (ci, cv) in conds.iter().enumerate() {
+                        if !cv.null_at(i) && cv.bool_values()[i] {
+                            picked = Some(results[ci].scalar_at(i));
+                            break;
+                        }
+                    }
+                    let raw = picked.unwrap_or_else(|| match &else_vec {
+                        Some(ev) => ev.scalar_at(i),
+                        None => ScalarValue::Null,
+                    });
+                    out.push(coerce_case_value(raw, &ty)?);
+                }
+                Vector::from_scalars(ty, out)
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let v = expr.eval(chunk)?;
+                let set: HashSet<&ScalarValue> = list.iter().filter(|x| !x.is_null()).collect();
+                let out: Vec<bool> = (0..v.len())
+                    .map(|i| {
+                        if v.null_at(i) {
+                            return false; // null 表达式按 false(与 And/Or 简化一致)
+                        }
+                        let hit = set.contains(&v.scalar_at(i));
+                        if *negated { !hit } else { hit }
+                    })
+                    .collect();
+                Ok(Vector::bools(out))
+            }
         }
     }
 
@@ -186,6 +330,25 @@ impl Expr {
                 )?))
             }
             Expr::IsNull { .. } => Ok(Some(DataType::Boolean)),
+            Expr::Case { whens, else_expr } => {
+                let ty = unify_case_type(
+                    whens
+                        .iter()
+                        .map(|(_, r)| r.return_type(input))
+                        .chain(std::iter::once(if let Some(e) = else_expr {
+                            e.return_type(input)
+                        } else {
+                            Ok(None)
+                        }))
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter(),
+                );
+                Ok(Some(ty))
+            }
+            Expr::InList { expr, .. } => {
+                expr.return_type(input)?;
+                Ok(Some(DataType::Boolean))
+            }
             Expr::Binary { op, left, right } => {
                 let lt = left.return_type(input)?;
                 let rt = right.return_type(input)?;
@@ -771,5 +934,100 @@ mod tests {
             Expr::Literal(ScalarValue::Int64(1)),
         );
         assert_eq!(e.return_type(&input).unwrap(), Some(DataType::Boolean));
+    }
+
+    #[test]
+    fn case_picks_first_matching_branch_and_promotes() {
+        // g: 0,1,2,1 → CASE g WHEN-链:g = 1 THEN 1.5 ELSE 0 END
+        let chunk = DataChunk::new(vec![Vector::int64s(vec![1, 2, 1, 0])]).unwrap();
+        let case = Expr::Case {
+            whens: vec![(
+                Expr::binary(
+                    BinaryOp::Eq,
+                    Expr::Column(0),
+                    Expr::Literal(ScalarValue::Int64(1)),
+                ),
+                Expr::Literal(ScalarValue::Float64(1.5)),
+            )],
+            else_expr: Some(Box::new(Expr::Literal(ScalarValue::Int64(0)))),
+        };
+        let out = case.eval(&chunk).unwrap();
+        // Int64 的 ELSE 0 提升为 Float64
+        assert_eq!(out.data_type(), DataType::Float64);
+        assert_eq!(out.float64_values(), &[1.5, 0.0, 1.5, 0.0]);
+        // 静态类型:任一分支 Float64 → Float64
+        let input = [common::schema::ColumnDesc::new(
+            "g".to_string(),
+            DataType::Int64,
+            true,
+        )];
+        assert_eq!(case.return_type(&input).unwrap(), Some(DataType::Float64));
+    }
+
+    #[test]
+    fn case_null_condition_is_miss_and_else_may_be_absent() {
+        // 条件列含 null:null 按未命中;无 ELSE → null
+        let b = Vector::from_scalars(
+            DataType::Boolean,
+            [
+                ScalarValue::Boolean(true),
+                ScalarValue::Boolean(false),
+                ScalarValue::Null,
+            ],
+        )
+        .unwrap();
+        let chunk = DataChunk::new(vec![b]).unwrap();
+        let case = Expr::Case {
+            whens: vec![(
+                Expr::Column(0),
+                Expr::Literal(ScalarValue::Utf8("hit".into())),
+            )],
+            else_expr: None,
+        };
+        let out = case.eval(&chunk).unwrap();
+        assert_eq!(out.scalar_at(0), ScalarValue::Utf8("hit".into()));
+        assert_eq!(out.scalar_at(1), ScalarValue::Null);
+        assert_eq!(out.scalar_at(2), ScalarValue::Null);
+    }
+
+    #[test]
+    fn in_list_membership_negation_and_null() {
+        let chunk = DataChunk::new(vec![
+            Vector::from_scalars(
+                DataType::Utf8,
+                vec![
+                    ScalarValue::Utf8("MAIL".into()),
+                    ScalarValue::Utf8("SHIP".into()),
+                    ScalarValue::Utf8("RAIL".into()),
+                    ScalarValue::Null,
+                ],
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let inlist = Expr::InList {
+            expr: Box::new(Expr::Column(0)),
+            list: Arc::new(vec![
+                ScalarValue::Utf8("MAIL".into()),
+                ScalarValue::Utf8("SHIP".into()),
+            ]),
+            negated: false,
+        };
+        let out = inlist.eval(&chunk).unwrap();
+        assert_eq!(out.bool_values(), &[true, true, false, false]);
+        // NOT IN:null 表达式仍为 false
+        let not_in = Expr::InList {
+            expr: Box::new(Expr::Column(0)),
+            list: Arc::new(vec![ScalarValue::Utf8("MAIL".into())]),
+            negated: true,
+        };
+        let out2 = not_in.eval(&chunk).unwrap();
+        assert_eq!(out2.bool_values(), &[false, true, true, false]);
+        let input = [common::schema::ColumnDesc::new(
+            "c".to_string(),
+            DataType::Utf8,
+            true,
+        )];
+        assert_eq!(inlist.return_type(&input).unwrap(), Some(DataType::Boolean));
     }
 }

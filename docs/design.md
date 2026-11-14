@@ -156,6 +156,31 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
   精确小数是后续独立类型工作。
 - **LIKE / NOT LIKE**:`%`/`_` 带回溯匹配器;`ESCAPE`/`ILIKE` 暂不支持。
 
+## 4.9.1 CASE / IN / 非相关子查询
+
+- **CASE(搜索式)**:`Expr::Case { whens: Vec<(cond, result)>, else_expr }`,
+  向量化求值 = 每分支整批求条件列与结果列,再逐行取首个命中分支
+  (2m+1 次 eval + 行内选择);条件 null 按未命中(与 And/Or 简化一致);
+  结果类型统一:任一分支 Float64 → Float64,Int64 字面量臂自动提升,
+  其余不匹配报错(不静默)。简单式 `CASE <operand>` 拒绝。
+  **聚合内 CASE**(`SUM(CASE WHEN ...)`):AggRewriter 对 Case 递归改写,
+  条件/结果子树按聚合上下文解析 —— Q7/Q9/Q12/Q14 的关键形状。
+- **IN 值列表**:解析期元素常量求值 → `Expr::InList { expr, list: Arc<Vec<SV>>,
+  negated }`,执行为哈希集合成员判定(避免 OR 链展开);null 表达式 → false;
+  成员判定标量精确相等(不跨类型)。
+- **非相关子查询**:计划期执行一次(`eval_subquery_rows`:plan_query + 独立
+  内存上下文整批收集;EXISTS 取到首个非空批即停)并物化:
+  - 标量 `(SELECT ...)` → 必须恰 1 行 × 1 列 → Literal;
+  - `IN (SELECT ...)` → 1 列 → InList 值集合;
+  - `[NOT] EXISTS` → 布尔字面量。
+  **相关引用直接报错**:子查询以空 scope 计划,引用外层别名/列会得到
+  "unknown table alias / column not found"(相关子查询 decorrelation 见路线图)。
+  局限:IN 子查询结果整体物化,大结果集的半连接(semi-join)见路线图。
+- **顺带修复的存量 bug**:HAVING 引入投影中没有的聚合(如
+  `HAVING SUM(x) > (SELECT ...)`)时,agg 输出 schema 在 HAVING 改写前计算 →
+  谓词列下标越界。修复:HAVING 改写提前到 AggHashExec 构建**之前**,改写后
+  重算 `project_input_schema`。
+
 ## 4.5 表数据布局与 Engine(M2)
 
 - 行键 `table_id u64BE ++ row_id u64BE`:按表聚簇、扫描序=插入序。
