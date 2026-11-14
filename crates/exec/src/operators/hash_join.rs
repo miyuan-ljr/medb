@@ -38,12 +38,18 @@ pub struct HashJoinExec {
     build_dtypes: Vec<DataType>,
     /// 构建侧哈希表:键 → 匹配的构建行
     table: Option<HashMap<Vec<ScalarValue>, Vec<Row>>>,
+    /// 类型化哈希表(Int64 键快速通道)
+    int_table: Option<HashMap<Vec<i64>, Vec<Row>>>,
     build_null_row: Row,
     probe_done: bool,
     out: Vec<Row>,
     /// 物化内存记账(build 哈希表 + 输出缓冲),超限 → MemoryLimitExceeded
     mem: Option<Reservation>,
     mem_bytes: usize,
+    /// **类型化哈希键快速通道**:全部键为单列 Int64(Expr::Column)时,
+    /// 用 HashMap<i64/Vec<i64>> 直取类型化数组,免去 Vec<ScalarValue> 装箱
+    int_probe_cols: Vec<usize>,
+    int_build_cols: Vec<usize>,
     next: usize,
 }
 
@@ -61,9 +67,33 @@ impl HashJoinExec {
         join_type: JoinType,
     ) -> Self {
         let build_dtypes = build_schema.iter().map(|c| c.ty.clone()).collect();
+        let probe_schema_ref = probe_schema.clone();
+        let build_schema_ref = build_schema.clone();
         let mut schema = probe_schema;
         schema.extend(build_schema);
         let combined_dtypes = schema.iter().map(|c| c.ty.clone()).collect();
+        // 类型化键探测:键必须都是单列引用且两侧类型均为 Int64(列下标与
+        // schema 对齐);否则走通用 Vec<ScalarValue> 路径
+        let key_cols = |keys: &[Expr], sc: &[ColumnDesc]| -> Option<Vec<usize>> {
+            let mut cols = Vec::with_capacity(keys.len());
+            for k in keys {
+                let Expr::Column(i) = k else {
+                    return None;
+                };
+                if sc.get(*i)?.ty != common::types::DataType::Int64 {
+                    return None;
+                }
+                cols.push(*i);
+            }
+            Some(cols)
+        };
+        let int_probe_cols = key_cols(&probe_keys, &probe_schema_ref);
+        let int_build_cols = key_cols(&build_keys, &build_schema_ref);
+        let fast = match (&int_probe_cols, &int_build_cols) {
+            (Some(p), Some(b)) => Some((p.clone(), b.clone())),
+            _ => None,
+        };
+        let (int_probe_cols, int_build_cols) = fast.unwrap_or((Vec::new(), Vec::new()));
         Self {
             probe,
             build,
@@ -76,11 +106,14 @@ impl HashJoinExec {
             combined_dtypes,
             build_dtypes,
             table: None,
+            int_table: None,
             build_null_row: Vec::new(),
             probe_done: false,
             out: Vec::new(),
             mem: None,
             mem_bytes: 0,
+            int_probe_cols,
+            int_build_cols,
             next: 0,
         }
     }
@@ -97,33 +130,74 @@ impl HashJoinExec {
     }
 
     /// 构建侧整批物化为哈希表;NULL 键不入表(不与任何行连接)。
+    /// Int64 单列键 → 类型化快速通道(直取列数组,免标量装箱)。
     fn build_table(&mut self, ctx: &mut ExecuteContext) -> Result<()> {
         let mut table: HashMap<Vec<ScalarValue>, Vec<Row>> = HashMap::new();
+        let mut int_table: HashMap<Vec<i64>, Vec<Row>> = HashMap::new();
+        let bcols = self.int_build_cols.clone();
         loop {
             let Some(batch) = self.build.next_batch(ctx)? else {
                 break;
             };
-            let key_cols = self
-                .build_keys
+            if bcols.is_empty() {
+                // 通用路径
+                let key_cols = self
+                    .build_keys
+                    .iter()
+                    .map(|e| e.eval(&batch))
+                    .collect::<Result<Vec<_>>>()?;
+                for i in 0..batch.num_rows() {
+                    let key: Vec<ScalarValue> = key_cols.iter().map(|c| c.scalar_at(i)).collect();
+                    if key.iter().any(|v| v.is_null()) {
+                        continue;
+                    }
+                    let row = batch.row(i);
+                    self.track_mem(
+                        ctx,
+                        crate::chunk::row_approx_bytes(&self.build_dtypes, &row) + key.len() * 16,
+                    )?;
+                    table.entry(key).or_default().push(row);
+                }
+                continue;
+            };
+            // 类型化路径
+            let _key_cols: Vec<&[i64]> = bcols
                 .iter()
-                .map(|e| e.eval(&batch))
-                .collect::<Result<Vec<_>>>()?;
-            for i in 0..batch.num_rows() {
-                let key: Vec<ScalarValue> = key_cols.iter().map(|c| c.scalar_at(i)).collect();
-                if key.iter().any(|v| v.is_null()) {
+                .map(|c| batch.column(*c).int64_values())
+                .collect::<Vec<_>>();
+            let n = batch.num_rows();
+            let null_bits: Vec<Vec<bool>> = bcols
+                .iter()
+                .map(|c| {
+                    let col = batch.column(*c);
+                    (0..n).map(|i| col.null_at(i)).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            for i in 0..n {
+                let mut key = Vec::with_capacity(bcols.len());
+                let mut has_null = false;
+                for (c, nulls) in bcols.iter().zip(&null_bits) {
+                    if nulls[i] {
+                        has_null = true;
+                        break;
+                    }
+                    key.push(batch.column(*c).int64_values()[i]);
+                }
+                if has_null {
                     continue;
                 }
                 let row = batch.row(i);
                 self.track_mem(
                     ctx,
-                    crate::chunk::row_approx_bytes(&self.build_dtypes, &row) + key.len() * 16,
+                    crate::chunk::row_approx_bytes(&self.build_dtypes, &row) + key.len() * 8,
                 )?;
-                table.entry(key).or_default().push(row);
+                int_table.entry(key).or_default().push(row);
             }
         }
         // 左外连接的 NULL 填充行模板
         self.build_null_row = vec![ScalarValue::Null; self.build_dtypes.len()];
         self.table = Some(table);
+        self.int_table = Some(int_table);
         Ok(())
     }
 
@@ -133,7 +207,18 @@ impl HashJoinExec {
     fn materialize(&mut self, ctx: &mut ExecuteContext) -> Result<()> {
         self.build_table(ctx)?;
         // take 出来:后面 track_mem 需要 &mut self;materialize 后哈希表不再需要
-        let table = std::mem::take(&mut self.table).expect("build_table called first");
+        let int_fast = !self.int_probe_cols.is_empty();
+        let probe_cols = self.int_probe_cols.clone();
+        let int_table = if int_fast {
+            std::mem::take(&mut self.int_table).expect("int build_table called first")
+        } else {
+            HashMap::new()
+        };
+        let table = if int_fast {
+            HashMap::new()
+        } else {
+            std::mem::take(&mut self.table).expect("build_table called first")
+        };
         let mut out: Vec<Row> = Vec::new();
         let left = self.join_type == JoinType::LeftOuter;
 
@@ -151,23 +236,40 @@ impl HashJoinExec {
             let n_rows = batch.num_rows();
             let mut cand: Vec<Vec<Row>> = vec![Vec::new(); n_rows];
             let mut null_ext: Vec<bool> = vec![false; n_rows];
+            let int_lookup = |i: usize| -> Option<Vec<i64>> {
+                let mut key = Vec::with_capacity(probe_cols.len());
+                for c in &probe_cols {
+                    let col = batch.column(*c);
+                    if col.null_at(i) {
+                        return None;
+                    }
+                    key.push(col.int64_values()[i]);
+                }
+                Some(key)
+            };
+            let generic_lookup = |i: usize| -> Option<Vec<ScalarValue>> {
+                let key: Vec<ScalarValue> = key_cols.iter().map(|c| c.scalar_at(i)).collect();
+                if key.iter().any(|v| v.is_null()) {
+                    return None;
+                }
+                Some(key)
+            };
             if ctx.threads > 1 && n_rows >= 256 {
                 // 并行:行下标分片,各片独立查表组装
                 let idx: Vec<usize> = (0..n_rows).collect();
                 let parts = crate::parallel::scope_map_try(&idx, ctx.threads, |sl| {
                     let mut rows: Vec<(usize, Vec<Row>, bool)> = Vec::with_capacity(sl.len());
                     for &i in sl {
-                        let key: Vec<ScalarValue> =
-                            key_cols.iter().map(|c| c.scalar_at(i)).collect();
-                        if key.iter().any(|v| v.is_null()) {
-                            rows.push((i, Vec::new(), left));
-                            continue;
-                        }
-                        match table.get(&key) {
-                            Some(matches) if !matches.is_empty() => {
+                        let matches = if int_fast {
+                            int_lookup(i).and_then(|k| int_table.get(&k).cloned())
+                        } else {
+                            generic_lookup(i).and_then(|k| table.get(&k).cloned())
+                        };
+                        match matches {
+                            Some(m) if !m.is_empty() => {
                                 let probe_row = batch.row(i);
-                                let mut combos = Vec::with_capacity(matches.len());
-                                for build_row in matches {
+                                let mut combos = Vec::with_capacity(m.len());
+                                for build_row in m {
                                     let mut row = probe_row.clone();
                                     row.extend(build_row.iter().cloned());
                                     combos.push(row);
@@ -185,15 +287,15 @@ impl HashJoinExec {
                 }
             } else {
                 for i in 0..n_rows {
-                    let key: Vec<ScalarValue> = key_cols.iter().map(|c| c.scalar_at(i)).collect();
-                    if key.iter().any(|v| v.is_null()) {
-                        null_ext[i] = left;
-                        continue;
-                    }
-                    match table.get(&key) {
-                        Some(matches) if !matches.is_empty() => {
+                    let matches = if int_fast {
+                        int_lookup(i).and_then(|k| int_table.get(&k).cloned())
+                    } else {
+                        generic_lookup(i).and_then(|k| table.get(&k).cloned())
+                    };
+                    match matches {
+                        Some(m) if !m.is_empty() => {
                             let probe_row = batch.row(i);
-                            for build_row in matches {
+                            for build_row in m {
                                 let mut row = probe_row.clone();
                                 row.extend(build_row.iter().cloned());
                                 cand[i].push(row);
@@ -273,6 +375,7 @@ impl HashJoinExec {
         }
 
         self.probe_done = true;
+        self.int_table = None;
         self.out = out;
         Ok(())
     }

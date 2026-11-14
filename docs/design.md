@@ -275,7 +275,20 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 每节点带估行数 / 下推过滤 / 连接键 / 物化侧标签。planner 以 `ExplNode` 树
 累积、`flatten_expl` 摊平;LIMIT 在外层包装时整体缩进一级。
 
-#### 5.5.5a 表达式 JIT(`exec::expr_compile`)
+#### 5.5.5b 类型化哈希键与 Top-N
+
+- **HashJoin Int64 快速通道**:全部连接键为单列 `Expr::Column` 且两侧列类型
+  均为 Int64 → build/探测均走 `HashMap<Vec<i64>>`:键从类型化列数组直取
+  (`int64_values()[i]` + 位图判空),不再逐行构造 `Vec<ScalarValue>`(枚举
+  判别 + String 克隆是此前 JOIN 的主要 CPU 开销)。表达式键 / 非整型键 /
+  混合键走通用路径。
+- **Top-N 排序**:planner 解析 LIMIT 时把 `(k, has_offset)` 提示传入
+  plan_select → SortExec;`ORDER BY ... LIMIT k` 且无 OFFSET 时切换流式
+  Top-N:键行(key rows)随批累积,每 4k 行整体排序裁剪到前 k(分摊),
+  最终只排序 k 行 —— O(n log k),内存上限 4k 行。
+  OFFSET > 0 或 `LIMIT k OFFSET o` 时不启用(o ≠ 0 时前 k 行不等于结果)。
+
+### 5.5.5a 表达式 JIT(`exec::expr_compile`)
 
 - **三层 JIT 光谱中的位置**:① 全流水线机器码(HyPer/LLVM)— 重写执行器,
   不做;② 整阶段 codegen(Tungsten)— 我们的拉取式向量化已摊薄逐行调用,

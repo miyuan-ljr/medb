@@ -4,9 +4,9 @@ use common::error::Result;
 use common::schema::ColumnDesc;
 
 use crate::chunk::DataChunk;
-use crate::expr_compile::CompiledExpr;
 use crate::executor::{BoxedExecutor, ExecuteContext, Executor};
 use crate::expr::Expr;
+use crate::expr_compile::CompiledExpr;
 
 pub struct ProjectExec {
     input: BoxedExecutor,

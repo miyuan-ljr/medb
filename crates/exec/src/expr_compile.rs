@@ -26,7 +26,7 @@ use common::error::{Error, Result};
 use common::types::{DataType, ScalarValue};
 
 use crate::chunk::DataChunk;
-use crate::expr::{eval_binary, broadcast, BinaryOp, Expr};
+use crate::expr::{BinaryOp, Expr, broadcast, eval_binary};
 use crate::vector::Vector;
 
 // ---------- 字节码 ----------
@@ -98,10 +98,7 @@ impl fmt::Display for Op {
                 }
             }
             Op::InList {
-                dst,
-                src,
-                negated,
-                ..
+                dst, src, negated, ..
             } => {
                 if *negated {
                     write!(f, "r{dst} = r{src} NOT IN ?set")
@@ -158,7 +155,12 @@ impl fmt::Display for CompiledExpr {
     /// 程序清单:JIT 优化的直接证据 —— 常量折叠后的字面量、消失的冗余算子、
     /// CSE 后的寄存器复用,全部肉眼可见。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "program ({} ops, result = r{}):", self.ops.len(), self.result)?;
+        writeln!(
+            f,
+            "program ({} ops, result = r{}):",
+            self.ops.len(),
+            self.result
+        )?;
         for (i, op) in self.ops.iter().enumerate() {
             writeln!(f, "  [{i:03}] {op}")?;
         }
@@ -234,7 +236,10 @@ impl Compiler {
             // --- 常量折叠:纯常量子树在编译期算成单个字面量 ---
             Expr::Literal(v) => {
                 let dst = self.alloc_reg();
-                self.emit(Op::LoadLit { dst, lit: v.clone() });
+                self.emit(Op::LoadLit {
+                    dst,
+                    lit: v.clone(),
+                });
                 dst
             }
             _ if is_pure_const(e) => {
@@ -269,10 +274,7 @@ impl Compiler {
                 dst
             }
             Expr::Function { name, args } => {
-                let srcs = args
-                    .iter()
-                    .map(|a| self.compile_sub(a))
-                    .collect::<Vec<_>>();
+                let srcs = args.iter().map(|a| self.compile_sub(a)).collect::<Vec<_>>();
                 let dst = self.alloc_reg();
                 self.emit(Op::InvokeFunc {
                     dst,
@@ -313,9 +315,7 @@ impl Compiler {
                     let rreg = self.compile_sub(r);
                     pairs.push((creg, rreg));
                 }
-                let else_reg = else_expr
-                    .as_ref()
-                    .map(|e| self.compile_sub(e));
+                let else_reg = else_expr.as_ref().map(|e| self.compile_sub(e));
                 let dst = self.alloc_reg();
                 self.emit(Op::CaseSelect {
                     dst,
@@ -352,8 +352,17 @@ fn is_pure_const(e: &Expr) -> bool {
             // 无副作用、无列依赖的标量函数可折叠
             matches!(
                 name.as_str(),
-                "upper" | "lower" | "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt"
-                    | "length" | "trim" | "reverse"
+                "upper"
+                    | "lower"
+                    | "abs"
+                    | "round"
+                    | "floor"
+                    | "ceil"
+                    | "ceiling"
+                    | "sqrt"
+                    | "length"
+                    | "trim"
+                    | "reverse"
             ) && args.iter().all(is_pure_const)
         }
         _ => false,
@@ -364,8 +373,8 @@ fn is_pure_const(e: &Expr) -> bool {
 /// —— 编译器复用解释器的内核,正是真实 JIT "runtime 联动编译" 的做法)。
 fn fold_const(e: &Expr) -> ScalarValue {
     let lit_row = vec![ScalarValue::Int64(0)];
-    let chunk = DataChunk::from_rows(&[common::types::DataType::Int64], &[lit_row])
-        .expect("1-row chunk");
+    let chunk =
+        DataChunk::from_rows(&[common::types::DataType::Int64], &[lit_row]).expect("1-row chunk");
     e.eval(&chunk)
         .map(|v| v.scalar_at(0))
         .unwrap_or(ScalarValue::Null)
@@ -492,9 +501,7 @@ impl CompiledExpr {
                 }
                 Op::IsNull { dst, src, negated } => {
                     let v = operand!(src);
-                    let out: Vec<bool> = (0..v.len())
-                        .map(|i| v.null_at(i) != *negated)
-                        .collect();
+                    let out: Vec<bool> = (0..v.len()).map(|i| v.null_at(i) != *negated).collect();
                     regs[*dst] = Some(Vector::bools(out));
                 }
                 Op::InList {
@@ -512,11 +519,7 @@ impl CompiledExpr {
                                 return false;
                             }
                             let hit = set.contains(&v.scalar_at(i));
-                            if *negated {
-                                !hit
-                            } else {
-                                hit
-                            }
+                            if *negated { !hit } else { hit }
                         })
                         .collect();
                     regs[*dst] = Some(Vector::bools(out));
@@ -534,9 +537,7 @@ impl CompiledExpr {
                             .as_ref()
                             .ok_or_else(|| Error::internal("case cond reg"))?;
                         let cb = cv.bool_values().to_vec();
-                        let cn = (0..cv.len())
-                            .map(|i| cv.null_at(i))
-                            .collect::<Vec<_>>();
+                        let cn = (0..cv.len()).map(|i| cv.null_at(i)).collect::<Vec<_>>();
                         conds.push((cb, cn));
                         let rv = regs[*r]
                             .as_ref()
@@ -608,7 +609,7 @@ fn coerce_case(v: ScalarValue, ty: &common::types::DataType) -> Result<ScalarVal
             other => Err(Error::sql(format!(
                 "CASE branch type mismatch: expected Float64, got {other:?}"
             ))),
-        }
+        },
         t if v.data_type().is_some_and(|vt| vt == *t) => Ok(v),
         _ => Err(Error::sql(format!(
             "CASE branch type mismatch: expected {ty:?}, got {v:?}"
@@ -673,7 +674,11 @@ mod tests {
     /// JIT 优化①:常量折叠 —— (1+2)*3 编译后只剩一个字面量。
     #[test]
     fn jit_folds_constants() {
-        let e = bin(BinaryOp::Mul, bin(BinaryOp::Add, lit_i(1), lit_i(2)), lit_i(3));
+        let e = bin(
+            BinaryOp::Mul,
+            bin(BinaryOp::Add, lit_i(1), lit_i(2)),
+            lit_i(3),
+        );
         let c = compile(&e);
         assert_eq!(c.len(), 1, "整棵树应折叠为一条指令:\n{c}");
         assert_eq!(
@@ -710,12 +715,23 @@ mod tests {
         let adds = c
             .ops
             .iter()
-            .filter(|op| matches!(op, Op::Binary { op: BinaryOp::Add, .. }))
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(adds, 1, "加法应只算一次:\n{c}");
         // 数值正确性
         let out = c.eval(&chunk()).unwrap();
-        assert_eq!(out.scalar_at(0), ScalarValue::Float64((100.0 + 0.25) * (100.0 + 0.25)));
+        assert_eq!(
+            out.scalar_at(0),
+            ScalarValue::Float64((100.0 + 0.25) * (100.0 + 0.25))
+        );
     }
 
     /// 扁平化 + 单次使用移动:复杂表达式与解释执行**结果逐位一致**。

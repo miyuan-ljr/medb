@@ -276,11 +276,11 @@ pub fn plan_query(q: &Query, ctx: &PlanContext<'_>) -> Result<PlannedQuery> {
         Some(sqlparser::ast::OrderByKind::Expressions(exprs)) => exprs.as_slice(),
         _ => &[],
     };
-    let planned = plan_select(select, order_by, ctx)?;
-
-    // LIMIT / OFFSET
+    // 先解 LIMIT/OFFSET:Top-N 提示要在排序算子构造时传入
+    let mut offset_value = 0u64;
+    let mut limit_value: Option<u64> = None;
     match &q.limit_clause {
-        None => Ok(planned),
+        None => {}
         Some(LimitClause::LimitOffset {
             limit,
             offset,
@@ -289,22 +289,27 @@ pub fn plan_query(q: &Query, ctx: &PlanContext<'_>) -> Result<PlannedQuery> {
             if !limit_by.is_empty() {
                 return Err(Error::not_supported("LIMIT BY clause"));
             }
-            let limit_value = match limit {
+            limit_value = match limit {
                 Some(e) => Some(literal_u64(e, "LIMIT")?),
                 None => None,
             };
-            let offset_value = match offset {
+            offset_value = match offset {
                 Some(o) => literal_u64(&o.value, "OFFSET")?,
                 None => 0,
             };
-            finish_with_limit(planned, offset_value, limit_value)
         }
         Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-            let off = literal_u64(offset, "OFFSET")?;
-            let lim = literal_u64(limit, "LIMIT")?;
-            finish_with_limit(planned, off, Some(lim))
+            offset_value = literal_u64(offset, "OFFSET")?;
+            limit_value = Some(literal_u64(limit, "LIMIT")?);
         }
     }
+    let planned = plan_select(
+        select,
+        order_by,
+        limit_value.map(|k| (k, offset_value != 0)),
+        ctx,
+    )?;
+    finish_with_limit(planned, offset_value, limit_value)
 }
 
 fn finish_with_limit(
@@ -430,6 +435,7 @@ fn scalar_function_args(
 fn plan_select(
     select: &Select,
     order_by: &[sqlparser::ast::OrderByExpr],
+    limit_hint: Option<(u64, bool)>, // (LIMIT k, 是否有 OFFSET)
     ctx: &PlanContext<'_>,
 ) -> Result<PlannedQuery> {
     if select.distinct.is_some() {
@@ -887,10 +893,14 @@ fn plan_select(
         vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
     ));
 
-    // Sort + 砍隐藏列
+    // Sort + 砍隐藏列(下游紧跟 LIMIT k 且无 OFFSET → Top-N 模式)
     if !keys.is_empty() {
         let n_keys = keys.len();
-        pipeline = Box::new(SortExec::new(pipeline, keys, project_schema.clone()));
+        let mut sort_exec = SortExec::new(pipeline, keys, project_schema.clone());
+        if let Some((k, false)) = limit_hint {
+            sort_exec = sort_exec.with_topn(k.max(1) as usize);
+        }
+        pipeline = Box::new(sort_exec);
         expl = Some(ExplNode::with(
             format!("Sort ({n_keys} keys)"),
             vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
@@ -2085,7 +2095,7 @@ fn plan_insert(insert: &sqlparser::ast::Insert, ctx: &PlanContext<'_>) -> Result
             Ok(StatementPlan::Insert { table, rows })
         }
         SetExpr::Select(select) => {
-            let query = plan_select(select, &[], ctx)?;
+            let query = plan_select(select, &[], None, ctx)?;
             check_insert_select_arity(&table, &targets, &query)?;
             Ok(StatementPlan::InsertSelect {
                 table,

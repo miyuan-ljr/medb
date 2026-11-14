@@ -25,6 +25,8 @@ pub struct SortExec {
     keys: Vec<SortKey>,
     schema: Vec<ColumnDesc>,
     input_dtypes: Vec<DataType>,
+    /// Top-N:下游紧跟 LIMIT k(无 OFFSET)时,流式维护前 k 行,排序 O(n log k)
+    topn: Option<usize>,
     rows: Option<Vec<Row>>,
     next: usize,
 }
@@ -37,75 +39,111 @@ impl SortExec {
             keys,
             schema,
             input_dtypes,
+            topn: None,
             rows: None,
             next: 0,
         }
+    }
+
+    /// Top-N 模式:下游紧跟 `LIMIT k`(无 OFFSET)时由 planner 启用。
+    pub fn with_topn(mut self, k: usize) -> Self {
+        self.topn = Some(k.max(1));
+        self
     }
 }
 
 impl Executor for SortExec {
     fn next_batch(&mut self, ctx: &mut ExecuteContext) -> Result<Option<DataChunk>> {
         if self.rows.is_none() {
-            // 物化全部输入行
-            let mut rows: Vec<Row> = Vec::new();
-            loop {
-                let Some(batch) = self.input.next_batch(ctx)? else {
-                    break;
-                };
-                for i in 0..batch.num_rows() {
-                    rows.push(batch.row(i));
+            // Top-N:流式维护前 k 行(键以行式存储,随批追加 + 定期裁剪)
+            if let Some(k) = self.topn {
+                let mut rows: Vec<Row> = Vec::new();
+                let mut key_rows: Vec<Row> = Vec::new();
+                loop {
+                    let Some(batch) = self.input.next_batch(ctx)? else {
+                        break;
+                    };
+                    let key_vecs = self
+                        .keys
+                        .iter()
+                        .map(|k| k.expr.eval(&batch))
+                        .collect::<Result<Vec<_>>>()?;
+                    for i in 0..batch.num_rows() {
+                        rows.push(batch.row(i));
+                        key_rows.push(key_vecs.iter().map(|v| v.scalar_at(i)).collect::<Row>());
+                    }
+                    // 累积超 4k 行 → 裁剪到前 k(分摊成本)
+                    if rows.len() > k * 4 {
+                        trim_topn(&mut rows, &mut key_rows, &self.keys, k);
+                    }
                 }
-            }
-            if !rows.is_empty() && !self.keys.is_empty() {
-                // 键列整列求值后排序
-                let chunk = DataChunk::from_rows(&self.input_dtypes, &rows)?;
-                let key_cols = self
-                    .keys
-                    .iter()
-                    .map(|k| k.expr.eval(&chunk))
-                    .collect::<Result<Vec<_>>>()?;
-
+                trim_topn(&mut rows, &mut key_rows, &self.keys, k);
                 let mut order: Vec<usize> = (0..rows.len()).collect();
-                order.sort_by(|&a, &b| {
-                    for (key, col) in self.keys.iter().zip(&key_cols) {
-                        let (va, vb) = (col.scalar_at(a), col.scalar_at(b));
-                        let ord = match (va.is_null(), vb.is_null()) {
-                            (true, true) => Ordering::Equal,
-                            (true, false) => {
-                                if key.nulls_first {
-                                    Ordering::Less
-                                } else {
-                                    Ordering::Greater
-                                }
-                            }
-                            (false, true) => {
-                                if key.nulls_first {
-                                    Ordering::Greater
-                                } else {
-                                    Ordering::Less
-                                }
-                            }
-                            (false, false) => {
-                                let o = compare_values(&va, &vb).unwrap_or(Ordering::Equal);
-                                if key.asc { o } else { o.reverse() }
-                            }
-                        };
-                        if ord != Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    Ordering::Equal
-                });
-                let sorted_rows: Vec<Row> = {
-                    let mut out = Vec::with_capacity(rows.len());
-                    for i in order {
-                        out.push(rows[i].clone());
-                    }
-                    out
-                };
-                self.rows = Some(sorted_rows);
+                order.sort_by(|&a, &b| compare_key_rows(&key_rows[a], &key_rows[b], &self.keys));
+                let sorted_rows: Vec<Row> = order.into_iter().map(|i| rows[i].clone()).collect();
+                self.rows = Some(sorted_rows.into_iter().take(k).collect());
             } else {
-                self.rows = Some(rows);
+                // 全量物化
+                let mut rows: Vec<Row> = Vec::new();
+                loop {
+                    let Some(batch) = self.input.next_batch(ctx)? else {
+                        break;
+                    };
+                    for i in 0..batch.num_rows() {
+                        rows.push(batch.row(i));
+                    }
+                }
+                if !rows.is_empty() && !self.keys.is_empty() {
+                    // 键列整列求值后排序
+                    let chunk = DataChunk::from_rows(&self.input_dtypes, &rows)?;
+                    let key_cols = self
+                        .keys
+                        .iter()
+                        .map(|k| k.expr.eval(&chunk))
+                        .collect::<Result<Vec<_>>>()?;
+
+                    let mut order: Vec<usize> = (0..rows.len()).collect();
+                    order.sort_by(|&a, &b| {
+                        for (key, col) in self.keys.iter().zip(&key_cols) {
+                            let (va, vb) = (col.scalar_at(a), col.scalar_at(b));
+                            let ord = match (va.is_null(), vb.is_null()) {
+                                (true, true) => Ordering::Equal,
+                                (true, false) => {
+                                    if key.nulls_first {
+                                        Ordering::Less
+                                    } else {
+                                        Ordering::Greater
+                                    }
+                                }
+                                (false, true) => {
+                                    if key.nulls_first {
+                                        Ordering::Greater
+                                    } else {
+                                        Ordering::Less
+                                    }
+                                }
+                                (false, false) => {
+                                    let o = compare_values(&va, &vb).unwrap_or(Ordering::Equal);
+                                    if key.asc { o } else { o.reverse() }
+                                }
+                            };
+                            if ord != Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                    let sorted_rows: Vec<Row> = {
+                        let mut out = Vec::with_capacity(rows.len());
+                        for i in order {
+                            out.push(rows[i].clone());
+                        }
+                        out
+                    };
+                    self.rows = Some(sorted_rows);
+                } else {
+                    self.rows = Some(rows);
+                }
             }
         }
         let rows = self.rows.as_ref().expect("rows built above");
@@ -122,6 +160,61 @@ impl Executor for SortExec {
     fn schema(&self) -> &[ColumnDesc] {
         &self.schema
     }
+}
+
+/// Top-N 裁剪:保留当前排序下前 k 行(按 base 偏移回全局行号)。
+/// 简单可靠版:整体排序后截断(行数被 4k 上限约束,均摊 O(n log n) 且常数小;
+/// 流式小顶堆版本见路线图)。
+fn trim_topn(rows: &mut Vec<Row>, key_rows: &mut Vec<Row>, keys: &[SortKey], k: usize) {
+    if rows.len() <= k {
+        return;
+    }
+    let n = rows.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| compare_key_rows(&key_rows[a], &key_rows[b], keys));
+    let keep: std::collections::HashSet<usize> = order[..k].iter().copied().collect();
+    let mut new_rows = Vec::with_capacity(k);
+    let mut new_key_rows = Vec::with_capacity(k);
+    for i in 0..n {
+        if keep.contains(&i) {
+            new_rows.push(rows[i].clone());
+            new_key_rows.push(key_rows[i].clone());
+        }
+    }
+    *rows = new_rows;
+    *key_rows = new_key_rows;
+}
+
+/// 对键行做排序比较(语义与 sort_order 一致)。
+fn compare_key_rows(a: &Row, b: &Row, keys: &[SortKey]) -> Ordering {
+    for (i, key) in keys.iter().enumerate() {
+        let (va, vb) = (&a[i], &b[i]);
+        let ord = match (va.is_null(), vb.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if key.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if key.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                let o = compare_values(va, vb).unwrap_or(Ordering::Equal);
+                if key.asc { o } else { o.reverse() }
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 #[cfg(test)]

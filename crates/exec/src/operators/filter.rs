@@ -5,9 +5,9 @@ use common::schema::ColumnDesc;
 use common::types::DataType;
 
 use crate::chunk::DataChunk;
-use crate::expr_compile::CompiledExpr;
 use crate::executor::{BoxedExecutor, ExecuteContext, Executor};
 use crate::expr::Expr;
+use crate::expr_compile::CompiledExpr;
 use crate::vector::Vector;
 
 pub struct FilterExec {
