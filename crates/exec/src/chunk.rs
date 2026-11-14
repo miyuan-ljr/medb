@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use common::error::{Error, Result};
 use common::schema::{ColumnDesc, Row};
-use common::types::DataType;
+use common::types::{DataType, ScalarValue};
 use memory::{MemoryTracker, Reservation};
 
 use crate::vector::Vector;
@@ -127,6 +127,25 @@ impl DataChunk {
         self.columns.iter().map(|c| c.approx_size()).sum::<usize>()
             + std::mem::size_of::<Vector>() * self.columns.len()
     }
+}
+
+/// 单行近似字节数(行级物化记账用;标量列按 ScalarValue 大小,文本/二进制按实际长度)。
+pub fn row_approx_bytes(dtypes: &[DataType], row: &[ScalarValue]) -> usize {
+    let mut n = std::mem::size_of::<ScalarValue>() * row.len();
+    for (ty, v) in dtypes.iter().zip(row) {
+        match (ty, v) {
+            (DataType::Utf8, ScalarValue::Utf8(s)) => n += s.len(),
+            (DataType::Binary, ScalarValue::Binary(b)) => n += b.len(),
+            (DataType::Array(_), ScalarValue::List(items)) => {
+                n += std::mem::size_of::<ScalarValue>() * items.len();
+            }
+            (DataType::Vector(dim), ScalarValue::Vector(_vals)) => {
+                n += 4 * dim; // dim 个 f32
+            }
+            _ => {}
+        }
+    }
+    n
 }
 
 #[cfg(test)]

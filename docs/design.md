@@ -275,6 +275,22 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 每节点带估行数 / 下推过滤 / 连接键 / 物化侧标签。planner 以 `ExplNode` 树
 累积、`flatten_expl` 摊平;LIMIT 在外层包装时整体缩进一级。
 
+### 5.5.5 内存上限与物化记账
+
+- **限额层级**:全局(默认 30 GiB)→ 会话 → 查询 → 执行器,任一层超限即
+  `MemoryLimitExceeded`(SQLSTATE 53200),整条链路原子回滚记账。
+- **记账缺口补齐**(此前只覆盖 DataChunk/arena/memtable):
+  - SeqScan 物化行集:一次性 reserve(行集 × `row_approx_bytes`),扫完即释放;
+  - HashJoin:build 哈希表逐行 reserve;输出缓冲(materialize 的 `out`)逐行
+    reserve;`Reservation` 随执行器 drop 释放;
+  - 引擎输出(`run_query` 收集的行):逐行 `Reservation::resize`。
+- **教训**:行级 `Vec<Row>` 累积此前完全游离在配额树外,限额形同虚设;
+  任何新的行/表物化都必须在创建点问一句"记账了吗"。
+- **OR 公共键提取**(Q19 根因):`(...) OR (...) OR ...` 且每个析取分支都含
+  同一跨表等值对(按两侧 SQL 文本匹配)→ 提取为哈希键,完整 OR 仍作 residual
+  强制(`PoolEntry.key_from_or`)。此前这类查询无法识别连接键 → 笛卡尔积
+  全物化(60k × 20k 行级),是基准内存爆掉的直接原因。
+
 ## 6. 测试策略
 
 - 单元:每个格式(键/块/bloom/WAL/SST)codec 往返 + 损坏检测;

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use common::error::Result;
 use common::schema::{ColumnDesc, Row, TableSchema};
 use common::types::DataType;
+use memory::Reservation;
 
 use crate::chunk::DataChunk;
 use crate::executor::{ExecuteContext, Executor};
@@ -33,6 +34,8 @@ pub struct SeqScanExec {
     source: Arc<dyn QueryDataSource>,
     table: TableSchema,
     rows: Option<Vec<Row>>,
+    /// 物化行集的内存记账(超查询/全局限额 → MemoryLimitExceeded)
+    mem: Option<Reservation>,
     next: usize,
 }
 
@@ -46,6 +49,7 @@ impl SeqScanExec {
             source,
             table,
             rows: None,
+            mem: None,
             next: 0,
         }
     }
@@ -54,10 +58,20 @@ impl SeqScanExec {
 impl Executor for SeqScanExec {
     fn next_batch(&mut self, ctx: &mut ExecuteContext) -> Result<Option<DataChunk>> {
         if self.rows.is_none() {
-            self.rows = Some(self.source.scan_table(&self.table)?);
+            let rows = self.source.scan_table(&self.table)?;
+            // 物化行集计入配额树(与 DataChunk 记账同一棵树)
+            let bytes = rows
+                .iter()
+                .map(|r| crate::chunk::row_approx_bytes(&self.dtypes, r))
+                .sum();
+            let res = ctx.mem.tracker.try_reserve(bytes)?;
+            self.mem = Some(res);
+            self.rows = Some(rows);
         }
         let rows = self.rows.as_ref().expect("rows fetched above");
         if self.next >= rows.len() {
+            // 扫完即释放物化记账(行集仍持有,但不再计入活跃内存)
+            self.mem = None;
             return Ok(None);
         }
         let end = (self.next + ctx.batch_size).min(rows.len());

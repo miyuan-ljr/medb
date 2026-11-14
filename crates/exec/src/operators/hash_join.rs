@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use crate::chunk::DataChunk;
 use crate::executor::{BoxedExecutor, ExecuteContext, Executor};
 use crate::expr::Expr;
+use memory::Reservation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinType {
@@ -40,6 +41,9 @@ pub struct HashJoinExec {
     build_null_row: Row,
     probe_done: bool,
     out: Vec<Row>,
+    /// 物化内存记账(build 哈希表 + 输出缓冲),超限 → MemoryLimitExceeded
+    mem: Option<Reservation>,
+    mem_bytes: usize,
     next: usize,
 }
 
@@ -75,11 +79,23 @@ impl HashJoinExec {
             build_null_row: Vec::new(),
             probe_done: false,
             out: Vec::new(),
+            mem: None,
+            mem_bytes: 0,
             next: 0,
         }
     }
 
-    /// 构建侧整批物化为哈希表;NULL 键不入表(不与任何行连接)。
+    /// 物化增长记账:累积 Reservation 随执行器生命周期释放。
+    fn track_mem(&mut self, ctx: &ExecuteContext, extra: usize) -> Result<()> {
+        let new_total = self.mem_bytes + extra;
+        match self.mem.as_mut() {
+            Some(r) => r.resize(new_total)?,
+            None => self.mem = Some(ctx.mem.tracker.try_reserve(new_total)?),
+        }
+        self.mem_bytes = new_total;
+        Ok(())
+    }
+
     /// 构建侧整批物化为哈希表;NULL 键不入表(不与任何行连接)。
     fn build_table(&mut self, ctx: &mut ExecuteContext) -> Result<()> {
         let mut table: HashMap<Vec<ScalarValue>, Vec<Row>> = HashMap::new();
@@ -97,7 +113,12 @@ impl HashJoinExec {
                 if key.iter().any(|v| v.is_null()) {
                     continue;
                 }
-                table.entry(key).or_default().push(batch.row(i));
+                let row = batch.row(i);
+                self.track_mem(
+                    ctx,
+                    crate::chunk::row_approx_bytes(&self.build_dtypes, &row) + key.len() * 16,
+                )?;
+                table.entry(key).or_default().push(row);
             }
         }
         // 左外连接的 NULL 填充行模板
@@ -111,7 +132,8 @@ impl HashJoinExec {
     /// residual 在输出前整批过滤(作用于含 NULL 补齐行的完整连接结果)。
     fn materialize(&mut self, ctx: &mut ExecuteContext) -> Result<()> {
         self.build_table(ctx)?;
-        let table = self.table.as_ref().expect("build_table called first");
+        // take 出来:后面 track_mem 需要 &mut self;materialize 后哈希表不再需要
+        let table = std::mem::take(&mut self.table).expect("build_table called first");
         let mut out: Vec<Row> = Vec::new();
         let left = self.join_type == JoinType::LeftOuter;
 
@@ -172,14 +194,28 @@ impl HashJoinExec {
                 if null_ext[i] {
                     let mut row = batch.row(i);
                     row.extend(self.build_null_row.iter().cloned());
+                    self.track_mem(
+                        ctx,
+                        crate::chunk::row_approx_bytes(&self.combined_dtypes, &row),
+                    )?;
                     out.push(row);
                 } else if cand[i].is_empty() {
                     if left {
                         let mut row = batch.row(i);
                         row.extend(self.build_null_row.iter().cloned());
+                        self.track_mem(
+                            ctx,
+                            crate::chunk::row_approx_bytes(&self.combined_dtypes, &row),
+                        )?;
                         out.push(row);
                     }
                 } else {
+                    for r in &cand[i] {
+                        self.track_mem(
+                            ctx,
+                            crate::chunk::row_approx_bytes(&self.combined_dtypes, r),
+                        )?;
+                    }
                     out.append(&mut cand[i]);
                 }
             }
@@ -386,5 +422,43 @@ mod tests {
         let root = MemoryTracker::new_root("t", None);
         let out = drain(&mut exec, &root);
         assert_eq!(out.len(), 0, "NULL 键不参与连接(内连接)");
+    }
+
+    #[test]
+    fn join_materialization_respects_memory_limit() {
+        // build 侧 200 行物化进哈希表,2KB 限额 → 记账超限报错(不真耗内存)
+        let rows: Vec<Row> = (0..200u64)
+            .map(|i| vec![ScalarValue::Int64(i as i64), ScalarValue::Int64(1)])
+            .collect();
+        let build = Box::new(ValuesExec::new(build_schema(), rows));
+        let probe = Box::new(ValuesExec::new(
+            probe_schema(),
+            vec![vec![ScalarValue::Int64(1), ScalarValue::Int64(1)]],
+        ));
+        let mut exec = HashJoinExec::new(
+            probe,
+            build,
+            probe_schema(),
+            build_schema(),
+            vec![Expr::Column(1)],
+            vec![Expr::Column(0)],
+            None,
+            None,
+            JoinType::Inner,
+        );
+        let root = MemoryTracker::new_root("tiny", Some(2048));
+        let err = drain_result(&mut exec, &root);
+        assert!(err.is_err(), "超限应报错");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("memory") || msg.contains("limit"), "{msg}");
+    }
+
+    /// drain 的 Result 版本(不 unwrap,供限额断言用)。
+    fn drain_result(exec: &mut dyn Executor, root: &Arc<MemoryTracker>) -> Result<()> {
+        let mut ctx = ExecuteContext::new(64, MemoryContext::new(root, "q", 4096));
+        while let Some(chunk) = exec.next_batch(&mut ctx)? {
+            let _ = chunk.num_rows();
+        }
+        Ok(())
     }
 }

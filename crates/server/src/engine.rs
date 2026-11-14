@@ -514,15 +514,26 @@ impl Engine {
         let mem = self.new_query_context();
         let mut ctx = ExecuteContext::new(self.config.engine.batch_size, mem);
         let mut exec = pq.executor;
+        let dtypes: Vec<common::types::DataType> = pq.schema.iter().map(|c| c.ty.clone()).collect();
         let mut rows: Vec<Row> = Vec::new();
+        // 输出物化记账(超查询/全局限额 → MemoryLimitExceeded)
+        let mut mem_res: Option<memory::tracker::Reservation> = None;
+        let mut mem_bytes = 0usize;
         loop {
             let Some(chunk) = exec.next_batch(&mut ctx)? else {
                 break;
             };
             for i in 0..chunk.num_rows() {
-                rows.push(chunk.row(i));
+                let row = chunk.row(i);
+                mem_bytes += exec::chunk::row_approx_bytes(&dtypes, &row);
+                match mem_res.as_mut() {
+                    Some(r) => r.resize(mem_bytes)?,
+                    None => mem_res = Some(ctx.mem.tracker.try_reserve(mem_bytes)?),
+                }
+                rows.push(row);
             }
         }
+        drop(mem_res);
         debug!(rows = rows.len(), "query executed");
         Ok(Outcome::Query {
             schema: pq.schema,

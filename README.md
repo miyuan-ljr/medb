@@ -89,7 +89,7 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 ## 当前进度与路线图
 
-已完成(全部带测试,workspace 221 个测试):
+已完成(全部带测试,workspace 222 个测试):
 
 - 内存机制三层(mimalloc / 配额树 / arena)
 - LSM 完整闭环:WAL 恢复、SST 读写、flush、压缩、墓碑、并发单写者、序列水位恢复、
@@ -131,6 +131,14 @@ postgres=# DELETE FROM users WHERE id = 1;
   - **EXPLAIN <SELECT>**:统计驱动的计划树(扫描估行/下推过滤/连接键/物化侧)
   - 顺带修正:LEFT JOIN 空产侧谓词此前被错误下推(会改变 NULL 补齐语义),
     统一路由后按"位置 ≥ 自身的 LEFT 步骤挡住下推"处理
+- **内存控制(30 GiB 上限)**:
+  - 配额树根默认限额提升到 **30 GiB**(`memory.global_limit_bytes`,0 = 不限);
+    memtable / arena / chunk / 哈希表 / 物化行集全在同一棵树上记账
+  - 补齐记账缺口:SeqScan 物化行集、HashJoin 构建哈希表 + 输出缓冲、
+    引擎查询输出行 —— 超任何一层限额即报 `MemoryLimitExceeded`(SQLSTATE 53200)
+  - Q19 根因修复:WHERE 为 OR-of-AND 且每个分支都含同一跨表等值对时,
+    提取该对作为哈希键(完整 OR 仍作 residual 强制)—— 此前这类查询会退化成
+    笛卡尔积全物化(12 亿行级别),正是内存爆掉的来源
 - **表达式补全(CASE / IN / 非相关子查询,`server/tests/expressions.rs`)**:
   - **CASE WHEN**(搜索式):投影、WHERE、`SUM(CASE WHEN ...)` 聚合内均可
     (Q7/Q9/Q12/Q14 形状);结果类型统一(任一分支 Float64 → Int64 提升);

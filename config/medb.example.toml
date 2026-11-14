@@ -6,8 +6,9 @@
 listen_addr = "127.0.0.1:55432"
 
 [memory]
-# 配额树根限额(字节);0 = 不限制
-global_limit_bytes = 1073741824    # 1 GiB
+# 配额树根限额(字节);0 = 不限制。默认 30 GiB(数据库全进程内存上限,
+# memtable/哈希表/查询中间结果均计入,超出即报 MemoryLimitExceeded)
+global_limit_bytes = 32212254720    # 30 GiB
 query_limit_bytes = 268435456      # 256 MiB
 session_limit_bytes = 67108864     # 64 MiB
 # 查询 arena 的 chunk 大小(短命对象统一分配,整块归还)

@@ -1161,6 +1161,26 @@ fn emit_inner_join(
                 )?);
                 key_sql.push(format!("{probe_side} = {build_side}"));
                 applied.insert(pi);
+                // 键来自 OR 公共键提取:键命中是必要非充分 → 完整 OR 仍需 residual
+                if !entry.key_from_or {
+                    continue;
+                }
+                let e = plan_expr(entry.expr, em.scope_ref, em.plan_ctx)?;
+                check_bool(&e, em.input_schema, "join condition")?;
+                let prefix_width = prefix
+                    .iter()
+                    .map(|&p| em.steps[p].schema.columns.len())
+                    .sum();
+                let e = remap_for_join(
+                    e,
+                    t_offset,
+                    t_width,
+                    prefix_width,
+                    acc_shift,
+                    build_accumulated,
+                )?;
+                residual.push(e);
+                residual_sql.push(format!("{}", entry.expr));
                 continue;
             }
             // 交换:probe = t 扫描(局部重基),build = 累计(重基 acc_shift)
@@ -1176,6 +1196,25 @@ fn emit_inner_join(
             )?);
             key_sql.push(format!("{probe_side} = {build_side}"));
             applied.insert(pi);
+            // 键来自 OR 公共键提取:完整 OR 仍需 residual(同上)
+            if entry.key_from_or {
+                let e = plan_expr(entry.expr, em.scope_ref, em.plan_ctx)?;
+                check_bool(&e, em.input_schema, "join condition")?;
+                let prefix_width = prefix
+                    .iter()
+                    .map(|&p| em.steps[p].schema.columns.len())
+                    .sum();
+                let e = remap_for_join(
+                    e,
+                    t_offset,
+                    t_width,
+                    prefix_width,
+                    acc_shift,
+                    build_accumulated,
+                )?;
+                residual.push(e);
+                residual_sql.push(format!("{}", entry.expr));
+            }
             continue;
         }
         // 非等值/跨多表条件:连接后过滤(组合列序见 remap_for_join)

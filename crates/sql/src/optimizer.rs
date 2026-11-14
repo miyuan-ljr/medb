@@ -115,6 +115,42 @@ pub(crate) fn collect_sql_tables(
             collect_sql_tables(pattern, scope, out)
         }
         SE::Extract { expr, .. } => collect_sql_tables(expr, scope, out),
+        SE::Between {
+            expr, low, high, ..
+        } => {
+            collect_sql_tables(expr, scope, out)?;
+            collect_sql_tables(low, scope, out)?;
+            collect_sql_tables(high, scope, out)
+        }
+        SE::In { expr, target, .. } => {
+            collect_sql_tables(expr, scope, out)?;
+            if let sqlparser::ast::InTarget::List(list) = target {
+                for e in list {
+                    collect_sql_tables(e, scope, out)?;
+                }
+            }
+            Ok(()) // InTarget::Subquery 非相关,计划期单独求值,不占外层表引用
+        }
+        SE::IsNull(expr) => collect_sql_tables(expr, scope, out),
+        SE::IsNotNull(expr) => collect_sql_tables(expr, scope, out),
+        SE::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_sql_tables(op, scope, out)?;
+            }
+            for cw in conditions {
+                collect_sql_tables(&cw.condition, scope, out)?;
+                collect_sql_tables(&cw.result, scope, out)?;
+            }
+            if let Some(e) = else_result {
+                collect_sql_tables(e, scope, out)?;
+            }
+            Ok(())
+        }
         SE::Substring {
             expr,
             substring_from,
@@ -355,8 +391,105 @@ pub struct PoolEntry<'a> {
     /// 引用的 scope 位置(升序)
     pub tables: Vec<usize>,
     pub join_pair: Option<JoinPair<'a>>,
+    /// true = 键来自 OR 分支公共等值提取(必要非充分)→ 计划器须把完整
+    /// 表达式同时保留为 residual 强制
+    pub key_from_or: bool,
     /// 非等值对条件的选择性(等值对用 1/ndv)
     pub sel: f64,
+}
+
+/// OR 树展开为顶层析取分支列表。
+fn flatten_or<'a>(e: &'a SE, out: &mut Vec<&'a SE>) {
+    match e {
+        SE::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            flatten_or(left, out);
+            flatten_or(right, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+/// 从 `(...) OR (...) OR ...` 形态的条件中提取"每个析取分支都含有"的
+/// 跨表等值对(按两侧 SQL 文本匹配):Q19 形状 —— 每个分支都包含
+/// `l_partkey = p_partkey` → 提取为哈希键,避免笛卡尔积。
+/// 返回 (键对, 是否确有多个分支)。
+fn or_common_pair<'a>(e: &'a SE, scope: &Scope, est: &Estimator<'_>) -> Option<JoinPair<'a>> {
+    let mut branches: Vec<&SE> = Vec::new();
+    flatten_or(e, &mut branches);
+    if branches.len() < 2 {
+        return None;
+    }
+    // 每个分支的键文本集合
+    let mut common: Option<Vec<(String, String)>> = None;
+    for b in &branches {
+        let mut keys: Vec<(String, String)> = Vec::new();
+        for c in split_conjuncts(b) {
+            if let SE::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = c
+            {
+                let Ok(lt) = sql_expr_tables(left, scope) else {
+                    continue;
+                };
+                let Ok(rt) = sql_expr_tables(right, scope) else {
+                    continue;
+                };
+                let (lo_e, hi_e) = match (lt.as_slice(), rt.as_slice()) {
+                    ([i], [j]) if i < j => (left, right),
+                    ([i], [j]) if i > j => (right, left),
+                    _ => continue,
+                };
+                keys.push((format!("{lo_e}"), format!("{hi_e}")));
+            }
+        }
+        match &mut common {
+            None => common = Some(keys),
+            Some(prev) => {
+                prev.retain(|k| keys.contains(k));
+                if prev.is_empty() {
+                    return None;
+                }
+            }
+        }
+    }
+    // 取第一个共同键对;expr 引用从第一个含它的分支取(生命周期同池条目)
+    let (lo_text, hi_text) = common?.remove(0);
+    for b in &branches {
+        for c in split_conjuncts(b) {
+            if let SE::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = c
+            {
+                if format!("{left}") == lo_text && format!("{right}") == hi_text {
+                    let lt = sql_expr_tables(left, scope).ok()?;
+                    let rt = sql_expr_tables(right, scope).ok()?;
+                    return match (lt.as_slice(), rt.as_slice()) {
+                        ([i], [j]) if i < j => Some(make_pair(*i, *j, left, right, est)),
+                        ([i], [j]) if i > j => Some(make_pair(*j, *i, right, left, est)),
+                        _ => None,
+                    };
+                }
+                if format!("{left}") == hi_text && format!("{right}") == lo_text {
+                    let lt = sql_expr_tables(left, scope).ok()?;
+                    let rt = sql_expr_tables(right, scope).ok()?;
+                    return match (lt.as_slice(), rt.as_slice()) {
+                        ([i], [j]) if i < j => Some(make_pair(*i, *j, left, right, est)),
+                        ([i], [j]) if i > j => Some(make_pair(*j, *i, right, left, est)),
+                        _ => None,
+                    };
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 构建连接条件池:从一组合取项中筛出跨表(≥2 表)条件并分类。
@@ -371,7 +504,8 @@ pub fn build_pool<'a>(
         if tables.len() < 2 {
             continue;
         }
-        // 等值对识别:两侧各只引用一张表
+        // 等值对识别:顶层 `a = b`,或 OR-of-AND 的公共键(Q19 形状)
+        let mut key_from_or = false;
         let join_pair = match c {
             SE::BinaryOp {
                 left,
@@ -388,11 +522,22 @@ pub fn build_pool<'a>(
             }
             _ => None,
         };
+        let join_pair = match join_pair {
+            Some(p) => Some(p),
+            None => match or_common_pair(c, scope, est) {
+                Some(p) => {
+                    key_from_or = true;
+                    Some(p)
+                }
+                None => None,
+            },
+        };
         let sel = est.selectivity(c).clamp(MIN_SEL, 1.0);
         pool.push(PoolEntry {
             expr: c,
             tables,
             join_pair,
+            key_from_or,
             sel,
         });
     }

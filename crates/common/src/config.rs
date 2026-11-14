@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:55432";
-pub const DEFAULT_GLOBAL_LIMIT_BYTES: u64 = 1 << 30; // 1 GiB
+/// 全局内存上限(配额树根):默认 30 GiB,超出即拒绝分配(MemoryLimitExceeded)
+pub const DEFAULT_GLOBAL_LIMIT_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 pub const DEFAULT_QUERY_LIMIT_BYTES: u64 = 256 << 20; // 256 MiB
 pub const DEFAULT_SESSION_LIMIT_BYTES: u64 = 64 << 20; // 64 MiB
 pub const DEFAULT_ARENA_CHUNK_BYTES: usize = 64 << 10; // 64 KiB
