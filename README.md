@@ -89,7 +89,7 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 ## 当前进度与路线图
 
-已完成(全部带测试,workspace 228 个测试):
+已完成(全部带测试,workspace 235 个测试):
 
 - 内存机制三层(mimalloc / 配额树 / arena)
 - LSM 完整闭环:WAL 恢复、SST 读写、flush、压缩、墓碑、并发单写者、序列水位恢复、
@@ -131,6 +131,16 @@ postgres=# DELETE FROM users WHERE id = 1;
   - **EXPLAIN <SELECT>**:统计驱动的计划树(扫描估行/下推过滤/连接键/物化侧)
   - 顺带修正:LEFT JOIN 空产侧谓词此前被错误下推(会改变 NULL 补齐语义),
     统一路由后按"位置 ≥ 自身的 LEFT 步骤挡住下推"处理
+- **表达式 JIT(`exec::expr_compile`)**:
+  - Expr 树 → **扁平字节码 + SSA 寄存器程序**,执行期一次顺序循环(无递归、
+    无分发树);接入 FilterExec / ProjectExec(每查询每表达式编译一次)
+  - **编译期三板斧**:常量折叠(`(1+2)*3` → 9)、代数化简(`x+0 → x`,
+    严格 SQL 三值逻辑 —— `x*0 ↛ 0` 被明确禁止,NULL 传播不破坏)、
+    公共子表达式消除(按子树文本键复用寄存器)
+  - **单次使用移动**:寄存器消费计数,单次使用按移动取用(免整列拷贝)
+  - SF0.1:合计 651ms → **590ms**(叠加上一轮累计 -40%)
+  - 说明:这是**表达式级 JIT**(字节码 + 解释循环,Hyper/Impala 光谱中的
+    折中层);LLVM/Cranelift 机器码与全流水线 codegen 见路线图
 - **谓词下推 + AP 列存路径 + 并行执行(读写路径性能优化)**:
   - **谓词下推**:扫描谓词随解码过滤(`scan_table_filtered`),未命中行不进
     物化 —— JOIN build 侧、聚合输入、内存占用同步缩小;

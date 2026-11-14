@@ -5,6 +5,7 @@ use common::schema::ColumnDesc;
 use common::types::DataType;
 
 use crate::chunk::DataChunk;
+use crate::expr_compile::CompiledExpr;
 use crate::executor::{BoxedExecutor, ExecuteContext, Executor};
 use crate::expr::Expr;
 use crate::vector::Vector;
@@ -12,7 +13,8 @@ use crate::vector::Vector;
 pub struct FilterExec {
     input: BoxedExecutor,
     schema: Vec<ColumnDesc>,
-    predicate: Expr,
+    /// JIT 编译后的谓词程序(常量折叠/代数化简/CSE 已在编译期应用)
+    predicate: CompiledExpr,
 }
 
 impl FilterExec {
@@ -21,7 +23,7 @@ impl FilterExec {
         Self {
             input,
             schema,
-            predicate,
+            predicate: crate::expr_compile::compile(&predicate),
         }
     }
 }

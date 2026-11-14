@@ -4,22 +4,25 @@ use common::error::Result;
 use common::schema::ColumnDesc;
 
 use crate::chunk::DataChunk;
+use crate::expr_compile::CompiledExpr;
 use crate::executor::{BoxedExecutor, ExecuteContext, Executor};
 use crate::expr::Expr;
 
 pub struct ProjectExec {
     input: BoxedExecutor,
     schema: Vec<ColumnDesc>,
-    exprs: Vec<Expr>,
+    /// JIT 编译后的投影程序(每输出列一份;编译期已做折叠/化简/CSE)
+    exprs: Vec<CompiledExpr>,
 }
 
 impl ProjectExec {
     /// `schema` 为输出列描述(名字来自别名或表达式文本,类型来自静态推导)。
     pub fn new(input: BoxedExecutor, schema: Vec<ColumnDesc>, exprs: Vec<Expr>) -> Self {
+        let compiled = exprs.iter().map(crate::expr_compile::compile).collect();
         Self {
             input,
             schema,
-            exprs,
+            exprs: compiled,
         }
     }
 }

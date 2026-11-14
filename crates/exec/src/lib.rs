@@ -12,6 +12,7 @@ pub mod agg;
 pub mod chunk;
 pub mod executor;
 pub mod expr;
+pub mod expr_compile;
 pub mod functions;
 pub mod operators;
 pub mod parallel;
