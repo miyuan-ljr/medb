@@ -133,6 +133,37 @@ impl InMemoryColumnarReplica {
             tables: Mutex::new(std::collections::HashMap::new()),
         }
     }
+
+    /// 取出整表(键 + 行)快照数据;未镜像的表返回 None。
+    pub fn collect_table(&self, table_id: u64) -> Option<Vec<(Vec<u8>, Row)>> {
+        self.tables
+            .lock()
+            .get(&table_id)
+            .map(|t| t.rows.iter().map(|(k, r)| (k.clone(), r.clone())).collect())
+    }
+
+    /// 批量装入快照数据(恢复路径;整表替换)。
+    pub fn bulk_load(&self, table_id: u64, entries: Vec<(Vec<u8>, Row)>) {
+        let mut tables = self.tables.lock();
+        let t = tables.entry(table_id).or_default();
+        for (k, r) in entries {
+            t.rows.insert(k, r);
+        }
+    }
+
+    /// 单条镜像应用(upsert / 删除);恢复重放用,不做 schema 校验。
+    pub fn apply_mirror(&self, table_id: u64, key: &[u8], row: Option<Row>) {
+        let mut tables = self.tables.lock();
+        let t = tables.entry(table_id).or_default();
+        match row {
+            Some(r) => {
+                t.rows.insert(key.to_vec(), r);
+            }
+            None => {
+                t.rows.remove(key);
+            }
+        }
+    }
 }
 
 impl Default for InMemoryColumnarReplica {

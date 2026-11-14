@@ -286,7 +286,13 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
   引擎实现:列存副本逐列读出 → 转 exec Vector(含 null 位图转换)。
   - 门控(任一不满足即回退行存):事务内读(副本只镜像已提交状态,
     必须保读己之写)、LOB/数组/向量列、副本缺失;
-  - **重启重建**:副本是内存镜像,Engine::open 时从 LSM 全量重建 ——
+  - **持久化**:`columnar_file` 每表一份快照(`columnar/{table_id}.col`),
+    列主序 + codec 值编码 + CRC32 + tmp/rename 原子替换;头部带**水位线**
+    (已镜像的最大 LSM seq)。持久化时机:FLUSH TABLES、累计 10 万次镜像写。
+    恢复 = 快照 bulk_load + LSM 重放(seq > 水位);**删除补齐**:LSM 扫描
+    会把墓碑键从结果剔除,快照中存在但 LSM 不可见的键在重放后移除(v1 踩过:
+    删除后重启复活一行);快照损坏 → 告警 + 全量重建(派生数据,安全);
+  - **重启重建**:无快照时 Engine::open 从 LSM 全量重建 ——
     空副本不可信,否则重启后新写入的行会"遮蔽"历史行(v1 踩过);
   - 列存副本 v1.1:每列带 null 位图(与行存 NULL 语义一致),Date 列支持;
   - 列间长度一致性校验(misalignment = corruption 错误)。

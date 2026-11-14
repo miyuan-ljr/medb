@@ -12,6 +12,7 @@
 //! - [`columnar`]:列存副本 trait 与内存实现(HTAP AP 路径)。
 
 pub mod columnar;
+pub mod columnar_file;
 pub mod compaction;
 pub mod key;
 pub mod lsm;

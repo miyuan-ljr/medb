@@ -115,6 +115,8 @@ impl StatsStore {
 /// 全量(或抽样)扫描重建统计(自动 ANALYZE 与 ANALYZE 语句共用)。
 /// 抽样目标 100 万行:超过时按等步长抽样,NDV 为样本下界估计。
 const ANALYZE_SAMPLE_ROWS: usize = 1 << 20;
+/// 列存增量写次数超过此值 → 自动持久化列存快照。
+const COLUMNAR_PERSIST_THRESHOLD: u64 = 100_000;
 
 /// 解码一片 entry 并按谓词过滤(并行解码的工作单元)。
 /// 组批(512 行)向量化求值谓词,命中行按序返回。
@@ -385,6 +387,10 @@ pub struct Engine {
     lsm: Arc<LsmStore>,
     columnar: Arc<InMemoryColumnarReplica>,
     stats: Arc<StatsStore>,
+    /// 列存快照水位线(table_id → 已镜像的最大 LSM seq)
+    columnar_wm: Mutex<std::collections::HashMap<u64, u64>>,
+    /// 列存增量写次数(超阈值自动持久化快照)
+    columnar_dirty: std::sync::atomic::AtomicU64,
     active_snapshots: Mutex<BTreeSet<u64>>,
     /// 提交锁:唯一性探测与写盘在同一把锁下串行,消除 check-then-write 竞争
     commit_lock: Mutex<()>,
@@ -446,33 +452,135 @@ impl Engine {
         // 列存副本是内存镜像,重启即失 —— 从 LSM 全量重建,
         // 使 AP 列存路径与行存始终一致(增量 CDC 见路线图)
         let columnar = Arc::new(InMemoryColumnarReplica::new());
+        let columnar_wm: Mutex<std::collections::HashMap<u64, u64>> =
+            Mutex::new(std::collections::HashMap::new());
+        let col_dir = config.storage.data_dir.join("columnar");
         let mut mirrored_rows = 0u64;
+        let mut snap_recovered = 0u64;
+        let mut replayed = 0u64;
         for schema in catalog.list_tables() {
+            let schema_arc = Arc::new(schema.clone());
+            // ① 优先加载列存快照(列格式 + 水位线);缺失/损坏 → 全量重建
+            let snap_path = storage::columnar_file::snapshot_path(&col_dir, schema.id);
+            #[allow(unused_assignments)] // 重建分支在循环内重新赋值
+            let mut wm = 0u64;
+            let mut snap_recovered_this = false;
+            match storage::columnar_file::read_snapshot(&snap_path, schema.id) {
+                Ok(Some(snap)) => {
+                    wm = snap.watermark;
+                    columnar.bulk_load(schema.id, snap.entries);
+                    snap_recovered += 1;
+                    snap_recovered_this = true;
+                }
+                Ok(None) => {
+                    let (from, to) = row_range(schema.id);
+                    let Ok(entries) = lsm.scan(&from, &to) else {
+                        continue;
+                    };
+                    for (key, _seq, value) in entries {
+                        let Some(bytes) = value else { continue };
+                        let mut slice = bytes.as_slice();
+                        let Ok(mut row) = common::codec::decode_row(&mut slice) else {
+                            continue;
+                        };
+                        if row.len() < schema.columns.len() {
+                            row.resize(schema.columns.len(), ScalarValue::Null);
+                        } else if row.len() > schema.columns.len() {
+                            row.truncate(schema.columns.len());
+                        }
+                        if let Err(e) = columnar.upsert(&schema_arc, &key, row) {
+                            warn!(table = %schema.name, error = %e, "columnar rebuild failed");
+                            break;
+                        }
+                        mirrored_rows += 1;
+                    }
+                    wm = lsm.last_sequence();
+                }
+                Err(e) => {
+                    warn!(table = %schema.name, error = %e, "columnar snapshot corrupt; full rebuild");
+                    let (from, to) = row_range(schema.id);
+                    let Ok(entries) = lsm.scan(&from, &to) else {
+                        continue;
+                    };
+                    for (key, _seq, value) in entries {
+                        let Some(bytes) = value else { continue };
+                        let mut slice = bytes.as_slice();
+                        let Ok(mut row) = common::codec::decode_row(&mut slice) else {
+                            continue;
+                        };
+                        if row.len() < schema.columns.len() {
+                            row.resize(schema.columns.len(), ScalarValue::Null);
+                        } else if row.len() > schema.columns.len() {
+                            row.truncate(schema.columns.len());
+                        }
+                        if let Err(e) = columnar.upsert(&schema_arc, &key, row) {
+                            warn!(table = %schema.name, error = %e, "columnar rebuild failed");
+                            break;
+                        }
+                        mirrored_rows += 1;
+                    }
+                    wm = lsm.last_sequence();
+                }
+            }
+            // ② 重放快照水位之后的 LSM 变更(upsert / 删除)
             let (from, to) = row_range(schema.id);
             let Ok(entries) = lsm.scan(&from, &to) else {
                 continue;
             };
-            let schema_arc = Arc::new(schema.clone());
-            for (key, _seq, value) in entries {
-                let Some(bytes) = value else { continue };
-                let mut slice = bytes.as_slice();
-                let Ok(mut row) = common::codec::decode_row(&mut slice) else {
+            // 快照恢复的表:记录副本键集,重放后移除已不在 LSM 可见集的键
+            // (LSM 扫描会剔除墓碑键,删除必须经此补齐)
+            let snapshot_keys: Option<std::collections::HashSet<Vec<u8>>> = if snap_recovered_this {
+                Some(
+                    columnar
+                        .collect_table(schema.id)
+                        .map(|entries| entries.into_iter().map(|(k, _)| k).collect())
+                        .unwrap_or_default(),
+                )
+            } else {
+                None
+            };
+            let mut seen: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::with_capacity(entries.len());
+            for (key, seq, value) in entries {
+                seen.insert(key.clone());
+                if seq <= wm {
                     continue;
-                };
-                if row.len() < schema.columns.len() {
-                    row.resize(schema.columns.len(), ScalarValue::Null);
-                } else if row.len() > schema.columns.len() {
-                    row.truncate(schema.columns.len());
                 }
-                if let Err(e) = columnar.upsert(&schema_arc, &key, row) {
-                    warn!(table = %schema.name, error = %e, "columnar rebuild failed");
-                    break;
+                match value {
+                    Some(bytes) => {
+                        let mut slice = bytes.as_slice();
+                        let Ok(mut row) = common::codec::decode_row(&mut slice) else {
+                            continue;
+                        };
+                        if row.len() < schema.columns.len() {
+                            row.resize(schema.columns.len(), ScalarValue::Null);
+                        } else if row.len() > schema.columns.len() {
+                            row.truncate(schema.columns.len());
+                        }
+                        columnar.apply_mirror(schema.id, &key, Some(row));
+                    }
+                    None => columnar.apply_mirror(schema.id, &key, None),
                 }
-                mirrored_rows += 1;
+                wm = wm.max(seq);
+                replayed += 1;
             }
+            if let Some(keys) = snapshot_keys {
+                for k in keys {
+                    if !seen.contains(&k) {
+                        columnar.apply_mirror(schema.id, &k, None);
+                        replayed += 1;
+                    }
+                }
+            }
+            columnar_wm.lock().insert(schema.id, wm);
         }
-        if mirrored_rows > 0 {
-            info!(rows = mirrored_rows, "columnar replica rebuilt from lsm");
+        if snap_recovered > 0 || replayed > 0 {
+            info!(
+                snapshots = snap_recovered,
+                rebuilt_rows = mirrored_rows,
+                replayed = replayed,
+                "columnar replica restored"
+            );
         }
         Ok(Arc::new(Self {
             config,
@@ -481,6 +589,8 @@ impl Engine {
             lsm,
             columnar,
             stats,
+            columnar_wm,
+            columnar_dirty: std::sync::atomic::AtomicU64::new(0),
             active_snapshots: Mutex::new(BTreeSet::new()),
             commit_lock: Mutex::new(()),
             _restored_tables: AtomicU64::new(restored),
@@ -604,6 +714,52 @@ impl Engine {
     /// 表统计只读访问(测试/诊断用)。
     pub fn table_stats(&self, table_id: u64) -> Option<Arc<TableStats>> {
         self.stats.get(table_id)
+    }
+
+    /// 镜像后推进列存水位线(须在 commit_lock 内调用,与 LSM 写串行)。
+    fn bump_columnar_wm(&self, table_id: u64) {
+        let seq = self.lsm.last_sequence();
+        {
+            let mut wm = self.columnar_wm.lock();
+            let e = wm.entry(table_id).or_insert(0);
+            if seq > *e {
+                *e = seq;
+            }
+        }
+        // 超阈值自动持久化快照
+        if self
+            .columnar_dirty
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+            >= COLUMNAR_PERSIST_THRESHOLD
+        {
+            self.columnar_dirty
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = self.persist_columnar_snapshots() {
+                warn!(error = %e, "columnar snapshot persist failed");
+            }
+        }
+    }
+
+    /// 把全部已镜像表的列存快照写到磁盘(tmp + rename 原子替换)。
+    pub fn persist_columnar_snapshots(&self) -> Result<()> {
+        let dir = self.config.storage.data_dir.join("columnar");
+        std::fs::create_dir_all(&dir)?;
+        for schema in self.catalog.list_tables() {
+            let Some(entries) = self.columnar.collect_table(schema.id) else {
+                continue;
+            };
+            let wm = self
+                .columnar_wm
+                .lock()
+                .get(&schema.id)
+                .copied()
+                .unwrap_or(0);
+            let path = storage::columnar_file::snapshot_path(&dir, schema.id);
+            storage::columnar_file::write_snapshot(&path, schema.id, wm, &entries, &schema)?;
+            debug!(table = %schema.name, rows = entries.len(), "columnar snapshot written");
+        }
+        Ok(())
     }
 
     /// 存储概要(memtable 用量 / 各层文件数)。
@@ -777,11 +933,13 @@ impl Engine {
                     if key.len() != 16 {
                         continue; // 索引条目
                     }
+                    let mut mirror_ok = true;
                     match value {
                         Some(bytes) => {
                             let mut slice = bytes.as_slice();
                             let row = common::codec::decode_row(&mut slice)?;
                             if let Err(e) = self.columnar.upsert(&table_arc, key, row) {
+                                mirror_ok = false;
                                 warn!(
                                     table = %table_arc.name,
                                     error = %e,
@@ -793,6 +951,7 @@ impl Engine {
                             if let Err(e) =
                                 self.columnar.delete(common::ids::TableId(table.id), key)
                             {
+                                mirror_ok = false;
                                 warn!(
                                     table = %table_arc.name,
                                     error = %e,
@@ -800,6 +959,9 @@ impl Engine {
                                 );
                             }
                         }
+                    }
+                    if mirror_ok {
+                        self.bump_columnar_wm(table.id);
                     }
                 }
             }
@@ -1225,7 +1387,12 @@ impl Engine {
             .iter()
             .map(|(k, v)| (k.clone(), Some(v.clone())))
             .collect();
-        self.lsm.write_batch(&batch_refs)?;
+        {
+            // 行重写 + 列存镜像在同一把提交锁下,水位线才有一致的快照语义
+            let _guard = self.commit_lock.lock();
+            self.lsm.write_batch(&batch_refs)?;
+            self.bump_columnar_wm(current.id);
+        }
 
         // 2. catalog 版本递增
         self.catalog.update_table(next.clone())?;
@@ -1268,9 +1435,25 @@ impl Engine {
             .collect();
         batch.push((catalog_key(name), None));
         batch.push((storage::table::stats_key(name), None));
-        self.lsm.write_batch(&batch)?;
+        {
+            let _guard = self.commit_lock.lock();
+            self.lsm.write_batch(&batch)?;
+            self.columnar_wm.lock().remove(&dropped.id);
+            self.columnar_dirty
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         self.stats.remove(dropped.id);
         self.columnar.drop_table(common::ids::TableId(dropped.id))?;
+        // 删除列存快照文件(缺失忽略)
+        let snap = storage::columnar_file::snapshot_path(
+            &self.config.storage.data_dir.join("columnar"),
+            dropped.id,
+        );
+        match std::fs::remove_file(&snap) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(table = name, error = %e, "columnar snapshot remove failed"),
+        }
         info!(table = name, "table dropped");
         Ok(Outcome::Tag {
             prefix: "DROP TABLE".into(),
@@ -1344,19 +1527,25 @@ impl Engine {
             if key.len() != 16 {
                 continue; // 索引条目不镜像列存
             }
+            let mut mirror_ok = true;
             match value {
                 Some(encoded) => {
                     let mut slice = encoded.as_slice();
                     let row = common::codec::decode_row(&mut slice)?;
                     if let Err(e) = self.columnar.upsert(&table, &key, row) {
+                        mirror_ok = false;
                         warn!(table = %table.name, error = %e, "columnar replica apply failed");
                     }
                 }
                 None => {
                     if let Err(e) = self.columnar.delete(common::ids::TableId(table.id), &key) {
+                        mirror_ok = false;
                         warn!(table = %table.name, error = %e, "columnar replica delete failed");
                     }
                 }
+            }
+            if mirror_ok {
+                self.bump_columnar_wm(table.id);
             }
         }
         Ok(())

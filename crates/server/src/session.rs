@@ -41,6 +41,7 @@ impl Session {
         match trimmed.to_ascii_uppercase().as_str() {
             "FLUSH TABLES" | "FLUSH" => {
                 let flushed = self.engine.flush()?;
+                self.engine.persist_columnar_snapshots()?;
                 return Ok(vec![Outcome::Tag {
                     prefix: if flushed {
                         "FLUSH".into()
