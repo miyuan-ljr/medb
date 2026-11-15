@@ -129,6 +129,7 @@ impl Session {
                     batch_size: self.engine.config().engine.batch_size,
                     catalog: &*catalog,
                     data,
+                    ctes: &[],
                 };
                 let plan = plan_statement(stmt, &ctx)?;
                 self.engine.execute_plan(&mut sctx, plan)
@@ -142,6 +143,7 @@ impl Session {
                     batch_size: self.engine.config().engine.batch_size,
                     catalog: &*catalog,
                     data,
+                    ctes: &[],
                 };
                 let plan = plan_statement(stmt, &ctx)?;
                 self.engine.execute_plan(&mut sctx, plan)

@@ -1167,6 +1167,7 @@ impl Engine {
             batch_size: self.config.engine.batch_size,
             catalog: &*self.catalog,
             data: self.data_source_for(self.lsm.last_sequence(), overlay, true),
+            ctes: &[],
         };
         plan_statement(stmt, &ctx)
     }

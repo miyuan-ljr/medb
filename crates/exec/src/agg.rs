@@ -51,6 +51,8 @@ pub struct AggDesc {
     pub func: AggFunc,
     pub arg: Option<Expr>,
     pub out_type: DataType,
+    /// COUNT(DISTINCT x) 形态(仅 Count 有意义)
+    pub distinct: bool,
 }
 
 impl AggDesc {
@@ -60,6 +62,16 @@ impl AggDesc {
         arg: Option<Expr>,
         input: &[common::schema::ColumnDesc],
     ) -> Result<Self> {
+        Self::with_distinct(func, arg, input, false)
+    }
+
+    /// distinct = COUNT(DISTINCT x) 形态。
+    pub fn with_distinct(
+        func: AggFunc,
+        arg: Option<Expr>,
+        input: &[common::schema::ColumnDesc],
+        distinct: bool,
+    ) -> Result<Self> {
         let arg_type = match &arg {
             Some(e) => e.return_type(input)?,
             None => None,
@@ -68,6 +80,7 @@ impl AggDesc {
             func,
             arg,
             out_type: func.return_type(arg_type)?,
+            distinct,
         })
     }
 }

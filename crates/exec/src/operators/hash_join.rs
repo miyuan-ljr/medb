@@ -35,7 +35,6 @@ pub struct HashJoinExec {
     residual: Option<Expr>,
     join_type: JoinType,
     schema: Vec<ColumnDesc>,
-    combined_dtypes: Vec<DataType>,
     build_dtypes: Vec<DataType>,
     /// 构建侧哈希表:键 → 构建行**引用** (批号, 行号) —— 行数据零拷贝,
     /// 构建批以 DataChunk 原样保留(记账随 chunk 自带 Reservation 存续)
@@ -55,7 +54,6 @@ pub struct HashJoinExec {
     /// 用 HashMap<i64/Vec<i64>> 直取类型化数组,免去 Vec<ScalarValue> 装箱
     int_probe_cols: Vec<usize>,
     int_build_cols: Vec<usize>,
-    next: usize,
 }
 
 impl HashJoinExec {
@@ -76,7 +74,7 @@ impl HashJoinExec {
         let build_schema_ref = build_schema.clone();
         let mut schema = probe_schema;
         schema.extend(build_schema);
-        let combined_dtypes = schema.iter().map(|c| c.ty.clone()).collect();
+
         // 类型化键探测:键必须都是单列引用且两侧类型均为 Int64(列下标与
         // schema 对齐);否则走通用 Vec<ScalarValue> 路径
         let key_cols = |keys: &[Expr], sc: &[ColumnDesc]| -> Option<Vec<usize>> {
@@ -108,7 +106,6 @@ impl HashJoinExec {
             residual,
             join_type,
             schema,
-            combined_dtypes,
             build_dtypes,
             table: None,
             int_table: None,
@@ -121,7 +118,6 @@ impl HashJoinExec {
             mem_bytes: 0,
             int_probe_cols,
             int_build_cols,
-            next: 0,
         }
     }
 

@@ -24,6 +24,8 @@ type GroupKey = Vec<ScalarValue>;
 #[derive(Debug, Clone)]
 enum AggState {
     Count(u64),
+    /// COUNT(DISTINCT x):去重值集合(输出集合大小)
+    CountDistinct(std::collections::HashSet<ScalarValue>),
     /// SUM:按输出类型分别累计
     SumI64(Option<i64>),
     SumF64(Option<f64>),
@@ -39,7 +41,13 @@ enum AggState {
 impl AggState {
     fn new(desc: &AggDesc) -> Self {
         match desc.func {
-            AggFunc::CountStar | AggFunc::Count => AggState::Count(0),
+            AggFunc::CountStar | AggFunc::Count => {
+                if desc.distinct {
+                    AggState::CountDistinct(Default::default())
+                } else {
+                    AggState::Count(0)
+                }
+            }
             AggFunc::Sum => match desc.out_type {
                 DataType::Float64 => AggState::SumF64(None),
                 _ => AggState::SumI64(None),
@@ -57,6 +65,9 @@ impl AggState {
         }
         match self {
             AggState::Count(n) => *n += 1,
+            AggState::CountDistinct(set) => {
+                set.insert(value);
+            }
             AggState::SumI64(acc) => match value {
                 ScalarValue::Int64(v) => {
                     *acc = Some(
@@ -106,6 +117,7 @@ impl AggState {
     fn finish(&self) -> ScalarValue {
         match self {
             AggState::Count(n) => ScalarValue::Int64(*n as i64),
+            AggState::CountDistinct(set) => ScalarValue::Int64(set.len() as i64),
             AggState::SumI64(acc) => acc.map(ScalarValue::Int64).unwrap_or(ScalarValue::Null),
             AggState::SumF64(acc) => acc.map(ScalarValue::Float64).unwrap_or(ScalarValue::Null),
             AggState::Avg { sum, n } => {

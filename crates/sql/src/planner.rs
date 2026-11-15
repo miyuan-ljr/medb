@@ -25,6 +25,7 @@ use exec::operators::sort::{SortExec, SortKey};
 use exec::operators::values::ValuesExec;
 use exec::operators::{filter::FilterExec, limit::LimitExec, project::ProjectExec};
 use exec::vector::Vector;
+use std::collections::HashMap;
 use sqlparser::ast::{
     BinaryOperator, DataType as SqlType, Expr as SE, FromTable, JoinConstraint, JoinOperator,
     LimitClause, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
@@ -38,6 +39,9 @@ pub struct PlanContext<'a> {
     pub batch_size: usize,
     pub catalog: &'a dyn CatalogStore,
     pub data: Arc<dyn QueryDataSource>,
+    /// 可见的 WITH CTE(名 → 体)。对子查询/派生表同样可见(Q15 形状);
+    /// 非递归:CTE 体计划时只看到它之前的 CTE。
+    pub ctes: &'a [(String, Query)],
 }
 
 /// FROM 作用域:多表(别名, schema)的有序集合,列解析返回扁平下标。
@@ -322,9 +326,6 @@ pub fn plan_statement(stmt: &Statement, ctx: &PlanContext<'_>) -> Result<Stateme
 // ---------- 查询 ----------
 
 pub fn plan_query(q: &Query, ctx: &PlanContext<'_>) -> Result<PlannedQuery> {
-    if q.with.is_some() {
-        return Err(Error::not_supported("WITH clause"));
-    }
     if q.fetch.is_some() {
         return Err(Error::not_supported("FETCH clause"));
     }
@@ -362,11 +363,25 @@ pub fn plan_query(q: &Query, ctx: &PlanContext<'_>) -> Result<PlannedQuery> {
             limit_value = Some(literal_u64(limit, "LIMIT")?);
         }
     }
+    // WITH:自身 CTE + 外层可见 CTE 合并(同名遮蔽:自身优先)
+    let mut merged_ctes: Vec<(String, Query)> = ctx.ctes.to_vec();
+    if let Some(with) = &q.with {
+        if with.recursive {
+            return Err(Error::not_supported("WITH RECURSIVE"));
+        }
+        for cte in &with.cte_tables {
+            if !cte.alias.columns.is_empty() {
+                return Err(Error::not_supported("WITH cte (col) AS ... (column list)"));
+            }
+            merged_ctes.insert(0, (cte.alias.name.value.clone(), *cte.query.clone()));
+        }
+    }
     let planned = plan_select(
         select,
         order_by,
         limit_value.map(|k| (k, offset_value != 0)),
         ctx,
+        &merged_ctes,
     )?;
     finish_with_limit(planned, offset_value, limit_value)
 }
@@ -496,6 +511,7 @@ fn plan_select(
     order_by: &[sqlparser::ast::OrderByExpr],
     limit_hint: Option<(u64, bool)>, // (LIMIT k, 是否有 OFFSET)
     ctx: &PlanContext<'_>,
+    ctes: &[(String, Query)],
 ) -> Result<PlannedQuery> {
     if select.distinct.is_some() {
         return Err(Error::not_supported("SELECT DISTINCT"));
@@ -504,10 +520,12 @@ fn plan_select(
         return Err(Error::not_supported("unsupported select clause"));
     }
 
-    // FROM:多表 + JOIN 步骤(逗号连接视为 CROSS JOIN)→ 有序关系步骤
+    // FROM:多表 + JOIN 步骤(逗号连接视为 CROSS JOIN)→ 有序关系步骤;
+    // 派生表/CTE 的流水线按别名挂在 pipelines,扫描时接管
+    let pipelines = std::cell::RefCell::new(HashMap::new());
     let steps = match select.from.as_slice() {
         [] => Vec::new(),
-        from => plan_from(from, ctx)?,
+        from => plan_from(from, ctx, ctes, &pipelines)?,
     };
     let mut scope = Scope::empty();
     for s in &steps {
@@ -521,9 +539,57 @@ fn plan_select(
         scope.flat_schema()
     };
 
-    // GROUP BY 项(仅形状检查;聚合路径才解析)
-    let group_items: &Vec<SE> = match &select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs,
+    // GROUP BY 项(仅形状检查;聚合路径才解析)。
+    // 标准便利语义(PG 同):条目为非限定标识符且**不是列**时,
+    // 依次尝试 SELECT 别名 → 输出序号(1 起)。
+    let select_aliases: Vec<(String, &SE)> = select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::ExprWithAlias { expr, alias } => Some((alias.value.clone(), expr)),
+            _ => None,
+        })
+        .collect();
+    let select_exprs: Vec<&SE> = select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::UnnamedExpr(e) => Some(e),
+            SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .collect();
+    let group_items: Vec<SE> = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs
+            .iter()
+            .map(|g| {
+                let SE::Identifier(id) = g else {
+                    return g.clone();
+                };
+                // 先试列解析(真实列名优先)
+                if scope_ref
+                    .and_then(|s| s.resolve(None, &id.value).ok())
+                    .is_some()
+                {
+                    return g.clone();
+                }
+                if let Ok(n) = id.value.parse::<usize>() {
+                    // 序号:GROUP BY 2 → 第 2 个输出列表达式
+                    if (1..=select_exprs.len()).contains(&n) {
+                        return select_exprs[n - 1].clone();
+                    }
+                    return g.clone();
+                }
+                // 别名(大小写不敏感)
+                if let Some((_, expr)) = select_aliases
+                    .iter()
+                    .find(|(a, _)| a.eq_ignore_ascii_case(&id.value))
+                {
+                    return (*expr).clone();
+                }
+                g.clone()
+            })
+            .collect(),
         _ => return Err(Error::not_supported("GROUP BY clause")),
     };
     let aggregate = !group_items.is_empty() || select_is_aggregate(select, order_by);
@@ -540,7 +606,7 @@ fn plan_select(
     // 聚合改写器(仅聚合路径使用);GROUP BY 项必须先于任何改写注册
     let mut rewriter = AggRewriter::new(scope_ref, &input_schema, ctx);
     if aggregate {
-        for item in group_items {
+        for item in &group_items {
             rewriter.add_group(item)?;
         }
     }
@@ -921,6 +987,7 @@ fn plan_select(
             est: &est,
             scope_ref,
             plan_ctx: ctx,
+            pipelines: &pipelines,
         };
         let mut st = PipelineState::default();
         let mut applied: std::collections::HashSet<usize> = Default::default();
@@ -1122,6 +1189,8 @@ struct EmitCtx<'a> {
     est: &'a Estimator<'a>,
     scope_ref: Option<&'a Scope>,
     plan_ctx: &'a PlanContext<'a>,
+    /// 派生表/CTE 的流水线(别名 → 执行器);扫描该表时 take 接管
+    pipelines: &'a std::cell::RefCell<HashMap<String, BoxedExecutor>>,
 }
 
 /// 流水线发射状态。
@@ -1226,6 +1295,7 @@ fn flush_group(
                 em.offsets[node],
                 &em.needed[node],
                 em.plan_ctx,
+                em.pipelines,
             )?;
             st.exec = Some(exec);
             st.cur_order = vec![node];
@@ -1409,6 +1479,7 @@ fn emit_inner_join(
             t_offset,
             &em.needed[t],
             em.plan_ctx,
+            em.pipelines,
         )?;
         let build = st.exec.take().expect("accumulated pipeline");
         let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
@@ -1428,6 +1499,7 @@ fn emit_inner_join(
             t_offset,
             &em.needed[t],
             em.plan_ctx,
+            em.pipelines,
         )?;
         let probe = st.exec.take().expect("accumulated pipeline");
         let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
@@ -1516,7 +1588,7 @@ fn emit_left_join(
         .map(|&f| em.input_schema[f].clone())
         .collect();
     let (build, _build_label) =
-        table_scan(&em.steps[k], &[], em.offsets[k], &em.needed[k], em.plan_ctx)?;
+        table_scan(&em.steps[k], &[], em.offsets[k], &em.needed[k], em.plan_ctx, em.pipelines)?;
 
     let mut residual: Vec<Expr> = Vec::new();
     let mut residual_sql: Vec<String> = Vec::new();
@@ -1666,25 +1738,88 @@ struct RelationStep {
 }
 
 /// FROM 子句解析:TableWithJoins 列表展开为有序步骤;逗号连接 = 无 ON 的内连接。
-fn plan_from(from: &[TableWithJoins], ctx: &PlanContext<'_>) -> Result<Vec<RelationStep>> {
+/// 返回 (步骤, 派生表/CTE 流水线表)。派生表与 CTE 在计划期就地规划,
+/// 流水线即数据源(别名 → 执行器);物理表走 catalog。
+fn plan_from(
+    from: &[TableWithJoins],
+    ctx: &PlanContext<'_>,
+    ctes: &[(String, Query)],
+    pipelines: &std::cell::RefCell<HashMap<String, BoxedExecutor>>,
+) -> Result<Vec<RelationStep>> {
     fn push_relation(
         relation: &TableFactor,
         ctx: &PlanContext<'_>,
+        ctes: &[(String, Query)],
+        pipelines: &std::cell::RefCell<HashMap<String, BoxedExecutor>>,
         steps: &mut Vec<RelationStep>,
     ) -> Result<()> {
-        let TableFactor::Table { name, alias, .. } = relation else {
-            return Err(Error::not_supported("FROM clause (subquery / function)"));
+        let (name, alias_opt, subquery) = match relation {
+            TableFactor::Table { name, alias, .. } => {
+                (Some(name), alias.as_ref().map(|a| a.name.value.clone()), None)
+            }
+            TableFactor::Derived { subquery, alias, .. } => {
+                (None, alias.as_ref().map(|a| a.name.value.clone()), Some(subquery))
+            }
+            other => {
+                return Err(Error::not_supported(format!("FROM clause: {other}")));
+            }
         };
-        let tname = object_name_to_string(name)?;
-        let schema = resolve_table(ctx.catalog, &tname)?;
-        let alias = alias
-            .as_ref()
-            .map(|a| a.name.value.clone())
-            .unwrap_or_else(|| tname.clone());
+        let (schema, alias, pipeline) = match subquery {
+            Some(q) => {
+                let pq = plan_query(q, ctx)?;
+                let alias =
+                    alias_opt.unwrap_or_else(|| "subquery".to_string());
+                let schema = TableSchema {
+                    id: 0, // 无存储:扫描由流水线接管
+                    name: alias.clone(),
+                    columns: pq.schema.clone(),
+                    primary_key: vec![],
+                    version: 1,
+                    indexes: vec![],
+                };
+                (schema, alias, Some(pq.executor))
+            }
+            None => {
+                let tname = object_name_to_string(name.as_ref().expect("table name"))?;
+                // CTE 优先于物理表;体计划只见它之前的 CTE(非递归)
+                let cte_pos = ctes
+                    .iter()
+                    .position(|(n, _)| n.eq_ignore_ascii_case(&tname));
+                if let Some(pos) = cte_pos {
+                    let (cname, cte_q) = &ctes[pos];
+                    let _ = cname;
+                    let sub_ctx = PlanContext {
+                        batch_size: ctx.batch_size,
+                        catalog: ctx.catalog,
+                        data: ctx.data.clone(),
+                        ctes: &ctes[..pos],
+                    };
+                    let pq = plan_query(cte_q, &sub_ctx)?;
+                    let alias = alias_opt.unwrap_or_else(|| tname.clone());
+                    let schema = TableSchema {
+                        id: 0,
+                        name: alias.clone(),
+                        columns: pq.schema.clone(),
+                        primary_key: vec![],
+                        version: 1,
+                        indexes: vec![],
+                    };
+                    (schema, alias, Some(pq.executor))
+                } else {
+                    let schema = resolve_table(ctx.catalog, &tname)?;
+                    let alias =
+                        alias_opt.unwrap_or_else(|| tname.clone());
+                    (schema, alias, None)
+                }
+            }
+        };
         if steps.iter().any(|s| s.alias.eq_ignore_ascii_case(&alias)) {
             return Err(Error::sql(format!(
                 "duplicate table alias '{alias}' in FROM clause"
             )));
+        }
+        if let Some(p) = pipeline {
+            pipelines.borrow_mut().insert(alias.clone(), p);
         }
         steps.push(RelationStep {
             alias,
@@ -1698,7 +1833,7 @@ fn plan_from(from: &[TableWithJoins], ctx: &PlanContext<'_>) -> Result<Vec<Relat
     let mut steps: Vec<RelationStep> = Vec::new();
     for twj in from {
         // 第一个 TableWithJoins 的主关系是驱动表;后续的是逗号连接(CROSS JOIN)
-        push_relation(&twj.relation, ctx, &mut steps)?;
+        push_relation(&twj.relation, ctx, ctes, pipelines, &mut steps)?;
         for join in &twj.joins {
             let (jt, on) = match &join.join_operator {
                 // `JOIN` 与 `INNER JOIN` 同义(sqlparser 分列两个变体)
@@ -1719,7 +1854,7 @@ fn plan_from(from: &[TableWithJoins], ctx: &PlanContext<'_>) -> Result<Vec<Relat
                     return Err(Error::not_supported(format!("join type {other:?}")));
                 }
             };
-            push_relation(&join.relation, ctx, &mut steps)?;
+            push_relation(&join.relation, ctx, ctes, pipelines, &mut steps)?;
             let j = steps.len() - 1;
             steps[j].join_type = jt;
             steps[j].on = on;
@@ -1736,12 +1871,21 @@ fn table_scan(
     offset: usize,
     needed: &[bool],
     ctx: &PlanContext<'_>,
+    pipelines: &std::cell::RefCell<HashMap<String, BoxedExecutor>>,
 ) -> Result<(BoxedExecutor, Option<String>)> {
     // 谓词下推:随解码过滤(列存路径则在列块上求值),不再叠加 FilterExec
     let rebased: Vec<Expr> = preds
         .iter()
         .map(|p| rebase_columns(p.clone(), offset))
         .collect::<Result<Vec<_>>>()?;
+    // 派生表/CTE:流水线即数据源(其内已含全部算子);谓词不可下推 → Filter
+    if let Some(pipeline) = pipelines.borrow_mut().remove(&step.alias) {
+        let exec: BoxedExecutor = match combine_and(rebased) {
+            Some(pred) => Box::new(FilterExec::new(pipeline, pred)),
+            None => pipeline,
+        };
+        return Ok((exec, None));
+    }
     // 投影剪枝:needed 全 true 时不启用(decode 路径等价)
     let all_true = needed.iter().all(|b| *b);
     let needed_opt = if all_true { None } else { Some(needed.to_vec()) };
@@ -2019,7 +2163,7 @@ impl<'a> AggRewriter<'a> {
     /// 聚合函数调用 → AggDesc(去重);返回其在聚合输出中的下标(group_n + idx)。
     fn add_agg(&mut self, f: &sqlparser::ast::Function) -> Result<usize> {
         let name = object_name_to_string(&f.name)?.to_ascii_lowercase();
-        let arg_expr = self.function_single_arg(f)?;
+        let (arg_expr, distinct) = self.function_single_arg(f)?;
         let func = match (name.as_str(), &arg_expr) {
             ("count", None) => AggFunc::CountStar,
             ("count", Some(_)) => AggFunc::Count,
@@ -2042,13 +2186,16 @@ impl<'a> AggRewriter<'a> {
         if let Some(idx) = self.aggs.iter().position(|(_, d)| *d == display) {
             return Ok(self.groups.len() + idx);
         }
-        let desc = AggDesc::new(func, arg_expr, self.input_schema)?;
+        let desc = AggDesc::with_distinct(func, arg_expr, self.input_schema, distinct)?;
         self.aggs.push((desc, display));
         Ok(self.groups.len() + self.aggs.len() - 1)
     }
 
-    /// 单参函数的参数;COUNT(*) → None。
-    fn function_single_arg(&mut self, f: &sqlparser::ast::Function) -> Result<Option<Expr>> {
+    /// 单参函数的参数;COUNT(*) → None。distinct = COUNT(DISTINCT x)。
+    fn function_single_arg(
+        &mut self,
+        f: &sqlparser::ast::Function,
+    ) -> Result<(Option<Expr>, bool)> {
         if f.filter.is_some() || f.over.is_some() || !f.within_group.is_empty() {
             return Err(Error::not_supported(
                 "FILTER/OVER/WITHIN GROUP on aggregate functions",
@@ -2057,11 +2204,10 @@ impl<'a> AggRewriter<'a> {
         let sqlparser::ast::FunctionArguments::List(list) = &f.args else {
             return Err(Error::not_supported("aggregate function argument form"));
         };
-        if let Some(dup) = &list.duplicate_treatment {
-            if matches!(dup, sqlparser::ast::DuplicateTreatment::Distinct) {
-                return Err(Error::not_supported("DISTINCT aggregates"));
-            }
-        }
+        let distinct = list
+            .duplicate_treatment
+            .as_ref()
+            .is_some_and(|d| matches!(d, sqlparser::ast::DuplicateTreatment::Distinct));
         let mut arg: Option<Expr> = None;
         let mut n = 0usize;
         for fa in &list.args {
@@ -2095,7 +2241,7 @@ impl<'a> AggRewriter<'a> {
             }
             arg = None;
         }
-        Ok(arg)
+        Ok((arg, distinct))
     }
 
     /// 表达式改写主入口:
@@ -2346,7 +2492,7 @@ fn plan_insert(insert: &sqlparser::ast::Insert, ctx: &PlanContext<'_>) -> Result
             Ok(StatementPlan::Insert { table, rows })
         }
         SetExpr::Select(select) => {
-            let query = plan_select(select, &[], None, ctx)?;
+            let query = plan_select(select, &[], None, ctx, ctx.ctes)?;
             check_insert_select_arity(&table, &targets, &query)?;
             Ok(StatementPlan::InsertSelect {
                 table,
@@ -3241,6 +3387,7 @@ mod tests {
             batch_size: 1024,
             catalog,
             data,
+            ctes: &[],
         }
     }
 
@@ -3525,11 +3672,9 @@ mod tests {
         catalog.create_table(table_t()).unwrap();
         for sql in [
             "SELECT 1 UNION SELECT 2",
-            "WITH x AS (SELECT 1) SELECT 1",
             "SELECT 1 LIMIT 'x'",
             "SELECT func(1)",
             "SELECT * FROM a JOIN b ON 1 = 1",
-            "SELECT COUNT(DISTINCT id) FROM t",
             "SELECT name FROM t GROUP BY name HAVING score > 1", // score 未分组
         ] {
             let stmt = parse_single(sql).unwrap();
