@@ -13,6 +13,7 @@ use common::types::{DataType, ScalarValue};
 use std::collections::HashMap;
 
 use crate::chunk::DataChunk;
+use crate::vector::Vector;
 use crate::executor::{BoxedExecutor, ExecuteContext, Executor};
 use crate::expr::Expr;
 use memory::Reservation;
@@ -36,13 +37,17 @@ pub struct HashJoinExec {
     schema: Vec<ColumnDesc>,
     combined_dtypes: Vec<DataType>,
     build_dtypes: Vec<DataType>,
-    /// 构建侧哈希表:键 → 匹配的构建行
-    table: Option<HashMap<Vec<ScalarValue>, Vec<Row>>>,
+    /// 构建侧哈希表:键 → 构建行**引用** (批号, 行号) —— 行数据零拷贝,
+    /// 构建批以 DataChunk 原样保留(记账随 chunk 自带 Reservation 存续)
+    table: Option<HashMap<Vec<ScalarValue>, Vec<(u32, u32)>>>,
     /// 类型化哈希表(Int64 键快速通道)
-    int_table: Option<HashMap<Vec<i64>, Vec<Row>>>,
+    int_table: Option<HashMap<Vec<i64>, Vec<(u32, u32)>>>,
+    /// 保留的构建批(引用指向这里;列式原样,不物化行)
+    build_data: Vec<DataChunk>,
     build_null_row: Row,
     probe_done: bool,
-    out: Vec<Row>,
+    out_chunks: std::collections::VecDeque<DataChunk>,
+    serve_off: usize,
     /// 物化内存记账(build 哈希表 + 输出缓冲),超限 → MemoryLimitExceeded
     mem: Option<Reservation>,
     mem_bytes: usize,
@@ -107,9 +112,11 @@ impl HashJoinExec {
             build_dtypes,
             table: None,
             int_table: None,
+            build_data: Vec::new(),
             build_null_row: Vec::new(),
             probe_done: false,
-            out: Vec::new(),
+            out_chunks: Default::default(),
+            serve_off: 0,
             mem: None,
             mem_bytes: 0,
             int_probe_cols,
@@ -129,42 +136,43 @@ impl HashJoinExec {
         Ok(())
     }
 
-    /// 构建侧整批物化为哈希表;NULL 键不入表(不与任何行连接)。
+    /// 构建侧入哈希表:**行数据零拷贝** —— 批以 DataChunk 原样保留,
+    /// 表里只存 (批号, 行号) 引用;每批记一次哈希结构开销(引用 + 键)。
+    /// NULL 键不入表(不与任何行连接)。
     /// Int64 单列键 → 类型化快速通道(直取列数组,免标量装箱)。
     fn build_table(&mut self, ctx: &mut ExecuteContext) -> Result<()> {
-        let mut table: HashMap<Vec<ScalarValue>, Vec<Row>> = HashMap::new();
-        let mut int_table: HashMap<Vec<i64>, Vec<Row>> = HashMap::new();
+        let mut table: HashMap<Vec<ScalarValue>, Vec<(u32, u32)>> = HashMap::new();
+        let mut int_table: HashMap<Vec<i64>, Vec<(u32, u32)>> = HashMap::new();
         let bcols = self.int_build_cols.clone();
+        self.build_data.clear();
         loop {
             let Some(batch) = self.build.next_batch(ctx)? else {
                 break;
             };
+            let n = batch.num_rows();
+            let ci = self.build_data.len() as u32;
+            // 哈希结构开销批级记账;批数据本身随 chunk 保留自带记账
+            let key_bytes = if bcols.is_empty() { 16 * self.build_keys.len() } else { 8 * bcols.len() };
+            self.track_mem(ctx, n * (16 + key_bytes))?;
+            self.build_data.push(batch);
+            let batch = self.build_data.last().expect("just pushed");
             if bcols.is_empty() {
                 // 通用路径
                 let key_cols = self
                     .build_keys
                     .iter()
-                    .map(|e| e.eval(&batch))
+                    .map(|e| e.eval(batch))
                     .collect::<Result<Vec<_>>>()?;
-                for i in 0..batch.num_rows() {
+                for i in 0..n {
                     let key: Vec<ScalarValue> = key_cols.iter().map(|c| c.scalar_at(i)).collect();
                     if key.iter().any(|v| v.is_null()) {
                         continue;
                     }
-                    let row = batch.row(i);
-                    self.track_mem(
-                        ctx,
-                        crate::chunk::row_approx_bytes(&self.build_dtypes, &row) + key.len() * 16,
-                    )?;
-                    table.entry(key).or_default().push(row);
+                    table.entry(key).or_default().push((ci, i as u32));
                 }
                 continue;
             };
             // 类型化路径
-            let _key_cols: Vec<&[i64]> = bcols
-                .iter()
-                .map(|c| batch.column(*c).int64_values())
-                .collect::<Vec<_>>();
             let n = batch.num_rows();
             let null_bits: Vec<Vec<bool>> = bcols
                 .iter()
@@ -186,12 +194,7 @@ impl HashJoinExec {
                 if has_null {
                     continue;
                 }
-                let row = batch.row(i);
-                self.track_mem(
-                    ctx,
-                    crate::chunk::row_approx_bytes(&self.build_dtypes, &row) + key.len() * 8,
-                )?;
-                int_table.entry(key).or_default().push(row);
+                int_table.entry(key).or_default().push((ci, i as u32));
             }
         }
         // 左外连接的 NULL 填充行模板
@@ -201,14 +204,16 @@ impl HashJoinExec {
         Ok(())
     }
 
-    /// 拉取并消化探测侧,产出全部输出行。
-    /// match_cond 在匹配期按对判定(LEFT JOIN 下未过条件的探测行仍 NULL 补齐);
-    /// residual 在输出前整批过滤(作用于含 NULL 补齐行的完整连接结果)。
+    /// 拉取并消化探测侧,**列式产出**:探测批逐行查表得 (批号, 行号) 引用,
+    /// 按列 gather 组装输出块(探测列直采;构建列按连续同批引用分段 gather
+    /// 后 concat)—— 全程不物化 Row。match_cond / residual 在列块上向量化
+    /// 求值;LEFT 未匹配(候选为 0 或全被 match_cond 过滤)探测行以 NULL 段
+    /// 追加(段内探测行序保持;跨段序 = 匹配行在前,SQL 语义无序保证)。
     fn materialize(&mut self, ctx: &mut ExecuteContext) -> Result<()> {
         self.build_table(ctx)?;
         // take 出来:后面 track_mem 需要 &mut self;materialize 后哈希表不再需要
         let int_fast = !self.int_probe_cols.is_empty();
-        let probe_cols = self.int_probe_cols.clone();
+        let probe_cols_idx = self.int_probe_cols.clone();
         let int_table = if int_fast {
             std::mem::take(&mut self.int_table).expect("int build_table called first")
         } else {
@@ -219,26 +224,23 @@ impl HashJoinExec {
         } else {
             std::mem::take(&mut self.table).expect("build_table called first")
         };
-        let mut out: Vec<Row> = Vec::new();
+        let build_data = std::mem::take(&mut self.build_data);
+        let probe_width = self.schema.len() - self.build_dtypes.len();
         let left = self.join_type == JoinType::LeftOuter;
 
         loop {
             let Some(batch) = self.probe.next_batch(ctx)? else {
                 break;
             };
+            let n_rows = batch.num_rows();
             let key_cols = self
                 .probe_keys
                 .iter()
                 .map(|e| e.eval(&batch))
                 .collect::<Result<Vec<_>>>()?;
-            // 按探测行分组收集候选组合行;null_ext 记录直接 NULL 补齐的探测行
-            // (行组装并行化:分片各自构建,按片序拼接保序)
-            let n_rows = batch.num_rows();
-            let mut cand: Vec<Vec<Row>> = vec![Vec::new(); n_rows];
-            let mut null_ext: Vec<bool> = vec![false; n_rows];
             let int_lookup = |i: usize| -> Option<Vec<i64>> {
-                let mut key = Vec::with_capacity(probe_cols.len());
-                for c in &probe_cols {
+                let mut key = Vec::with_capacity(probe_cols_idx.len());
+                for c in &probe_cols_idx {
                     let col = batch.column(*c);
                     if col.null_at(i) {
                         return None;
@@ -254,131 +256,150 @@ impl HashJoinExec {
                 }
                 Some(key)
             };
-            if ctx.threads > 1 && n_rows >= 256 {
-                // 并行:行下标分片,各片独立查表组装
-                let idx: Vec<usize> = (0..n_rows).collect();
-                let parts = crate::parallel::scope_map_try(&idx, ctx.threads, |sl| {
-                    let mut rows: Vec<(usize, Vec<Row>, bool)> = Vec::with_capacity(sl.len());
-                    for &i in sl {
-                        let matches = if int_fast {
-                            int_lookup(i).and_then(|k| int_table.get(&k).cloned())
-                        } else {
-                            generic_lookup(i).and_then(|k| table.get(&k).cloned())
-                        };
-                        match matches {
-                            Some(m) if !m.is_empty() => {
-                                let probe_row = batch.row(i);
-                                let mut combos = Vec::with_capacity(m.len());
-                                for build_row in m {
-                                    let mut row = probe_row.clone();
-                                    row.extend(build_row.iter().cloned());
-                                    combos.push(row);
-                                }
-                                rows.push((i, combos, false));
-                            }
-                            _ => rows.push((i, Vec::new(), left)),
-                        }
-                    }
-                    Ok(rows)
-                })?;
-                for (i, rows, null_flag) in parts.into_iter().flatten() {
-                    cand[i] = rows;
-                    null_ext[i] = null_flag;
-                }
-            } else {
-                for i in 0..n_rows {
-                    let matches = if int_fast {
-                        int_lookup(i).and_then(|k| int_table.get(&k).cloned())
-                    } else {
-                        generic_lookup(i).and_then(|k| table.get(&k).cloned())
-                    };
-                    match matches {
-                        Some(m) if !m.is_empty() => {
-                            let probe_row = batch.row(i);
-                            for build_row in m {
-                                let mut row = probe_row.clone();
-                                row.extend(build_row.iter().cloned());
-                                cand[i].push(row);
-                            }
-                        }
-                        _ => null_ext[i] = left,
-                    }
-                }
-            }
-            // match_cond:候选整批求值,按探测行保留通过者
-            if let Some(cond) = &self.match_cond {
-                let mut flat: Vec<Row> = Vec::new();
-                let mut owner: Vec<usize> = Vec::new();
-                for (i, rows) in cand.iter().enumerate() {
-                    for r in rows {
-                        flat.push(r.clone());
-                        owner.push(i);
-                    }
-                }
-                if !flat.is_empty() {
-                    let chunk = DataChunk::from_rows(&self.combined_dtypes, &flat)?;
-                    let mask = cond.eval(&chunk)?;
-                    let mut kept: Vec<Vec<Row>> = vec![Vec::new(); batch.num_rows()];
-                    for j in 0..flat.len() {
-                        if !mask.null_at(j) && mask.bool_values()[j] {
-                            kept[owner[j]].push(flat[j].clone());
-                        }
-                    }
-                    cand = kept;
-                }
-            }
-            // 产出:命中行按序输出;无命中(或全被 match_cond 滤掉)左外补 NULL
-            for i in 0..batch.num_rows() {
-                if null_ext[i] {
-                    let mut row = batch.row(i);
-                    row.extend(self.build_null_row.iter().cloned());
-                    self.track_mem(
-                        ctx,
-                        crate::chunk::row_approx_bytes(&self.combined_dtypes, &row),
-                    )?;
-                    out.push(row);
-                } else if cand[i].is_empty() {
-                    if left {
-                        let mut row = batch.row(i);
-                        row.extend(self.build_null_row.iter().cloned());
-                        self.track_mem(
-                            ctx,
-                            crate::chunk::row_approx_bytes(&self.combined_dtypes, &row),
-                        )?;
-                        out.push(row);
-                    }
+            // 1. 查表:输出行索引(探测行下标 + 构建引用),零行拷贝
+            let mut probe_idx: Vec<usize> = Vec::new();
+            let mut build_refs: Vec<(u32, u32)> = Vec::new();
+            let mut cand_count = vec![0u32; n_rows]; // 匹配前候选数(match_cond 存活判定基线)
+            for i in 0..n_rows {
+                let matches = if int_fast {
+                    int_lookup(i).and_then(|k| int_table.get(&k).cloned())
                 } else {
-                    for r in &cand[i] {
-                        self.track_mem(
-                            ctx,
-                            crate::chunk::row_approx_bytes(&self.combined_dtypes, r),
-                        )?;
-                    }
-                    out.append(&mut cand[i]);
+                    generic_lookup(i).and_then(|k| table.get(&k).cloned())
+                };
+                let Some(m) = matches.filter(|m| !m.is_empty()) else {
+                    continue;
+                };
+                cand_count[i] = m.len() as u32;
+                for r in m {
+                    probe_idx.push(i);
+                    build_refs.push(r);
                 }
             }
-        }
-
-        // residual(WHERE 路由):组合列上整批过滤
-        if let Some(residual) = &self.residual {
-            let chunk = DataChunk::from_rows(&self.combined_dtypes, &out)?;
-            let mask = residual.eval(&chunk)?;
-            let keep: Vec<bool> = (0..out.len())
-                .map(|i| mask.bool_values()[i] && !mask.null_at(i))
-                .collect();
-            out = out
-                .into_iter()
-                .zip(keep)
-                .filter(|(_, k)| *k)
-                .map(|(r, _)| r)
-                .collect();
+            if probe_idx.is_empty() && !left {
+                continue;
+            }
+            // 2. 列式组装:探测列直采;构建列按连续同批段 gather 后 concat
+            let mut cols: Vec<Vector> = Vec::with_capacity(self.schema.len());
+            for c in 0..probe_width {
+                cols.push(batch.column(c).gather(&probe_idx));
+            }
+            let runs = build_ref_runs(&build_refs);
+            for c in 0..self.build_dtypes.len() {
+                cols.push(gather_build_column(&build_data, &runs, c));
+            }
+            let mut chunk = DataChunk::with_memory(cols, &ctx.mem.tracker)?;
+            // 3. match_cond:列块上向量化求值 + 按探测行统计存活数
+            let mut survivors = cand_count;
+            if let Some(cond) = &self.match_cond {
+                let mask = cond.eval(&chunk)?;
+                let sel: Vec<bool> = (0..chunk.num_rows())
+                    .map(|j| !mask.null_at(j) && mask.bool_values()[j])
+                    .collect();
+                for (j, keep) in sel.iter().enumerate() {
+                    if !*keep {
+                        survivors[probe_idx[j]] -= 1;
+                    }
+                }
+                chunk = chunk.select(&sel, &ctx.mem.tracker)?;
+            }
+            // 4. LEFT:候选 0 或全被过滤的探测行 → NULL 补齐段(保持探测行序)
+            if left {
+                let null_rows: Vec<usize> =
+                    (0..n_rows).filter(|&i| survivors[i] == 0).collect();
+                if !null_rows.is_empty() {
+                    let mut null_cols: Vec<Vector> = Vec::with_capacity(self.schema.len());
+                    for c in 0..probe_width {
+                        null_cols.push(batch.column(c).gather(&null_rows));
+                    }
+                    for ty in &self.build_dtypes {
+                        null_cols.push(Vector::from_scalars(
+                            ty.clone(),
+                            (0..null_rows.len()).map(|_| ScalarValue::Null),
+                        )?);
+                    }
+                    let null_chunk = DataChunk::with_memory(null_cols, &ctx.mem.tracker)?;
+                    chunk = concat_two_chunks(chunk, null_chunk)?;
+                }
+            }
+            // 5. residual(WHERE 路由):列块上整批过滤
+            if let Some(residual) = &self.residual {
+                let mask = residual.eval(&chunk)?;
+                let sel: Vec<bool> = (0..chunk.num_rows())
+                    .map(|j| !mask.null_at(j) && mask.bool_values()[j])
+                    .collect();
+                chunk = chunk.select(&sel, &ctx.mem.tracker)?;
+            }
+            if chunk.num_rows() > 0 {
+                self.out_chunks.push_back(chunk);
+            }
         }
 
         self.probe_done = true;
-        self.int_table = None;
-        self.out = out;
         Ok(())
     }
+
+    /// 列式产出按游标切片交付(与 SeqScan 列存路径同约定)。
+    fn next_batch_serve(&mut self, ctx: &mut ExecuteContext) -> Result<Option<DataChunk>> {
+        loop {
+            let Some(front) = self.out_chunks.front() else {
+                return Ok(None);
+            };
+            if self.serve_off >= front.num_rows() {
+                self.out_chunks.pop_front();
+                self.serve_off = 0;
+                continue;
+            }
+            let n = (front.num_rows() - self.serve_off).min(ctx.batch_size);
+            let cols = front
+                .columns()
+                .iter()
+                .map(|v| v.slice(self.serve_off, n))
+                .collect();
+            let chunk = DataChunk::with_memory(cols, &ctx.mem.tracker)?;
+            self.serve_off += n;
+            return Ok(Some(chunk));
+        }
+    }
+}
+
+/// 构建引用按**连续同批**分段(保持引用顺序 = 输出行序)。
+fn build_ref_runs(refs: &[(u32, u32)]) -> Vec<(u32, Vec<usize>)> {
+    let mut runs: Vec<(u32, Vec<usize>)> = Vec::new();
+    for (ci, ri) in refs {
+        match runs.last_mut() {
+            Some((c, idx)) if *c == *ci => idx.push(*ri as usize),
+            _ => runs.push((*ci, vec![*ri as usize])),
+        }
+    }
+    runs
+}
+
+/// 按分段取构建侧单列(段内 gather,跨段 concat;保持引用顺序)。
+fn gather_build_column(
+    build_data: &[DataChunk],
+    runs: &[(u32, Vec<usize>)],
+    c: usize,
+) -> Vector {
+    if runs.len() == 1 {
+        let (ci, idx) = &runs[0];
+        return build_data[*ci as usize].column(c).gather(idx);
+    }
+    let parts: Vec<Vector> = runs
+        .iter()
+        .map(|(ci, idx)| build_data[*ci as usize].column(c).gather(idx))
+        .collect();
+    Vector::concat(&parts).expect("same-type parts")
+}
+
+/// 两块列式拼接(同 schema)。
+fn concat_two_chunks(a: DataChunk, b: DataChunk) -> Result<DataChunk> {
+    let cols = a
+        .columns()
+        .iter()
+        .zip(b.columns())
+        .map(|(va, vb)| Vector::concat(&[va.clone(), vb.clone()]))
+        .collect::<Result<Vec<_>>>()?;
+    DataChunk::new(cols)
 }
 
 impl Executor for HashJoinExec {
@@ -386,18 +407,7 @@ impl Executor for HashJoinExec {
         if !self.probe_done {
             self.materialize(ctx)?;
         }
-        let rows: &[Row] = &self.out;
-        if self.next >= rows.len() {
-            return Ok(None);
-        }
-        let end = (self.next + ctx.batch_size).min(rows.len());
-        let chunk = DataChunk::with_rows(
-            &self.combined_dtypes,
-            &rows[self.next..end],
-            &ctx.mem.tracker,
-        )?;
-        self.next = end;
-        Ok(Some(chunk))
+        self.next_batch_serve(ctx)
     }
 
     fn schema(&self) -> &[ColumnDesc] {

@@ -1020,12 +1020,18 @@ fn plan_select(
     if !keys.is_empty() {
         let n_keys = keys.len();
         let mut sort_exec = SortExec::new(pipeline, keys, project_schema.clone());
+        let mut topn_k: Option<u64> = None;
         if let Some((k, false)) = limit_hint {
             sort_exec = sort_exec.with_topn(k.max(1) as usize);
+            topn_k = Some(k);
         }
         pipeline = Box::new(sort_exec);
+        let sort_label = match topn_k {
+            Some(k) => format!("Sort ({n_keys} keys, topn={k})"),
+            None => format!("Sort ({n_keys} keys)"),
+        };
         expl = Some(ExplNode::with(
-            format!("Sort ({n_keys} keys)"),
+            sort_label,
             vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
         ));
         if !hidden.is_empty() {

@@ -647,6 +647,150 @@ impl Vector {
         self.slice(0, n)
     }
 
+    /// 按行下标集合抽取(gather):数值列纯索引拷贝,Utf8 单缓冲重建
+    /// (无逐值 String 分配),null 位图同步抽取。输出所有权必需的拷贝。
+    pub fn gather(&self, idx: &[usize]) -> Vector {
+        let data = match &self.data {
+            ColumnData::Bool(v) => ColumnData::Bool(idx.iter().map(|&i| v[i]).collect()),
+            ColumnData::Int64(v) => ColumnData::Int64(idx.iter().map(|&i| v[i]).collect()),
+            ColumnData::Float64(v) => ColumnData::Float64(idx.iter().map(|&i| v[i]).collect()),
+            ColumnData::Date(v) => ColumnData::Date(idx.iter().map(|&i| v[i]).collect()),
+            ColumnData::Utf8 { data, offsets } => {
+                let total: usize = idx
+                    .iter()
+                    .map(|&i| (offsets[i + 1] - offsets[i]) as usize)
+                    .sum();
+                let mut buf = Vec::with_capacity(total);
+                let mut offs = Vec::with_capacity(idx.len() + 1);
+                offs.push(0u32);
+                for &i in idx {
+                    let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
+                    buf.extend_from_slice(&data[s..e]);
+                    offs.push(buf.len() as u32);
+                }
+                ColumnData::Utf8 { data: buf, offsets: offs }
+            }
+            ColumnData::Binary(v) => ColumnData::Binary(idx.iter().map(|&i| v[i].clone()).collect()),
+            ColumnData::List { elem, values } => ColumnData::List {
+                elem: elem.clone(),
+                values: idx.iter().map(|&i| values[i].clone()).collect(),
+            },
+            ColumnData::Vector { dim, values } => ColumnData::Vector {
+                dim: *dim,
+                values: idx.iter().map(|&i| values[i].clone()).collect(),
+            },
+        };
+        let nulls = self.nulls.as_ref().map(|v| {
+            let mut out = Validity::all_valid(idx.len());
+            for (i, &src) in idx.iter().enumerate() {
+                out.set(i, v.get(src));
+            }
+            out
+        });
+        Self { data, nulls }
+    }
+
+    /// 纵向拼接(同类型列;null 位图合并)。分片产出的合并原语。
+    pub fn concat(parts: &[Vector]) -> Result<Vector> {
+        let Some(first) = parts.first() else {
+            return Err(Error::invalid_argument("concat requires >=1 part"));
+        };
+        let ty = first.data_type();
+        for p in parts {
+            if p.data_type() != ty {
+                return Err(Error::invalid_argument(format!(
+                    "concat type mismatch: {ty:?} vs {:?}",
+                    p.data_type()
+                )));
+            }
+        }
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let data = match &first.data {
+            ColumnData::Bool(_) => ColumnData::Bool(
+                parts.iter().flat_map(|p| p.bool_values().to_vec()).collect(),
+            ),
+            ColumnData::Int64(_) => ColumnData::Int64(
+                parts.iter().flat_map(|p| p.int64_values().to_vec()).collect(),
+            ),
+            ColumnData::Float64(_) => ColumnData::Float64(
+                parts.iter().flat_map(|p| p.float64_values().to_vec()).collect(),
+            ),
+            ColumnData::Date(_) => {
+                // Date 无数值快速通道 → 借 datum 逐行取(与 Bool 同理,量小)
+                let mut out = Vec::with_capacity(total);
+                for p in parts {
+                    for i in 0..p.len() {
+                        match p.datum(i) {
+                            Datum::Date(d) => out.push(d),
+                            Datum::Null => out.push(0),
+                            _ => panic!("concat type mismatch on date column"),
+                        }
+                    }
+                }
+                ColumnData::Date(out)
+            }
+            ColumnData::Utf8 { .. } => {
+                let mut buf = Vec::new();
+                let mut offs = Vec::with_capacity(total + 1);
+                offs.push(0u32);
+                for p in parts {
+                    if let ColumnData::Utf8 { data, offsets } = &p.data {
+                        for w in &offsets[1..] {
+                            offs.push(buf.len() as u32 + *w);
+                        }
+                        buf.extend_from_slice(data);
+                    } else {
+                        unreachable!("concat utf8 part mismatch");
+                    }
+                }
+                ColumnData::Utf8 { data: buf, offsets: offs }
+            }
+            ColumnData::Binary(_) => ColumnData::Binary(
+                parts
+                    .iter()
+                    .flat_map(|p| match &p.data {
+                        ColumnData::Binary(v) => v.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            ),
+            ColumnData::List { elem, .. } => ColumnData::List {
+                elem: elem.clone(),
+                values: parts
+                    .iter()
+                    .flat_map(|p| match &p.data {
+                        ColumnData::List { values, .. } => values.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            },
+            ColumnData::Vector { dim, .. } => ColumnData::Vector {
+                dim: *dim,
+                values: parts
+                    .iter()
+                    .flat_map(|p| match &p.data {
+                        ColumnData::Vector { values, .. } => values.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            },
+        };
+        // null 位图合并(任一分部带位图才需要)
+        let any_nulls = parts.iter().any(|p| p.nulls.is_some());
+        let nulls = any_nulls.then(|| {
+            let mut out = Validity::all_valid(total);
+            let mut j = 0usize;
+            for p in parts {
+                for i in 0..p.len() {
+                    out.set(j, p.null_at(i) == false);
+                    j += 1;
+                }
+            }
+            out
+        });
+        Ok(Self { data, nulls })
+    }
+
     /// 截取 [offset, offset + len) 行窗口。
     /// **只拷贝窗口内数据**(交付给下游的所有权必需),源向量保持不变 ——
     /// 批切片零冗余拷贝的关键原语:剩余行复用同一份缓冲,不重压。

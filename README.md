@@ -175,7 +175,10 @@ postgres=# DELETE FROM users WHERE id = 1;
     应用于 LSM 解码过滤与 HashJoin 探测行组装;`engine.parallelism` 配置
     (默认 CPU 核数,上限 8);
   - SF0.1 基准:11 条合计 976ms → **651ms**(-33%),Q6 -60%、Q10 -62%;
-  后续批切片游标化(Vector::slice,消除 O(N²/batch) 重拷)→ **253ms**
+  后续批切片游标化(Vector::slice,消除 O(N²/batch) 重拷)→ **253ms**;
+  引用式哈希表 + 列式产出(哈希表存 (批号,行号) 引用,输出按列 gather,
+  零 Row 物化)→ **108ms**(PG 同数据 90ms;Q3/Q5/Q7/Q10/Q11/Q12/Q14/Q18
+  单条已反超 PG;累计 -89%)
 - **内存控制(30 GiB 上限)**:
   - 配额树根默认限额提升到 **30 GiB**(`memory.global_limit_bytes`,0 = 不限);
     memtable / arena / chunk / 哈希表 / 物化行集全在同一棵树上记账

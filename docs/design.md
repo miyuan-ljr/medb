@@ -180,7 +180,15 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 - **连接执行**:逐表 `SeqScan(+下推过滤)→ HashJoinExec`(probe = 已组合流水线,
   build = 新表)。等值条件 `a = b` 且两侧各只引用一张表(表达式亦可,如
   `l_extendedprice*(1-l_discount) = x`)→ 哈希键:probe 侧按扁平下标求值,
-  build 侧列下标重基到表内(`rebase_columns`)。其余条件:
+  build 侧列下标重基到表内(`rebase_columns`)。
+  **引用式哈希表 + 列式产出**(v2.1,内存原则落地):哈希表存 `(批号, 行号)`
+  引用而非物化行 —— 构建批以 DataChunk 原样保留(记账随 chunk 自带
+  Reservation 存续),哈希结构开销批级记账;输出按列 gather 组装(探测列
+  直采,构建列按连续同批段 gather 后 concat,Int64 纯索引拷贝 / Utf8 单
+  缓冲无逐值 String 分配),match_cond / residual 列块向量化求值,LEFT 未
+  匹配行以 NULL 段追加。此前 build 侧每行物化 Row(4µs/行,TEXT 列逐值
+  String 分配)+ 每行记账占 Q3 92%,改造后 SF0.1 合计 236 → 108ms。
+  交付按游标 slice 切批(与 SeqScan 列存同约定)。其余条件:
   - `match_cond`:匹配期逐对判定(LEFT JOIN 下未过条件的左行仍 NULL 补齐
     —— 若放 residual 会错误地把 NULL 补齐行过滤掉);
   - `residual`:连接后整批过滤(WHERE 路由下来的条件,作用于含 NULL 补齐行
