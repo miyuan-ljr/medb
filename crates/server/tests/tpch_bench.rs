@@ -501,6 +501,14 @@ fn tpch_benchmark() {
         load_main
     );
 
+    // **基准场景约定:查询前把 memtable 刷进 SST**(合并 + 重建列存副本)。
+    // AP 读路径 = SST 列存副本 + memtable 增量合并;分析型查询应运行在
+    // "数据已合并" 的稳态 —— 脏 memtable 会让每条查询为 delta 合并买单,
+    // 那是写多读少场景的代价,不属于本基准的测量目标。
+    let t = Instant::now();
+    engine.flush().unwrap();
+    println!("flush-before-query: {:?}", t.elapsed());
+
     for (t, expect) in [
         ("lineitem", 0usize),
         ("orders", ORDERS_CT),
