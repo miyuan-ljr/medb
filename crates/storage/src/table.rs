@@ -159,6 +159,11 @@ pub fn encode_pk_component(v: &ScalarValue) -> Result<Vec<u8>> {
             }
             out.extend_from_slice(&[0x00, 0x00]);
         }
+        // Date = 距 epoch 天数(i32):符号位翻转 BE == 数值序(与 Int64 同法)
+        ScalarValue::Date(days) => {
+            out.push(0x06);
+            out.extend_from_slice(&(*days ^ (1i32 << 31)).to_be_bytes());
+        }
         other => {
             return Err(Error::invalid_argument(format!(
                 "type {:?} cannot be used as primary key",

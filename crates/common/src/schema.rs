@@ -23,6 +23,17 @@ impl ColumnDesc {
     }
 }
 
+/// 二级索引元数据(列存 segment 上的索引树;catalog 持久化)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexMeta {
+    /// 表内唯一 id(分配 = 当前最大 +1;0 保留给 PK 唯一索引)。
+    pub id: u64,
+    /// 表内唯一名称(CREATE INDEX 给出)。
+    pub name: String,
+    /// 索引列名(v1 单列)。
+    pub column: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchema {
     pub id: u64,
@@ -36,11 +47,30 @@ pub struct TableSchema {
     /// 前缀兼容解码(缺列补 NULL、多列截断)跨版本可见。
     #[serde(default)]
     pub version: u64,
+    /// 二级索引(旧 catalog JSON 无此字段 → 空,前向兼容)。
+    #[serde(default)]
+    pub indexes: Vec<IndexMeta>,
 }
 
 impl TableSchema {
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == name)
+    }
+
+    /// 按名称查索引(表内唯一;大小写敏感与列名一致)。
+    pub fn find_index(&self, name: &str) -> Option<&IndexMeta> {
+        self.indexes.iter().find(|i| i.name == name)
+    }
+
+    /// 某列上的索引(v1 每列至多一棵索引树)。
+    pub fn index_on_column(&self, col_idx: usize) -> Option<&IndexMeta> {
+        let col = self.columns.get(col_idx)?;
+        self.indexes.iter().find(|i| i.column == col.name)
+    }
+
+    /// 下一个可用索引 id。
+    pub fn next_index_id(&self) -> u64 {
+        self.indexes.iter().map(|i| i.id).max().unwrap_or(0) + 1
     }
 
     /// 主键列下标(按主键声明顺序);无主键返回 None。

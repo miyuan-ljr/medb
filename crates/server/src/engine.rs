@@ -325,51 +325,9 @@ impl QueryDataSource for LsmDataSource {
                 return Ok(None);
             }
         }
-        let Some((generation, seg_max_seq)) = ap.segment_info(table.id) else {
-            return Ok(None); // 无 segment → 行存路径(首次 flush 后才有)
-        };
-        // 取/建解码缓存(段文件 → 列向量;gen 变化自动失效)
-        let cache = match ap.cache(table.id) {
-            Some(c) if c.generation == generation => c,
-            _ => {
-                let path =
-                    columnar_file::segment_path(&ap.dir(), table.id, generation, seg_max_seq);
-                let seg = match columnar_file::read_segment(&path, table.id) {
-                    Ok(Some(seg)) => seg,
-                    Ok(None) => return Ok(None), // 段缺失(被删/代次超前)→ 行存回退
-                    Err(e) => {
-                        // 段损坏:派生数据不阻塞查询 → 注销代次 + 行存回退,
-                        // 下次 flush 重建新段(文件按代次整份替换)。
-                        warn!(table = %table.name, error = %e, "columnar segment corrupt; row-store fallback");
-                        ap.remove(table.id);
-                        return Ok(None);
-                    }
-                };
-                // 列主序组装:cell 解码 → 每列 Vector(null 经 validity)
-                let mut col_vals: Vec<Vec<ScalarValue>> =
-                    vec![Vec::with_capacity(seg.rows.len()); table.columns.len()];
-                let mut keys = Vec::with_capacity(seg.rows.len());
-                for r in &seg.rows {
-                    keys.push(r.key.clone());
-                    for (c, cell) in r.row.iter().enumerate() {
-                        col_vals[c].push(cell.clone());
-                    }
-                }
-                let cols = table
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .map(|(c, desc)| Vector::from_scalars(desc.ty.clone(), col_vals[c].clone()))
-                    .collect::<Result<Vec<_>>>()?;
-                let c = Arc::new(ApCache {
-                    generation: generation,
-                    keys,
-                    cols,
-                    rows: seg.rows.len(),
-                });
-                ap.set_cache(table.id, c.clone());
-                c
-            }
+        let cache = match self.load_ap_cache(ap, table)? {
+            Some(c) => c,
+            None => return Ok(None),
         };
         // memtable 增量 → delta 块(查询时向量化;memtable seq 恒大于已
         // flush seq → delta 块中的版本恒为最新)
@@ -430,15 +388,272 @@ impl QueryDataSource for LsmDataSource {
         }
         Ok(Some(chunks))
     }
+
+    /// 数据源支持索引访问(AP 路径可用,即非事务读)。
+    fn supports_index_scan(&self) -> bool {
+        self.ap.is_some()
+    }
+
+    /// **二级索引访问**:segment 索引树范围取候选行键 → 与 memtable 增量
+    /// 合并(覆盖取新版本、墓碑剔除)→ 全宽行输出。
+    /// 无段/索引文件缺失 → 全表行存 + 范围过滤(等价慢路径,正确性不变)。
+    fn scan_index(
+        &self,
+        table: &TableSchema,
+        col_idx: usize,
+        lo: Option<(ScalarValue, bool)>,
+        hi: Option<(ScalarValue, bool)>,
+        needed: &[bool],
+    ) -> Result<Vec<Row>> {
+        let Some(ap) = &self.ap else {
+            return self.fallback_index_scan(table, col_idx, lo, hi, needed);
+        };
+        let Some((generation, seg_max_seq)) = ap.segment_info(table.id) else {
+            return self.fallback_index_scan(table, col_idx, lo, hi, needed);
+        };
+        // 索引树(缓存;gen 变化自动失效;文件缺失/损坏 → 全扫回退)
+        let tree = match ap.index_cache(table.id, col_idx) {
+            Some((g, t)) if g == generation => t,
+            _ => {
+                let path = storage::columnar_index::index_path(
+                    &ap.dir(),
+                    table.id,
+                    generation,
+                    seg_max_seq,
+                    col_idx as u32,
+                );
+                let loaded = match storage::columnar_index::read_index(&path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(table = %table.name, error = %e, "columnar index unreadable; full scan fallback");
+                        return self.fallback_index_scan(table, col_idx, lo, hi, needed);
+                    }
+                };
+                let Some(tree) = loaded else {
+                    return self.fallback_index_scan(table, col_idx, lo, hi, needed);
+                };
+                let tree = Arc::new(tree);
+                ap.set_index_cache(table.id, col_idx, generation, tree.clone());
+                tree
+            }
+        };
+        let enc_lo = lo
+            .as_ref()
+            .map(|(v, _)| storage::table::encode_pk_component(v))
+            .transpose()?;
+        let enc_hi = hi
+            .as_ref()
+            .map(|(v, _)| storage::table::encode_pk_component(v))
+            .transpose()?;
+        // 编码保序 → 字节区间精确覆盖标量区间(开/闭按谓词原样传递)
+        use std::ops::Bound;
+        let lo_inc = lo.as_ref().map(|(_, inc)| *inc).unwrap_or(false);
+        let hi_inc = hi.as_ref().map(|(_, inc)| *inc).unwrap_or(false);
+        let in_range = |enc: &[u8]| -> bool {
+            let ge = match &enc_lo {
+                Some(l) if lo_inc => enc >= l.as_slice(),
+                Some(l) => enc > l.as_slice(),
+                None => true,
+            };
+            let le = match &enc_hi {
+                Some(h) if hi_inc => enc <= h.as_slice(),
+                Some(h) => enc < h.as_slice(),
+                None => true,
+            };
+            ge && le
+        };
+        let lb = enc_lo.as_ref().map_or(Bound::Unbounded, |l| {
+            if lo_inc {
+                Bound::Included(l.as_slice())
+            } else {
+                Bound::Excluded(l.as_slice())
+            }
+        });
+        let rb = enc_hi.as_ref().map_or(Bound::Unbounded, |h| {
+            if hi_inc {
+                Bound::Included(h.as_slice())
+            } else {
+                Bound::Excluded(h.as_slice())
+            }
+        });
+        let candidates: Vec<Vec<u8>> = tree
+            .range::<[u8], (Bound<&[u8]>, Bound<&[u8]>)>((lb, rb))
+            .flat_map(|(_, keys)| keys.iter().cloned())
+            .collect();
+        if candidates.is_empty() && self.memtable_for(table)?.is_empty() {
+            return Ok(Vec::new());
+        }
+        // memtable 增量:候选键的覆盖解析 + 不在候选中的存活行
+        let mt = self.memtable_for(table)?;
+        let mt_map: std::collections::HashMap<&[u8], Option<&Vec<u8>>> = mt
+            .iter()
+            .map(|(k, _, v)| (k.as_slice(), v.as_ref()))
+            .collect();
+        let candidate_set: std::collections::HashSet<&[u8]> =
+            candidates.iter().map(|k| k.as_slice()).collect();
+        let cache = self.load_ap_cache(ap, table)?.ok_or_else(|| {
+            // 理论不可达:树存在则段必存在;防御性回退
+            common::error::Error::internal("segment cache missing while index present")
+        })?;
+        let ncols = table.columns.len();
+        let mut rows: Vec<Row> = Vec::with_capacity(candidates.len());
+        for key in &candidates {
+            match mt_map.get(key.as_slice()) {
+                Some(Some(bytes)) => rows.push(decode_full_row(bytes, ncols)?),
+                Some(None) => {} // 墓碑:候选行已删
+                None => {
+                    let Some(&pos) = cache.key_pos.get(key) else { continue };
+                    let mut row: Row = Vec::with_capacity(ncols);
+                    for c in 0..ncols {
+                        row.push(cache.cols[c].scalar_at(pos));
+                    }
+                    rows.push(row);
+                }
+            }
+        }
+        for (k, _, v) in &mt {
+            if candidate_set.contains(k.as_slice()) {
+                continue; // 已按 memtable 版本解析过
+            }
+            // delta 行不在索引树里 → 必须按谓词范围显式过滤
+            let Some(bytes) = v else { continue };
+            let row = decode_full_row(bytes, ncols)?;
+            let cell = &row[col_idx];
+            if matches!(cell, ScalarValue::Null) {
+                continue; // NULL 不入索引,永不命中范围
+            }
+            let enc = storage::table::encode_pk_component(cell)?;
+            if in_range(&enc) {
+                rows.push(row);
+            }
+        }
+        apply_needed(&mut rows, needed);
+        Ok(rows)
+    }
 }
 
-/// AP 列存段存储:segment 目录 + 每表代次 + 解码列缓存。
+impl LsmDataSource {
+    /// 取/建 segment 解码缓存(gen 变化自动失效;段缺失/损坏 → None 行存回退)。
+    fn load_ap_cache(
+        &self,
+        ap: &ApStore,
+        table: &TableSchema,
+    ) -> Result<Option<Arc<ApCache>>> {
+        let Some((generation, seg_max_seq)) = ap.segment_info(table.id) else {
+            return Ok(None); // 无 segment → 行存路径(首次 flush 后才有)
+        };
+        if let Some(c) = ap.cache(table.id) {
+            if c.generation == generation {
+                return Ok(Some(c));
+            }
+        }
+        let path = columnar_file::segment_path(&ap.dir(), table.id, generation, seg_max_seq);
+        let seg = match columnar_file::read_segment(&path, table.id) {
+            Ok(Some(seg)) => seg,
+            Ok(None) => return Ok(None), // 段缺失(被删/代次超前)→ 行存回退
+            Err(e) => {
+                // 段损坏:派生数据不阻塞查询 → 注销代次 + 行存回退,
+                // 下次 flush 重建新段(文件按代次整份替换)。
+                warn!(table = %table.name, error = %e, "columnar segment corrupt; row-store fallback");
+                ap.remove(table.id);
+                return Ok(None);
+            }
+        };
+        // 列主序组装:cell 解码 → 每列 Vector(null 经 validity)
+        let mut col_vals: Vec<Vec<ScalarValue>> =
+            vec![Vec::with_capacity(seg.rows.len()); table.columns.len()];
+        let mut keys = Vec::with_capacity(seg.rows.len());
+        for r in &seg.rows {
+            keys.push(r.key.clone());
+            for (c, cell) in r.row.iter().enumerate() {
+                col_vals[c].push(cell.clone());
+            }
+        }
+        let key_pos: HashMap<Vec<u8>, usize> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), i))
+            .collect();
+        let cols = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(c, desc)| Vector::from_scalars(desc.ty.clone(), col_vals[c].clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let c = Arc::new(ApCache {
+            generation,
+            keys,
+            key_pos,
+            cols,
+            rows: seg.rows.len(),
+        });
+        ap.set_cache(table.id, c.clone());
+        Ok(Some(c))
+    }
+
+
+    /// memtable 增量(活跃 + 冻结表,含墓碑)。
+    fn memtable_for(&self, table: &TableSchema) -> Result<Vec<storage::memtable::ScanEntry>> {
+        let (from, to) = row_range(table.id);
+        self.lsm.scan_memtable(&from, &to, self.read_ts)
+    }
+
+    /// 索引不可用时的等价慢路径:全表行存 + 索引列范围过滤(编码序比较)。
+    fn fallback_index_scan(
+        &self,
+        table: &TableSchema,
+        col_idx: usize,
+        lo: Option<(ScalarValue, bool)>,
+        hi: Option<(ScalarValue, bool)>,
+        needed: &[bool],
+    ) -> Result<Vec<Row>> {
+        let rows = self.scan_table_filtered(table, None, needed)?;
+        let enc_lo = lo
+            .as_ref()
+            .map(|(v, _)| storage::table::encode_pk_component(v))
+            .transpose()?;
+        let enc_hi = hi
+            .as_ref()
+            .map(|(v, _)| storage::table::encode_pk_component(v))
+            .transpose()?;
+        let mut out = Vec::new();
+        for row in rows {
+            let v = &row[col_idx];
+            if matches!(v, ScalarValue::Null) {
+                continue; // NULL 不在索引树中(与 build 一致)
+            }
+            let enc = storage::table::encode_pk_component(v)?;
+            let ge_lo = enc_lo.as_ref().map_or(true, |l| {
+                if lo.as_ref().map(|(_, inc)| *inc).unwrap_or(false) {
+                    enc >= *l
+                } else {
+                    enc > *l
+                }
+            });
+            let le_hi = enc_hi.as_ref().map_or(true, |h| {
+                if hi.as_ref().map(|(_, inc)| *inc).unwrap_or(false) {
+                    enc <= *h
+                } else {
+                    enc < *h
+                }
+            });
+            if ge_lo && le_hi {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// AP 列存段存储:segment 目录 + 每表代次 + 解码列/索引树缓存。
 /// 列存副本只覆盖 SST 数据;memtable 增量由读路径以 overlay 合并。
 pub(crate) struct ApStore {
     dir: std::path::PathBuf,
     /// table_id → (generation, segment max_seq)。缺失 = 无段(行存回退)。
     gens: Mutex<HashMap<u64, (u64, u64)>>,
     caches: Mutex<HashMap<u64, Arc<ApCache>>>,
+    /// table_id → col_idx → (generation, 索引树)。gen 不匹配即失效重读。
+    index_caches: Mutex<HashMap<u64, HashMap<u32, (u64, Arc<storage::columnar_index::IndexTree>)>>>,
 }
 
 impl ApStore {
@@ -458,6 +673,7 @@ impl ApStore {
     pub fn remove(&self, table_id: u64) {
         self.gens.lock().remove(&table_id);
         self.caches.lock().remove(&table_id);
+        self.index_caches.lock().remove(&table_id);
     }
 
     /// 删除某表全部 segment 文件并清空代次/缓存(ALTER 失效 / DROP 清理)。
@@ -467,7 +683,7 @@ impl ApStore {
         self.remove(table_id);
     }
 
-    /// 删除某表满足条件的 segment 文件(keep 返回 true 的保留)。
+    /// 删除某表满足条件的派生文件(segment .seg / 索引 .idx;keep 返回 true 的保留)。
     pub(crate) fn remove_files_matching(
         &self,
         table_id: u64,
@@ -478,7 +694,8 @@ impl ApStore {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name.starts_with(&prefix) && name.ends_with(".seg") && !keep(&name) {
+                let derived = name.ends_with(".seg") || name.ends_with(".idx");
+                if derived && name.starts_with(&prefix) && !keep(&name) {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -496,13 +713,47 @@ impl ApStore {
     pub fn invalidate_cache(&self, table_id: u64) {
         self.caches.lock().remove(&table_id);
     }
+
+    /// 索引树缓存((generation, tree);None = 未缓存)。
+    pub fn index_cache(
+        &self,
+        table_id: u64,
+        col_idx: usize,
+    ) -> Option<(u64, Arc<storage::columnar_index::IndexTree>)> {
+        self.index_caches
+            .lock()
+            .get(&table_id)?
+            .get(&(col_idx as u32))
+            .map(|(g, t)| (*g, t.clone()))
+    }
+
+    pub fn set_index_cache(
+        &self,
+        table_id: u64,
+        col_idx: usize,
+        generation: u64,
+        tree: Arc<storage::columnar_index::IndexTree>,
+    ) {
+        self.index_caches
+            .lock()
+            .entry(table_id)
+            .or_default()
+            .insert(col_idx as u32, (generation, tree));
+    }
+
+    /// 清空某表全部索引树缓存(段重建/DDL 后)。
+    pub fn invalidate_index_caches(&self, table_id: u64) {
+        self.index_caches.lock().remove(&table_id);
+    }
 }
 
-/// 解码后的列缓存(一段 segment 的列向量 + 行键)。
+/// 解码后的列缓存(一段 segment 的列向量 + 行键/位置索引)。
 pub(crate) struct ApCache {
     pub generation: u64,
-    /// 行键(与列向量行序一致;delta 影子剔除用)
+    /// 行键(与列向量行序一致;delta 影子剔除 + 索引候选定位用)
     pub keys: Vec<Vec<u8>>,
+    /// 行键 → 行位置(索引候选 → 行取数)
+    pub key_pos: HashMap<Vec<u8>, usize>,
     pub cols: Vec<Vector>,
     pub rows: usize,
 }
@@ -656,6 +907,7 @@ impl Engine {
             dir: columnar_dir,
             gens: Mutex::new(gens),
             caches: Mutex::new(HashMap::new()),
+            index_caches: Mutex::new(HashMap::new()),
         });
         let engine = Arc::new(Self {
             config,
@@ -802,7 +1054,8 @@ impl Engine {
 
     /// 将全部表的 LSM 可见数据重建为列存 segment(LSM flush 钩子触发,
     /// 与 LSM 写串行 —— 钩子在 write_lock 内调用)。
-    /// segment = SST 全量真值;代次 +1,旧代文件删除,解码缓存失效。
+    /// segment = SST 全量真值;代次 +1,旧代文件删除,解码/索引缓存失效。
+    /// catalog 中登记的二级索引随段重建(每段每列一棵索引树)。
     fn rebuild_columnar_segments(&self) -> Result<()> {
         let dir = self.ap.dir();
         std::fs::create_dir_all(&dir)?;
@@ -829,15 +1082,61 @@ impl Engine {
             let generation = self.ap.segment_info(schema.id).map_or(1, |(g, _)| g + 1);
             let path = columnar_file::segment_path(&dir, schema.id, generation, max_seq);
             columnar_file::write_segment(&path, schema.id, &seg_rows, &schema)?;
-            // 清理旧代文件(保留刚写的这份)
-            let new_name = path.file_name().and_then(|n| n.to_str()).map(String::from);
+            // 索引树随段重建(当前 catalog 登记的每一列)
+            self.write_segment_indexes(&dir, &schema, generation, max_seq, &seg_rows);
+            // 清理旧代文件(保留刚写的 segment 及其同代索引)
+            let new_prefix =
+                format!("{}.{:05}.{}.", schema.id, generation, max_seq);
             self.ap
-                .remove_files_matching(schema.id, |n| new_name.as_deref() == Some(n));
+                .remove_files_matching(schema.id, |n| n.starts_with(&new_prefix));
             self.ap.set_gen(schema.id, generation, max_seq);
             self.ap.invalidate_cache(schema.id);
+            self.ap.invalidate_index_caches(schema.id);
             debug!(table = %schema.name, rows = seg_rows.len(), "columnar segment rebuilt");
         }
         Ok(())
+    }
+
+    /// 为 catalog 登记的每个二级索引写一棵与 segment 同代的索引树。
+    /// 失败仅告警(派生数据):查询时索引缺失/损坏 → 全扫回退。
+    fn write_segment_indexes(
+        &self,
+        dir: &std::path::Path,
+        schema: &TableSchema,
+        generation: u64,
+        max_seq: u64,
+        seg_rows: &[SegmentRow],
+    ) {
+        for idx in &schema.indexes {
+            let Some(col_idx) = schema.column_index(&idx.column) else {
+                continue; // 目录不一致(防御):列已被删
+            };
+            let tree = storage::columnar_index::build_tree(
+                seg_rows
+                    .iter()
+                    .map(|r| (r.key.as_slice(), r.row.get(col_idx))),
+                storage::table::encode_pk_component,
+            );
+            match tree {
+                Ok(tree) => {
+                    let path = storage::columnar_index::index_path(
+                        dir,
+                        schema.id,
+                        generation,
+                        max_seq,
+                        col_idx as u32,
+                    );
+                    if let Err(e) =
+                        storage::columnar_index::write_index(&path, schema.id, col_idx as u32, &tree)
+                    {
+                        warn!(table = %schema.name, index = %idx.name, error = %e, "columnar index write failed; full scan fallback");
+                    }
+                }
+                Err(e) => {
+                    warn!(table = %schema.name, index = %idx.name, error = %e, "columnar index build failed; full scan fallback");
+                }
+            }
+        }
     }
 
     /// 存储概要(memtable 用量 / 各层文件数)。
@@ -928,6 +1227,15 @@ impl Engine {
                 if_not_exists,
             } => self.exec_alter_add_column(&name, column, if_not_exists),
             StatementPlan::DropTable { name } => self.exec_drop_table(&name),
+            StatementPlan::CreateIndex {
+                table,
+                name,
+                column,
+                if_not_exists,
+            } => self.exec_create_index(&table, &name, &column, if_not_exists),
+            StatementPlan::DropIndex { name, if_exists } => {
+                self.exec_drop_index(&name, if_exists)
+            }
             StatementPlan::Begin | StatementPlan::Commit | StatementPlan::Rollback => Err(
                 Error::internal("transaction control statement handled by Session"),
             ),
@@ -1482,6 +1790,144 @@ impl Engine {
         })
     }
 
+    /// CREATE INDEX:登记 catalog → 段已存在时立即建树(无段则下次 flush 随
+    /// 段重建)。v1:单列、非唯一;NULL 值不入树(SQL 三值逻辑永不命中)。
+    fn exec_create_index(
+        &self,
+        table: &str,
+        index_name: &str,
+        column: &str,
+        if_not_exists: bool,
+    ) -> Result<Outcome> {
+        let current = self
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| Error::catalog(format!("table '{table}' not found")))?;
+        if current.find_index(index_name).is_some() {
+            if if_not_exists {
+                return Ok(Outcome::Tag {
+                    prefix: "CREATE INDEX".into(),
+                    rows: None,
+                });
+            }
+            return Err(Error::catalog(format!(
+                "index '{index_name}' on table '{table}' already exists"
+            )));
+        }
+        let Some(col_idx) = current.column_index(column) else {
+            return Err(Error::catalog(format!(
+                "column '{column}' of table '{table}' not found"
+            )));
+        };
+        if current.index_on_column(col_idx).is_some() {
+            return Err(Error::catalog(format!(
+                "table '{table}' already has an index on column '{column}'"
+            )));
+        }
+        if !matches!(
+            current.columns[col_idx].ty,
+            common::types::DataType::Boolean
+                | common::types::DataType::Int64
+                | common::types::DataType::Float64
+                | common::types::DataType::Utf8
+                | common::types::DataType::Binary
+                | common::types::DataType::Date
+        ) {
+            return Err(Error::not_supported(format!(
+                "index on column type {:?}",
+                current.columns[col_idx].ty
+            )));
+        }
+
+        let mut next = current.clone();
+        next.indexes.push(common::schema::IndexMeta {
+            id: next.next_index_id(),
+            name: index_name.to_string(),
+            column: column.to_string(),
+        });
+        next.version = current.version.max(1) + 1;
+        self.catalog.update_table(next.clone())?;
+        // 持久化目录区(失败回滚内存 catalog —— 与 ALTER 同一模式)
+        let bytes = encode_schema(&next)?;
+        if let Err(e) = self.lsm.put(&catalog_key(table), &bytes) {
+            let _ = self.catalog.update_table(current.clone());
+            return Err(e);
+        }
+        // 段已存在 → 立即建树;否则下次 flush 随段重建(期间查询走全扫)
+        if let Some((generation, max_seq)) = self.ap.segment_info(next.id) {
+            let path = columnar_file::segment_path(&self.ap.dir(), next.id, generation, max_seq);
+            if let Ok(Some(seg)) = columnar_file::read_segment(&path, next.id) {
+                let next_arc = Arc::new(next.clone());
+                self.write_segment_indexes(
+                    &self.ap.dir(),
+                    &next_arc,
+                    generation,
+                    max_seq,
+                    &seg.rows,
+                );
+            }
+        }
+        info!(table = table, index = index_name, column = column, "index created");
+        Ok(Outcome::Tag {
+            prefix: "CREATE INDEX".into(),
+            rows: None,
+        })
+    }
+
+    /// DROP INDEX:索引名跨表检索(歧义报错)→ 摘除目录 → 删该列索引文件。
+    fn exec_drop_index(&self, index_name: &str, if_exists: bool) -> Result<Outcome> {
+        let mut owner: Option<TableSchema> = None;
+        for t in self.catalog.list_tables() {
+            if t.find_index(index_name).is_some() {
+                if owner.is_some() {
+                    return Err(Error::catalog(format!(
+                        "index name '{index_name}' is ambiguous (exists on multiple tables)"
+                    )));
+                }
+                owner = Some(t);
+            }
+        }
+        let Some(current) = owner else {
+            if if_exists {
+                return Ok(Outcome::Tag {
+                    prefix: "DROP INDEX".into(),
+                    rows: None,
+                });
+            }
+            return Err(Error::catalog(format!("index '{index_name}' not found")));
+        };
+        let dropped_column = current
+            .find_index(index_name)
+            .expect("checked above")
+            .column
+            .clone();
+        let mut next = current.clone();
+        next.indexes.retain(|i| i.name != index_name);
+        next.version = current.version.max(1) + 1;
+        self.catalog.update_table(next.clone())?;
+        let bytes = encode_schema(&next)?;
+        if let Err(e) = self.lsm.put(&catalog_key(&next.name), &bytes) {
+            let _ = self.catalog.update_table(current.clone());
+            return Err(e);
+        }
+        // 删该列全部代的索引文件(其他列/segment 文件保留)
+        if let Some(col_idx) = next.column_index(&dropped_column) {
+            let target = col_idx as u32;
+            self.ap.remove_files_matching(next.id, |n| {
+                match storage::columnar_index::parse_index_file_name(n) {
+                    Some((_, _, _, c)) => c != target,
+                    None => true, // 非 .idx 文件一律保留
+                }
+            });
+        }
+        self.ap.invalidate_index_caches(next.id);
+        info!(table = %next.name, index = index_name, "index dropped");
+        Ok(Outcome::Tag {
+            prefix: "DROP INDEX".into(),
+            rows: None,
+        })
+    }
+
     // ---------- 事务提交 ----------
 
     /// COMMIT:唯一性探测(提交锁下)→ 事务缓冲一次性落盘(单条 WAL 记录 =
@@ -1545,6 +1991,32 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+/// 解码一行并按当前 schema 收敛宽度(短补 NULL / 长截断)。
+fn decode_full_row(bytes: &[u8], ncols: usize) -> Result<Row> {
+    let mut s = bytes;
+    let mut row = common::codec::decode_row(&mut s)?;
+    if row.len() < ncols {
+        row.resize(ncols, ScalarValue::Null);
+    } else if row.len() > ncols {
+        row.truncate(ncols);
+    }
+    Ok(row)
+}
+
+/// 投影剪枝:未标记列置 Null 占位(行保持全宽,下游扁平下标不变)。
+fn apply_needed(rows: &mut [Row], needed: &[bool]) {
+    if needed.is_empty() {
+        return;
+    }
+    for row in rows {
+        for (c, need) in needed.iter().enumerate() {
+            if !need && c < row.len() {
+                row[c] = ScalarValue::Null;
+            }
+        }
     }
 }
 

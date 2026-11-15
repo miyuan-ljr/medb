@@ -895,6 +895,194 @@ fn greedy_order(nodes: &[usize], base: &[f64], pool: &[PoolEntry<'_>]) -> GroupP
     }
 }
 
+// ---------- 二级索引范围计划(基于统计的代价选择) ----------
+
+/// 索引访问时每行取数代价相对全扫每行代价的倍数
+/// (索引树定位 + 逐键行取数 + memtable 解析;经验值,教学项目不标定)。
+pub const INDEX_COST_FACTOR: f64 = 4.0;
+
+/// 单列索引范围计划:从 planned 合取项(表内局部下标)提取等值/范围条件。
+pub struct IndexRangePlan {
+    /// 索引列(表内局部下标)
+    pub col_idx: usize,
+    /// 范围边界 (值, 是否闭);None = 该侧无界
+    pub lo: Option<(ScalarValue, bool)>,
+    pub hi: Option<(ScalarValue, bool)>,
+    /// 命中的合取项下标(从下推集合移除;其余作残余谓词)
+    pub matched: Vec<usize>,
+    /// 命中条件的联合选择性(× row_count = 估算命中行)
+    pub est_selectivity: f64,
+}
+
+/// 从合取项中提取可下推到二级索引的单列范围。
+/// 规则:Column <cmp> Literal(或反向);等值/比较运算;字面量类型与列一致
+/// (跨类型比较交给普通下推路径);NULL 字面量不进索引(SQL 三值逻辑)。
+/// 统计缺失(无该列 NDV/min-max)→ 返回 None(无法估价,不用索引)。
+pub fn plan_index_range(
+    preds: &[exec::expr::Expr],
+    schema: &common::schema::TableSchema,
+    stats: Option<&TableStats>,
+) -> Option<IndexRangePlan> {
+    use exec::expr::{BinaryOp, Expr};
+
+    let Some(stats) = stats else {
+        return None;
+    };
+    let mut col_idx: Option<usize> = None;
+    let mut lo: Option<(ScalarValue, bool)> = None;
+    let mut hi: Option<(ScalarValue, bool)> = None;
+    let mut eq: Option<ScalarValue> = None;
+    let mut matched: Vec<usize> = Vec::new();
+
+    for (i, pred) in preds.iter().enumerate() {
+        let Expr::Binary { op, left, right } = pred else {
+            continue;
+        };
+        let (col, lit, flip) = match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(c), Expr::Literal(v)) => (*c, v, false),
+            (Expr::Literal(v), Expr::Column(c)) => (*c, v, true),
+            _ => continue,
+        };
+        if matches!(lit, ScalarValue::Null) {
+            continue; // NULL 不进索引树,条件留给普通下推(三值逻辑正确处理)
+        }
+        let op = match (op, flip) {
+            (BinaryOp::Eq, _) => BinaryOp::Eq,
+            (BinaryOp::Lt, false) | (BinaryOp::Gt, true) => BinaryOp::Lt,
+            (BinaryOp::LtEq, false) | (BinaryOp::GtEq, true) => BinaryOp::LtEq,
+            (BinaryOp::Gt, false) | (BinaryOp::Lt, true) => BinaryOp::Gt,
+            (BinaryOp::GtEq, false) | (BinaryOp::LtEq, true) => BinaryOp::GtEq,
+            _ => continue,
+        };
+        // 同列约束;跨类型不取(编码需精确类型)
+        match col_idx {
+            Some(c) if c != col => continue,
+            _ => {}
+        }
+        let desc = schema.columns.get(col)?;
+        if lit.data_type().as_ref() != Some(&desc.ty) {
+            continue;
+        }
+        if stats.column(&desc.name).is_none() {
+            continue; // 无该列统计 → 无法估价
+        }
+        col_idx = Some(col);
+        matched.push(i);
+        match op {
+            BinaryOp::Eq => eq = Some(lit.clone()),
+            BinaryOp::Lt => tighten_hi(&mut hi, (lit.clone(), false)),
+            BinaryOp::LtEq => tighten_hi(&mut hi, (lit.clone(), true)),
+            BinaryOp::Gt => tighten_lo(&mut lo, (lit.clone(), false)),
+            BinaryOp::GtEq => tighten_lo(&mut lo, (lit.clone(), true)),
+            _ => unreachable!(),
+        }
+    }
+    let col_idx = col_idx?;
+    // catalog 必须登记该列的二级索引(无索引 → 提取结果无意义)
+    if schema.index_on_column(col_idx).is_none() {
+        return None;
+    }
+    let desc = &schema.columns[col_idx];
+    let col_stats = stats.column(&desc.name)?;
+    // 选择性:等值 = 1/NDV;范围 = min/max 线性插值(无边界 → 保守 1.0)
+    let sel = if eq.is_some() {
+        1.0 / (col_stats.ndv.max(1) as f64)
+    } else {
+        let min = col_stats.min.as_ref();
+        let max = col_stats.max.as_ref();
+        let s = match (&lo, &hi) {
+            (Some((lv, _)), Some((hv, _))) => {
+                let f = (scalar_f64(Some(hv)) - scalar_f64(Some(lv)))
+                    / (scalar_f64(max) - scalar_f64(min)).max(f64::EPSILON);
+                if f.is_finite() { f } else { 1.0 }
+            }
+            (Some((lv, _)), None) => range_selectivity(lv, min, max, false),
+            (None, Some((hv, _))) => range_selectivity(hv, min, max, true),
+            (None, None) => 1.0,
+        };
+        s.clamp(0.001, 1.0)
+    };
+    // NULL 行既不在树中也不命中比较 → 命中率再乘非空占比
+    let null_frac = col_stats.null_count as f64 / stats.row_count.max(1) as f64;
+    let sel = sel * (1.0 - null_frac);
+    Some(IndexRangePlan {
+        col_idx,
+        lo: if eq.is_some() { eq.clone().map(|v| (v, true)) } else { lo },
+        hi: if eq.is_some() { eq.clone().map(|v| (v, true)) } else { hi },
+        matched,
+        est_selectivity: sel.clamp(0.0, 1.0),
+    })
+}
+
+fn tighten_lo(cur: &mut Option<(ScalarValue, bool)>, new: (ScalarValue, bool)) {
+    let better = match cur {
+        None => true,
+        Some((v, inc)) => match types::compare_values(&new.0, v) {
+            Ok(o) if o.is_gt() => true,
+            Ok(o) if o.is_eq() => !new.1 && *inc, // 同值时开区间更紧
+            _ => false,
+        },
+    };
+    if better {
+        *cur = Some(new);
+    }
+}
+
+fn tighten_hi(cur: &mut Option<(ScalarValue, bool)>, new: (ScalarValue, bool)) {
+    let better = match cur {
+        None => true,
+        Some((v, inc)) => match types::compare_values(&new.0, v) {
+            Ok(o) if o.is_lt() => true,
+            Ok(o) if o.is_eq() => !new.1 && *inc,
+            _ => false,
+        },
+    };
+    if better {
+        *cur = Some(new);
+    }
+}
+
+fn scalar_f64(v: Option<&ScalarValue>) -> f64 {
+    match v {
+        Some(ScalarValue::Int64(i)) => *i as f64,
+        Some(ScalarValue::Float64(f)) => *f,
+        Some(ScalarValue::Date(d)) => *d as f64,
+        Some(ScalarValue::Boolean(b)) => *b as i32 as f64,
+        _ => 0.0,
+    }
+}
+
+/// 范围选择性:min/max 线性插值。upper=true 表示上界条件(col < v)。
+fn range_selectivity(
+    v: &ScalarValue,
+    min: Option<&ScalarValue>,
+    max: Option<&ScalarValue>,
+    upper: bool,
+) -> f64 {
+    let (lo, hi) = (scalar_f64(min), scalar_f64(max));
+    let span = hi - lo;
+    if span <= f64::EPSILON {
+        return 1.0; // 无有效 min/max → 保守不衰减
+    }
+    let x = scalar_f64(Some(v));
+    let f = if upper {
+        if x >= hi {
+            1.0
+        } else if x <= lo {
+            0.001
+        } else {
+            (hi - x) / span
+        }
+    } else if x <= lo {
+        1.0
+    } else if x >= hi {
+        0.001
+    } else {
+        (x - lo) / span
+    };
+    if f.is_finite() { f } else { 1.0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +1102,7 @@ mod tests {
                 .collect(),
             primary_key: vec![],
             version: 1,
+            indexes: Vec::new(),
         }
     }
 
@@ -1061,6 +1250,7 @@ mod q19_regression {
                 .collect(),
             primary_key: vec![],
             version: 1,
+            indexes: Vec::new(),
         };
         s.push(
             "lineitem".into(),

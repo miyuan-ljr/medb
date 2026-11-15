@@ -8,10 +8,12 @@
 //! - [`manifest`]:层级清单与文件号;
 //! - [`compaction`]:压缩策略 trait + Leveled 简化实现;
 //! - [`lsm`]:LsmStore 门面(写路径 / 读路径 / flush / 压缩 / 恢复);
-//! - [`table`]:表数据键布局(行键 / 目录键 / 范围);
-//! - [`columnar`]:列存副本 trait 与内存实现(HTAP AP 路径)。
+//! - [`table`]:表数据键布局(行键 / 目录键 / 范围 / 可排序编码);
+//! - [`columnar_file`]:列存 segment 文件(HTAP AP 路径);
+//! - [`columnar_index`]:segment 上的二级索引树文件。
 
 pub mod columnar_file;
+pub mod columnar_index;
 pub mod compaction;
 pub mod key;
 pub mod lsm;

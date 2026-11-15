@@ -242,6 +242,7 @@ mod tests {
                 ColumnDesc::new("d", DataType::Date, true),
             ],
             primary_key: Vec::new(),
+            indexes: Vec::new(),
             version: 1,
         }
     }

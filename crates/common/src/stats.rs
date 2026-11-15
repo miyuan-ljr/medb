@@ -279,6 +279,7 @@ mod tests {
             ],
             primary_key: vec![],
             version: 1,
+            indexes: Vec::new(),
         }
     }
 

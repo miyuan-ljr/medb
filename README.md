@@ -183,6 +183,16 @@ postgres=# DELETE FROM users WHERE id = 1;
   - Q19 根因修复:WHERE 为 OR-of-AND 且每个分支都含同一跨表等值对时,
     提取该对作为哈希键(完整 OR 仍作 residual 强制)—— 此前这类查询会退化成
     笛卡尔积全物化(12 亿行级别),正是内存爆掉的来源
+- **二级索引 + 基于代价的索引选择(`server/tests/secondary_index.rs`)**:
+  - **索引树建在列存 segment 上**(每段每列一棵 `BTreeMap<编码值, 行键列表>`,
+    flush 随段重建、CREATE INDEX 立即建树、ALTER 一并失效、DROP 清理;
+    NULL 不入树);memtable 增量查询时合并(覆盖取新版本/墓碑剔除/delta
+    行显式范围过滤)
+  - **优化器选择**:统计(NDV/min-max)估算命中行,估行 × 索引行代价
+    (4×)仍小于全扫才选;EXPLAIN 标签 `IndexScan ... range: [...]` 可观察;
+    等值/范围/开闭区间正确,索引路径与行存路径结果一致
+  - DDL:`CREATE INDEX [IF NOT EXISTS]` / `DROP INDEX [IF EXISTS]` /
+    `ALTER TABLE ... DROP INDEX`;v1 单列非唯一(UNIQUE/多列/表达式明确报错)
 - **表达式补全(CASE / IN / 非相关子查询,`server/tests/expressions.rs`)**:
   - **CASE WHEN**(搜索式):投影、WHERE、`SUM(CASE WHEN ...)` 聚合内均可
     (Q7/Q9/Q12/Q14 形状);结果类型统一(任一分支 Float64 → Int64 提升);
@@ -198,8 +208,8 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 - **M1 事务剩余**:写冲突检测(first-committer-wins)、语句级保存点、
   隔离级别提升(快照隔离)
-- **M3 HTAP 落地剩余**:二级索引建在列存 segment 上
-  (`BTreeMap<编码值, BTreeSet<row_key>>`,每段一棵索引树);
+- **M3 HTAP 落地剩余**:索引增强(UNIQUE 约束与写路径校验、多列复合索引、
+  IN 列表走索引、UPDATE/DELETE 目标定位走索引、LSM PK 唯一索引接入点查)、
   段级列剪枝、字典/RLE 编码、增量 delta 行 + 后台 merge
 - **M2/M4/M5**:RIGHT/FULL JOIN、**相关子查询**(EXISTS/IN 引用外层列)与
   FROM 派生表、CREATE VIEW、COUNT(DISTINCT)、TPC-H 数据加载(dbgen tbl 导入)、

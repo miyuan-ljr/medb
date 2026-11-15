@@ -118,8 +118,30 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
   **依赖 `scan_memtable` 输出墓碑**(`(key, seq, None)`,storage 专用合并),
   否则删除行无法从 segment 块剔除(v2 踩过:共用 `merge_visible_per_key`
   把墓碑整键隐藏,DELETE 后 segment 块多出幽灵行)。
-- 后续:二级索引建在 segment 上(`BTreeMap<编码值, BTreeSet<row_key>>`,
-  每段一棵索引树);字典/RLE 编码;增量 delta 行 + 后台 merge。
+- 后续:字典/RLE 编码;增量 delta 行 + 后台 merge。
+
+### 3.8 二级索引(建在列存 segment 上)
+- **存储**:每 segment × 每索引列一棵 B 树(`BTreeMap<memcomparable编码值,
+  行键列表>`,行键升序;`columnar_index.rs`,文件 `MEDBIDX1`,命名
+  `{tid}.{gen:05}.{max_seq}.{col_idx}.idx` 与 segment 同前缀 → 旧代清理 /
+  ALTER 失效 / DROP 清理与 segment 共用同一套文件规则)。NULL 不入树
+  (三值逻辑下 NULL 永不命中比较)。
+- **生命周期**:flush 钩子随段重建(当前 catalog 登记的每列);CREATE INDEX
+  时段已存在 → 立即建树,否则下次 flush 补(期间索引查询内部全扫回退);
+  ALTER 删段时索引文件一并删除。索引树解码缓存按 (tid, col) 持有,gen 不
+  匹配即失效重读。
+- **查询路径**(`scan_index`):索引树范围取候选行键(编码保序 → 字节区间
+  精确覆盖标量区间,开/闭按谓词传递)→ 与 memtable delta 合并:候选键被
+  覆盖取 memtable 新版本、墓碑剔除;**delta 中的行不在树里,必须显式按
+  范围过滤**(v1 踩过:不过滤 → memtable 任意行泄漏进索引查询结果)。
+  无段/索引文件缺失/损坏 → 全表行存 + 范围过滤(等价慢路径,正确性不变)。
+- **DDL**:`CREATE INDEX [IF NOT EXISTS] name ON t (col)` / `DROP INDEX [IF EXISTS]`
+  / `ALTER TABLE t DROP INDEX col`。v1 单列、非唯一(UNIQUE/多列/表达式明确
+  报错);索引名跨表唯一(歧义报错);`TableSchema.indexes`(serde default,
+  旧 catalog 前向兼容),版本 +1 持久化。
+- **已知边界**:UPDATE/DELETE 的目标行定位不走索引(仍全扫;见路线图);
+  事务内读不走索引门控(与 AP 列存同一 gating);PK 列点查仍走全扫 ——
+  LSM 里的 PK 唯一索引(LSM 键空间)尚未接入读取路径,见路线图。
 
 ## 4. 向量化执行
 
@@ -299,6 +321,21 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 计划树自顶向下:Limit → Sort → Project → Aggregate → HashJoin → Scan,
 每节点带估行数 / 下推过滤 / 连接键 / 物化侧标签。planner 以 `ExplNode` 树
 累积、`flatten_expl` 摊平;LIMIT 在外层包装时整体缩进一级。
+索引命中时扫描标签为 `IndexScan <表> via <索引名> col=<列> rows≈<估行>
+range: [lo, hi)`(开/闭按谓词;EXPLAIN 是观察索引选择的窗口)。
+
+### 5.5.4b 二级索引的代价选择(`optimizer::plan_index_range`)
+
+- **提取**:下推合取项(表内局部下标)中 `Column <cmp> Literal`(或反向,
+  op 归一)且**同一列**;字面量类型必须与列一致(跨类型交普通下推);
+  NULL 字面量不入索引(树中无 NULL);多条件收紧边界(同值取更紧开闭)。
+- **估价**:等值 = 1/NDV;范围 = min/max 线性插值(谓词边界越过统计边界
+  → 覆盖全部 1.0 或近 0 —— v1 踩过:区间外被夹到 0.001,全表范围误选索引);
+  再乘非空占比。命中条件的估行 = 选择性 × row_count。
+- **决策**:catalog 登记该列索引 + 数据源支持索引访问(非事务读)+
+  估行 × `INDEX_COST_FACTOR(4.0)` < 全表行数 → IndexScan;命中合取项从
+  下推集合移除,其余作残余谓词在 IndexScanExec 内物化后向量化过滤。
+- **确定性**:统计缺失/无索引列 → 一律普通扫描(行为可预期,EXPLAIN 可证)。
 
 #### 5.5.5c 投影下推(解码剪枝)
 

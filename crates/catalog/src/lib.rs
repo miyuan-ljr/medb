@@ -112,6 +112,7 @@ mod tests {
             name: name.into(),
             columns: vec![ColumnDesc::new("v", DataType::Int64, true)],
             primary_key: Vec::new(),
+            indexes: Vec::new(),
             version: 1,
         }
     }

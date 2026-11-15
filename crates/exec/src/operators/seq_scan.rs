@@ -83,6 +83,30 @@ pub trait QueryDataSource: Send + Sync {
         let _ = table;
         Ok(None)
     }
+
+    /// 数据源当前是否支持 [`Self::scan_index`](索引访问路径)。计划器据此
+    /// 决定是否生成 IndexScan(不支持时走普通扫描 + 谓词下推)。
+    fn supports_index_scan(&self) -> bool {
+        false
+    }
+
+    /// **二级索引访问**:返回索引列落在 [lo, hi](值, 是否闭)内的行,
+    /// 含 memtable 增量(更新取新版本、删除剔除),并与 segment 行去重。
+    /// `needed` 与 scan_table_filtered 同约定(空 = 全列;未标记列 Null 占位)。
+    /// 默认不支持(计划器先经 [`Self::supports_index_scan`] 探测)。
+    fn scan_index(
+        &self,
+        table: &TableSchema,
+        col_idx: usize,
+        lo: Option<(common::types::ScalarValue, bool)>,
+        hi: Option<(common::types::ScalarValue, bool)>,
+        needed: &[bool],
+    ) -> Result<Vec<Row>> {
+        let _ = (table, col_idx, lo, hi, needed);
+        Err(common::error::Error::not_supported(
+            "index scan not supported by this data source",
+        ))
+    }
 }
 
 pub struct SeqScanExec {
@@ -264,6 +288,7 @@ mod tests {
                 ColumnDesc::new("b", DataType::Utf8, true),
             ],
             primary_key: Vec::new(),
+            indexes: Vec::new(),
             version: 1,
         }
     }

@@ -152,6 +152,18 @@ pub enum StatementPlan {
     DropTable {
         name: String,
     },
+    /// CREATE INDEX(单列、非唯一;索引树随列存 segment 重建)。
+    CreateIndex {
+        table: String,
+        name: String,
+        column: String,
+        if_not_exists: bool,
+    },
+    /// DROP INDEX(索引名全局唯一;歧义报错)。
+    DropIndex {
+        name: String,
+        if_exists: bool,
+    },
     /// ANALYZE [TABLE] <name>:全量(或抽样)重建表统计。
     Analyze {
         name: Option<String>,
@@ -208,6 +220,12 @@ pub fn plan_statement(stmt: &Statement, ctx: &PlanContext<'_>) -> Result<Stateme
             let [op] = alter.operations.as_slice() else {
                 return Err(Error::not_supported("multiple operations in ALTER TABLE"));
             };
+            if let sqlparser::ast::AlterTableOperation::DropIndex { name } = op {
+                return Ok(StatementPlan::DropIndex {
+                    name: name.value.clone(),
+                    if_exists: false,
+                });
+            }
             let sqlparser::ast::AlterTableOperation::AddColumn {
                 column_def,
                 if_not_exists,
@@ -238,6 +256,47 @@ pub fn plan_statement(stmt: &Statement, ctx: &PlanContext<'_>) -> Result<Stateme
                 name: object_name_to_string(&alter.name)?,
                 column: ColumnDesc::new(column_def.name.value.clone(), ty, nullable),
                 if_not_exists: *if_not_exists,
+            })
+        }
+        Statement::CreateIndex(ci) => {
+            if ci.unique {
+                return Err(Error::not_supported(
+                    "CREATE UNIQUE INDEX (v1 supports non-unique only)",
+                ));
+            }
+            if ci.columns.len() != 1 {
+                return Err(Error::not_supported("multi-column CREATE INDEX"));
+            }
+            let Some(name) = &ci.name else {
+                return Err(Error::not_supported("unnamed CREATE INDEX (provide a name)"));
+            };
+            let column = match &ci.columns[0].column.expr {
+                sqlparser::ast::Expr::Identifier(ident) => ident.value.clone(),
+                other => {
+                    return Err(Error::not_supported(format!(
+                        "index on expression: {other}"
+                    )))
+                }
+            };
+            Ok(StatementPlan::CreateIndex {
+                table: object_name_to_string(&ci.table_name)?,
+                name: object_name_to_string(name)?,
+                column,
+                if_not_exists: ci.if_not_exists,
+            })
+        }
+        Statement::Drop {
+            object_type: sqlparser::ast::ObjectType::Index,
+            if_exists,
+            names,
+            ..
+        } => {
+            if names.len() != 1 {
+                return Err(Error::not_supported("DROP INDEX with multiple names"));
+            }
+            Ok(StatementPlan::DropIndex {
+                name: object_name_to_string(&names[0])?,
+                if_exists: *if_exists,
             })
         }
         Statement::Drop {
@@ -1139,17 +1198,20 @@ fn flush_group(
         if k == 0 {
             // 首表扫描:列 = 该表局部下标(偏移 = offsets[node]);
             // 后续连接的累计侧表达式按 st.col_shift 重基
-            st.exec = Some(table_scan(
+            let (exec, idx_label) = table_scan(
                 &em.steps[node],
                 &em.scan_preds[node],
                 em.offsets[node],
                 &em.needed[node],
                 em.plan_ctx,
-            )?);
+            )?;
+            st.exec = Some(exec);
             st.cur_order = vec![node];
             st.col_shift = em.offsets[node];
             st.est_rows = plan.est_rows[0];
-            st.expl = Some(ExplNode::leaf(scan_label(em, node, base_of(em, node))));
+            st.expl = Some(ExplNode::leaf(
+                idx_label.unwrap_or_else(|| scan_label(em, node, base_of(em, node))),
+            ));
             continue;
         }
         let step = &plan.steps[k - 1];
@@ -1319,7 +1381,7 @@ fn emit_inner_join(
         .map(|&f| em.input_schema[f].clone())
         .collect();
     let (probe_exec, build_exec, probe_schema, build_schema, children) = if build_accumulated {
-        let probe = table_scan(
+        let (probe, probe_label) = table_scan(
             &em.steps[t],
             &em.scan_preds[t],
             t_offset,
@@ -1328,15 +1390,17 @@ fn emit_inner_join(
         )?;
         let build = st.exec.take().expect("accumulated pipeline");
         let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
+        let probe_label =
+            probe_label.unwrap_or_else(|| scan_label(em, t, base_of(em, t)));
         (
             probe,
             build,
             em.steps[t].schema.columns.clone(),
             prefix_schema,
-            vec![ExplNode::leaf(scan_label(em, t, base_of(em, t))), expl_prev],
+            vec![ExplNode::leaf(probe_label), expl_prev],
         )
     } else {
-        let build = table_scan(
+        let (build, build_label) = table_scan(
             &em.steps[t],
             &em.scan_preds[t],
             t_offset,
@@ -1345,12 +1409,14 @@ fn emit_inner_join(
         )?;
         let probe = st.exec.take().expect("accumulated pipeline");
         let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
+        let build_label =
+            build_label.unwrap_or_else(|| scan_label(em, t, base_of(em, t)));
         (
             probe,
             build,
             prefix_schema,
             em.steps[t].schema.columns.clone(),
-            vec![expl_prev, ExplNode::leaf(scan_label(em, t, base_of(em, t)))],
+            vec![expl_prev, ExplNode::leaf(build_label)],
         )
     };
 
@@ -1427,7 +1493,8 @@ fn emit_left_join(
         .iter()
         .map(|&f| em.input_schema[f].clone())
         .collect();
-    let build = table_scan(&em.steps[k], &[], em.offsets[k], &em.needed[k], em.plan_ctx)?;
+    let (build, _build_label) =
+        table_scan(&em.steps[k], &[], em.offsets[k], &em.needed[k], em.plan_ctx)?;
 
     let mut residual: Vec<Expr> = Vec::new();
     let mut residual_sql: Vec<String> = Vec::new();
@@ -1640,31 +1707,89 @@ fn plan_from(from: &[TableWithJoins], ctx: &PlanContext<'_>) -> Result<Vec<Relat
 }
 
 /// 单表扫描(可选下推过滤,列下标重基到表内局部)。
+/// 返回 (执行器, Option<IndexScan 标签>):索引命中时标签替代普通 Scan 标签。
 fn table_scan(
     step: &RelationStep,
     preds: &[Expr],
     offset: usize,
     needed: &[bool],
     ctx: &PlanContext<'_>,
-) -> Result<BoxedExecutor> {
+) -> Result<(BoxedExecutor, Option<String>)> {
     // 谓词下推:随解码过滤(列存路径则在列块上求值),不再叠加 FilterExec
-    let pushdown = if preds.is_empty() {
-        None
-    } else {
-        let rebased = preds
-            .iter()
-            .map(|p| rebase_columns(p.clone(), offset))
-            .collect::<Result<Vec<_>>>()?;
-        combine_and(rebased)
-    };
+    let rebased: Vec<Expr> = preds
+        .iter()
+        .map(|p| rebase_columns(p.clone(), offset))
+        .collect::<Result<Vec<_>>>()?;
     // 投影剪枝:needed 全 true 时不启用(decode 路径等价)
     let all_true = needed.iter().all(|b| *b);
-    let needed = if all_true {
-        None
-    } else {
-        Some(needed.to_vec())
-    };
-    let exec: BoxedExecutor = match (pushdown, needed) {
+    let needed_opt = if all_true { None } else { Some(needed.to_vec()) };
+
+    // 二级索引决策:数据源支持 + catalog 登记该列索引 + 统计估算命中行
+    // × 索引行代价 < 全扫行代价 → IndexScan(命中的合取项从下推移除)。
+    if ctx.data.supports_index_scan() && !rebased.is_empty() {
+        let stats = ctx.data.table_stats(&step.schema);
+        if let Some(ip) =
+            optimizer::plan_index_range(&rebased, &step.schema, stats.as_deref())
+        {
+            let total = stats.as_ref().map(|s| s.row_count).unwrap_or(0) as f64;
+            let est = ip.est_selectivity * total;
+            if total > 0.0 && est * optimizer::INDEX_COST_FACTOR < total {
+                let residual: Vec<Expr> = rebased
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !ip.matched.contains(i))
+                    .map(|(_, e)| e.clone())
+                    .collect();
+                let exec: BoxedExecutor = Box::new(
+                    exec::operators::index_scan::IndexScanExec::new(
+                        ctx.data.clone(),
+                        step.schema.clone(),
+                        ip.col_idx,
+                        ip.lo.clone(),
+                        ip.hi.clone(),
+                        combine_and(residual),
+                        needed_opt,
+                    ),
+                );
+                let mut range = String::from("(-∞, +∞)");
+                match (&ip.lo, &ip.hi) {
+                    (Some((l, li)), Some((h, hi))) => {
+                        range = format!(
+                            "{}{}, {}{}",
+                            if *li { "[" } else { "(" },
+                            l,
+                            h,
+                            if *hi { "]" } else { ")" }
+                        );
+                    }
+                    (Some((l, li)), None) => {
+                        range = format!("{}{}, +∞)", if *li { "[" } else { "(" }, l);
+                    }
+                    (None, Some((h, hi))) => {
+                        range = format!("(-∞, {}{}", h, if *hi { "]" } else { ")" });
+                    }
+                    _ => {}
+                }
+                let label = format!(
+                    "IndexScan {} via {} col={} rows≈{} range: {}",
+                    step.alias,
+                    step.schema
+                        .indexes
+                        .iter()
+                        .find(|ix| ix.column == step.schema.columns[ip.col_idx].name)
+                        .map(|ix| ix.name.as_str())
+                        .unwrap_or("?"),
+                    step.schema.columns[ip.col_idx].name,
+                    fmt_est(est.max(1.0)),
+                    range
+                );
+                return Ok((exec, Some(label)));
+            }
+        }
+    }
+
+    let pushdown = if rebased.is_empty() { None } else { combine_and(rebased) };
+    let exec: BoxedExecutor = match (pushdown, needed_opt) {
         (Some(pred), n) => Box::new(SeqScanExec::with_projection(
             ctx.data.clone(),
             step.schema.clone(),
@@ -1678,7 +1803,7 @@ fn table_scan(
             n,
         )),
     };
-    Ok(exec)
+    Ok((exec, None))
 }
 
 /// 宽度前缀和:表位置 k 的列占扁平区间 [offsets[k], offsets[k+1])。
@@ -2448,6 +2573,7 @@ fn plan_create_table(create: &sqlparser::ast::CreateTable) -> Result<StatementPl
             columns,
             primary_key,
             version: 1,
+            indexes: Vec::new(),
         },
     })
 }
@@ -3026,6 +3152,7 @@ mod tests {
                 ColumnDesc::new("score", DataType::Float64, true),
             ],
             primary_key: Vec::new(),
+            indexes: Vec::new(),
             version: 1,
         }
     }
@@ -3538,6 +3665,7 @@ mod tests {
                 ColumnDesc::new("l_nation".to_string(), DataType::Utf8, false),
             ],
             primary_key: Vec::new(),
+            indexes: Vec::new(),
             version: 1,
         };
         catalog.create_table(schema).unwrap();
