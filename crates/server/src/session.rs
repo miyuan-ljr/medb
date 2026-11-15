@@ -78,12 +78,24 @@ impl Session {
         let statements = parse_statements(sql)?;
         let mut outcomes = Vec::with_capacity(statements.len());
         for stmt in &statements {
-            outcomes.push(self.execute_one(stmt)?);
+            outcomes.push(self.execute_one(stmt, &[])?);
         }
         Ok(outcomes)
     }
 
-    fn execute_one(&mut self, stmt: &Statement) -> Result<Outcome> {
+    /// 执行带绑定参数的单条语句(extended query protocol 的 Bind 后调用)。
+    /// 占位符 `$n` 在计划期替换为绑定值字面量(类型保真)。
+    pub fn execute_prepared(&mut self, sql: &str, params: &[ScalarValue]) -> Result<Outcome> {
+        let statements = parse_statements(sql)?;
+        if statements.len() != 1 {
+            return Err(Error::sql(
+                "extended query must contain exactly one statement",
+            ));
+        }
+        self.execute_one(&statements.into_iter().next().expect("checked above"), params)
+    }
+
+    fn execute_one(&mut self, stmt: &Statement, params: &[ScalarValue]) -> Result<Outcome> {
         match stmt {
             Statement::StartTransaction { .. } => {
                 if self.txn.is_some() {
@@ -130,6 +142,7 @@ impl Session {
                     catalog: &*catalog,
                     data,
                     ctes: &[],
+                    params,
                 };
                 let plan = plan_statement(stmt, &ctx)?;
                 self.engine.execute_plan(&mut sctx, plan)
@@ -144,6 +157,7 @@ impl Session {
                     catalog: &*catalog,
                     data,
                     ctes: &[],
+                    params,
                 };
                 let plan = plan_statement(stmt, &ctx)?;
                 self.engine.execute_plan(&mut sctx, plan)

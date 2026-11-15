@@ -1151,7 +1151,7 @@ impl Engine {
         let statements = parse_statements(sql)?;
         let mut outcomes = Vec::with_capacity(statements.len());
         for stmt in &statements {
-            let plan = self.plan_statement_with_snapshot(stmt)?;
+            let plan = self.plan_statement_with_snapshot(stmt, &[])?;
             let mut sctx = self.begin_autocommit();
             outcomes.push(self.execute_plan(&mut sctx, plan)?);
         }
@@ -1161,6 +1161,7 @@ impl Engine {
     fn plan_statement_with_snapshot(
         &self,
         stmt: &sqlparser::ast::Statement,
+        params: &[ScalarValue],
     ) -> Result<StatementPlan> {
         let overlay: Arc<std::collections::BTreeMap<_, _>> = Arc::new(Default::default());
         let ctx = PlanContext {
@@ -1168,8 +1169,26 @@ impl Engine {
             catalog: &*self.catalog,
             data: self.data_source_for(self.lsm.last_sequence(), overlay, true),
             ctes: &[],
+            params,
         };
         plan_statement(stmt, &ctx)
+    }
+
+    /// 计划语句并返回查询输出列 schema(extended protocol Describe 用;
+    /// 不执行)。占位符以 NULL 绑定 —— 列名/类型与参数取值无关。
+    /// 仅查询语句产出 schema;其余(DML/DDL)返回空(PG 同:无行描述)。
+    /// 注意 INSERT VALUES 的计划期求值会用 NULL 触发 NOT NULL 检查,
+    /// 绝不可在 Describe 路径上计划写语句。
+    pub fn describe(&self, sql: &str, n_params: usize) -> Result<Vec<ColumnDesc>> {
+        let stmt = sql::parser::parse_single(sql)?;
+        if !matches!(stmt, sqlparser::ast::Statement::Query(_)) {
+            return Ok(Vec::new());
+        }
+        let params = vec![ScalarValue::Null; n_params];
+        match self.plan_statement_with_snapshot(&stmt, &params)? {
+            StatementPlan::Query(pq) => Ok(pq.schema),
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// 在语句上下文中执行已计划语句。

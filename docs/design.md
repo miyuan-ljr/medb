@@ -235,13 +235,29 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
   - 标量 `(SELECT ...)` → 必须恰 1 行 × 1 列 → Literal;
   - `IN (SELECT ...)` → 1 列 → InList 值集合;
   - `[NOT] EXISTS` → 布尔字面量。
-  **相关引用直接报错**:子查询以空 scope 计划,引用外层别名/列会得到
-  "unknown table alias / column not found"(相关子查询 decorrelation 见路线图)。
-  局限:IN 子查询结果整体物化,大结果集的半连接(semi-join)见路线图。
+- **相关子查询去相关**(`decorrelate.rs`,TPC-H Q2/Q4/Q17/Q20/Q21):
+  WHERE 合取项里识别相关 EXISTS / IN / 标量比较子查询,摘下改写为流水线上的连接;
+  合取项按引用表分类(内表局部 / 外表独占 / 相关等值 / 相关残余):
+  - `EXISTS` / `IN` → `HashSemiJoinExec`(anti = NOT EXISTS):子查询剥离相关
+    谓词后按非相关路径规划为构建侧;相关等值成哈希键(外表侧 = 探测键,
+    内表侧列**追加进子查询输出**并重映射);相关残余(如 `l3.l_suppkey <>
+    l1.l_suppkey`)在"探测列 ++ 构建列"拼接块上向量化求值。anti 保留零命中
+    探测行(NULL 键同),与 SQL 相关谓词三值逻辑一致。
+  - 等值相关**标量聚合**(`x < (SELECT AVG(y) ... WHERE t.k = outer.k)`)→
+    分组拉升:相关等值的内表侧全部注入 GROUP BY,聚合值按组与外层相关绑定
+    一一对应 → `HashJoinExec(LeftOuter)` 左外连接(无匹配组 = 原子查询空集
+    → NULL → 谓词 false);值列挂合成 `__sq` 表(真实表之后),比较谓词
+    改写为 `__sq` 列引用、在包装应用后过滤。MIN/MAX/SUM/AVG 提升;
+    **COUNT 拒绝**(空组 0 vs NULL 语义不同)。
+  - 内表优先的标识符解析(SQL 作用域规则;同名别名如 Q17 的双层 lineitem
+    不冲突);子查询 FROM 限物理表;提升的正确性前提 = 全部相关等值成组键。
+  - 非相关子查询(含内部更深的相关子查询)仍走计划期求值路径。
 - **顺带修复的存量 bug**:HAVING 引入投影中没有的聚合(如
   `HAVING SUM(x) > (SELECT ...)`)时,agg 输出 schema 在 HAVING 改写前计算 →
   谓词列下标越界。修复:HAVING 改写提前到 AggHashExec 构建**之前**,改写后
-  重算 `project_input_schema`。
+  重算 `project_input_schema`。另一处:**DP 连接发射的累计侧键**此前按常数
+  `acc_shift` 重基,DP 选出跳表累积集(如先 {0,2} 再接 1)时位置错位
+  (Q2 触发越界崩溃)→ 改为按规范表序布局逐表定位(`rebase_to_layout`)。
 
 ## 4.5 表数据布局与 Engine(M2)
 
@@ -264,9 +280,21 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 
 ## 5. 服务端
 
-- pgwire 0.42:`PgWireServerHandlers` 只覆写 `simple_query_handler`(返回
-  `Arc<Self>`),启动用 `NoopStartupHandler` 免认证;accept loop 每连接
-  `process_socket`。注意 0.42 没有 `PgWireServer` 结构,直接用 `process_socket`。
+- pgwire 0.42:`PgWireServerHandlers` 覆写 `simple_query_handler` 与
+  `extended_query_handler`(均返回 `Arc<Self>`),启动用 `NoopStartupHandler`
+  免认证;accept loop 每连接 `process_socket`。注意 0.42 没有 `PgWireServer`
+  结构,直接用 `process_socket`。
+- **extended query protocol**(Parse/Bind/Execute/Describe):`MedbPrepared`
+  只存原始 SQL(Parse 期仅语法预检;查询计划推迟到 Bind,计划缓存见路线图)。
+  `QueryParser` 实现在 `Handlers` 上:`get_parameter_types` 以 SQL 文本扫描
+  `$n` 计数(字符串字面量外),声明 TEXT;`get_result_schema` 以 **NULL 绑定**
+  计划查询推导列 schema(**只对 SELECT/WITH** —— INSERT VALUES 的计划期求值
+  会用 NULL 触发 NOT NULL 约束,绝不可在 Describe 路径计划写语句;DML/DDL
+  返回空 schema)。`do_query`:参数按 TEXT 解码为文本后**形状推断**为标量
+  (整数/浮点/布尔/日期/字符串)→ `Session::execute_prepared` → 占位符在
+  `plan_expr` 替换为绑定值 Literal(`PlanContext.params`,子查询/CTE 上下文
+  透传;`?` 占位符不支持,统一 PG 风格 `$1..$n`)。psql `\bind 'a' 'b'`、
+  PG 驱动 PreparedStatement 即走此链路。
 - sqlparser 0.64 AST 适配要点(升级时先对照):
   `Query.limit_clause: Option<LimitClause>`(枚举,两种语法形状);
   `SelectItem::ExprWithAliases` 与 `QualifiedWildcard(SelectItemQualifiedWildcardKind)`;

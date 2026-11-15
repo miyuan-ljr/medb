@@ -2,19 +2,24 @@
 //!
 //! 支持一条 Query 消息里带多条语句(分号分隔),逐条产出响应;
 //! 任一语句失败即返回 ErrorResponse,连接保持可用。
-//! extended query protocol(预编译语句)未实现,回退 pgwire 默认错误。
+//! extended query protocol(Parse/Bind/Execute)经占位符 `$n` 绑定参数:
+//! 计划期把占位符替换为绑定值字面量(类型保真);Describe 以 NULL 绑定
+//! 推导输出列 schema。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::error::ErrorCode;
 use common::schema::{ColumnDesc, Row};
-use common::types::DataType;
+use common::types::{DataType, ScalarValue};
 use futures::Sink;
 use futures::stream;
 use parking_lot::Mutex;
-use pgwire::api::query::SimpleQueryHandler;
+use pgwire::api::portal::Portal;
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::stmt::QueryParser;
+use pgwire::api::portal::Format;
 use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult, SEVERITY_ERROR};
 use pgwire::messages::PgWireBackendMessage;
@@ -42,6 +47,10 @@ impl Handlers {
 
 impl PgWireServerHandlers for Handlers {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+        Arc::new(self.clone())
+    }
+
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
         Arc::new(self.clone())
     }
 }
@@ -141,4 +150,200 @@ fn error_to_info(err: &common::error::Error) -> ErrorInfo {
         _ => "XX000",                                                   // internal_error
     };
     ErrorInfo::new(SEVERITY_ERROR.to_owned(), code.to_owned(), err.to_string())
+}
+
+// ---------- extended query protocol ----------
+
+/// 预编译语句:原始 SQL(Parse 期只做语法检查;占位符在 Bind 后的计划期解析)。
+#[derive(Clone)]
+pub struct MedbPrepared {
+    sql: String,
+}
+
+fn user_error(code: &str, message: String) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        SEVERITY_ERROR.to_owned(),
+        code.to_owned(),
+        message,
+    )))
+}
+
+/// 统计 SQL 文本中的 `$n` 占位符数(字符串字面量与注释之外取最大序号)。
+fn count_placeholders(sql: &str) -> usize {
+    let mut max = 0usize;
+    let mut chars = sql.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => in_string = !in_string,
+            '$' if !in_string => {
+                let mut num = String::new();
+                while chars.peek_if_ascii_digit() {
+                    num.push(chars.next().expect("peeked"));
+                }
+                if !num.is_empty() {
+                    max = max.max(num.parse::<usize>().unwrap_or(0));
+                }
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
+trait PeekDigits {
+    fn peek_if_ascii_digit(&mut self) -> bool;
+}
+
+impl<I: Iterator<Item = char>> PeekDigits for std::iter::Peekable<I> {
+    fn peek_if_ascii_digit(&mut self) -> bool {
+        self.peek().is_some_and(|c| c.is_ascii_digit())
+    }
+}
+
+/// 文本参数值 → 标量(类型推断:整数/浮点/布尔/日期/字符串)。
+/// 协议参数无声明类型时的实用近似;声明类型推断(DESCRIBE 反推)见路线图。
+fn guess_scalar(v: Option<String>) -> ScalarValue {
+    let Some(t) = v else {
+        return ScalarValue::Null;
+    };
+    if let Ok(i) = t.parse::<i64>() {
+        return ScalarValue::Int64(i);
+    }
+    if let Ok(f) = t.parse::<f64>() {
+        return ScalarValue::Float64(f);
+    }
+    match t.as_str() {
+        "true" | "false" => return ScalarValue::Boolean(t == "true"),
+        _ => {}
+    }
+    if looks_like_date(&t) {
+        if let Ok(d) = common::types::parse_date_text(&t) {
+            return d;
+        }
+    }
+    ScalarValue::Utf8(t)
+}
+
+/// YYYY-MM-DD 形状(占位符类型推断用)。
+fn looks_like_date(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| {
+            i == 4 || i == 7 || c.is_ascii_digit()
+        })
+}
+
+#[async_trait]
+impl QueryParser for Handlers {
+    type Statement = MedbPrepared;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Option<MedbPrepared>>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let trimmed = sql.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        // 语法预检(参数绑定推迟到计划期)
+        sql::parser::parse_statements(trimmed).map_err(|e| {
+            user_error("42601".into(), format!("parse failed: {e}"))
+        })?;
+        Ok(Some(MedbPrepared {
+            sql: trimmed.to_owned(),
+        }))
+    }
+
+    fn get_parameter_types(&self, stmt: &MedbPrepared) -> PgWireResult<Vec<Type>> {
+        // 参数实际类型在计划期由绑定值决定;Describe 声明 TEXT 占位
+        Ok((0..count_placeholders(&stmt.sql)).map(|_| Type::TEXT).collect())
+    }
+
+    fn get_result_schema(
+        &self,
+        stmt: &MedbPrepared,
+        _column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        let schema = self.state.engine.describe(&stmt.sql, count_placeholders(&stmt.sql)).map_err(|e| {
+            user_error("42601".into(), e.to_string())
+        })?;
+        Ok(fields_of(&schema))
+    }
+}
+
+/// 列 schema → Describe 响应字段(文本格式)。
+fn fields_of(schema: &[ColumnDesc]) -> Vec<FieldInfo> {
+    schema
+        .iter()
+        .map(|c| {
+            FieldInfo::new(
+                c.name.clone(),
+                None,
+                None,
+                pg_type(c.ty.clone()),
+                FieldFormat::Text,
+            )
+        })
+        .collect()
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for Handlers {
+    type Statement = MedbPrepared;
+    type QueryParser = Handlers;
+
+    fn query_parser(&self) -> Arc<Handlers> {
+        Arc::new(self.clone())
+    }
+
+    async fn do_query<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<MedbPrepared>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let session = client
+            .session_extensions()
+            .get_or_insert_with(|| Mutex::new(Session::new(self.state.engine.clone())));
+        let mut session = session.lock();
+
+        let n = portal.parameter_len();
+        let mut params = Vec::with_capacity(n);
+        for i in 0..n {
+            let text: Option<String> = portal.parameter(i, &Type::TEXT)?;
+            params.push(guess_scalar(text));
+        }
+        let sql = portal.statement.statement.sql.clone();
+        match session.execute_prepared(&sql, &params) {
+            Ok(outcome) => match outcome {
+                Outcome::Query { schema, rows } => {
+                    Ok(Response::Query(query_response(schema, rows)?))
+                }
+                Outcome::Tag { prefix, rows } => {
+                    let mut tag = Tag::new(&prefix);
+                    if let Some(n) = rows {
+                        tag = tag.with_rows(n as usize);
+                    }
+                    Ok(Response::Execution(tag))
+                }
+            },
+            Err(err) => {
+                warn!(error = %err, "statement failed");
+                Ok(Response::Error(Box::new(error_to_info(&err))))
+            }
+        }
+    }
 }

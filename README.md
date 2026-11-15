@@ -28,7 +28,7 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 ```text
                      psql / PG 驱动
-                          │ PG wire (simple query)
+                          │ PG wire (simple + extended query)
                  ┌────────▼────────┐
                  │  server         │  会话/协议/错误映射(SQLSTATE)
                  ├─────────────────┤
@@ -104,7 +104,13 @@ postgres=# DELETE FROM users WHERE id = 1;
 - **事务(READ COMMITTED)**:BEGIN/COMMIT/ROLLBACK、会话写缓冲 + 快照 overlay
   (读己之写)、COMMIT 原子落盘、事务内 DDL 拒绝、多会话隔离测试
 - PG 协议端到端:RowDescription/DataRow/CommandComplete/ErrorResponse、
-  INSERT 0 n / UPDATE n / DELETE n / CREATE TABLE / BEGIN / COMMIT 命令标签
+  INSERT 0 n / UPDATE n / DELETE n / CREATE TABLE / BEGIN / COMMIT 命令标签;
+  **extended query protocol**(Parse/Bind/Execute/Describe):占位符 `$n`
+  绑定参数(计划期替换、类型保真),psql `\bind` / PG 驱动 PreparedStatement 可用
+- **相关子查询去相关**(`sql/src/decorrelate.rs`):EXISTS / IN → 半/反半连接
+  (`HashSemiJoinExec`;非等值相关谓词为拼接块匹配条件),等值相关的标量聚合
+  → 分组拉升 + 左外连接;TPC-H Q2/Q4/Q17/Q20/Q21 全覆盖(`tools/coverage_check.sh`
+  22 条全 PASS,与 PG 逐行对拍)
 - 列存 segment 文件(`columnar_file`):每表一份 `columnar/{table_id}.{gen}.{max_seq}.seg`,
   列主序 + codec 编码 + CRC32 + tmp/rename 原子替换;只覆盖 SST 数据,
   memtable 增量在查询时转向量化(独立 delta 块 + 影子键剔除,segment 缓存
@@ -215,9 +221,8 @@ postgres=# DELETE FROM users WHERE id = 1;
 - **M3 HTAP 落地剩余**:索引增强(UNIQUE 约束与写路径校验、多列复合索引、
   IN 列表走索引、UPDATE/DELETE 目标定位走索引、LSM PK 唯一索引接入点查)、
   段级列剪枝、字典/RLE 编码、增量 delta 行 + 后台 merge
-- **M2/M4/M5**:RIGHT/FULL JOIN、**相关子查询**(EXISTS/IN 引用外层列)与
-  FROM 派生表、CREATE VIEW、COUNT(DISTINCT)、TPC-H 数据加载(dbgen tbl 导入)、
-  extended query protocol(psql \d)、块缓存、
+- **M2/M4/M5**:RIGHT/FULL JOIN、CREATE VIEW、TPC-H 数据加载(dbgen tbl 导入)、
+  扩展协议的类型声明推断(DESCRIBE 反推参数类型)与语句计划缓存、块缓存、
   分级压缩、manifest 落盘、流式归并扫描、系统视图、DISTINCT、
   直方图/多列统计、连接代价标定(benchmark)
 
@@ -227,17 +232,20 @@ postgres=# DELETE FROM users WHERE id = 1;
 - 压缩是全量合并(单 L1 文件),无分级限流。
 - manifest 不落盘,靠 WAL + SST 文件名重建(单进程假设)。
 - And/Or 的 null 按 false 处理(三值逻辑 TODO)。
-- extended query protocol 未接(psql 交互查询走 simple 协议不受影响)。
+- 扩展协议绑定参数的取值类型由文本形状推断(整数/浮点/布尔/日期/字符串),
+  Describe 以 TEXT 声明参数类型;`?` 占位符不支持(统一 PG 风格 `$1..$n`)。
 - 事务无写冲突检测(后提交者覆盖,RC 语义下允许);无保存点;DDL 不能在事务内。
-- ORDER BY / 聚合为全量物化后排序(无外部排序/top-N 堆优化)。
-- HashJoin 构建侧整批物化;代价模型未标定(权重为启发值);统计为
-  单列 NDV/min-max(无直方图、无相关性);NDV 写路径不增量(靠 ANALYZE)。
+- ORDER BY / 聚合为全量物化后排序(Sort 带 LIMIT 提示时走 top-N 堆)。
+- HashJoin 构建侧整批物化(相关子查询的半/反半连接同);代价模型未标定
+  (权重为启发值);统计为单列 NDV/min-max(无直方图、无相关性);NDV 写路径
+  不增量(靠 ANALYZE)。
 - DECIMAL 收敛为 Float64(TPC-H 数值列够用,精确小数见路线图)。
-- CASE WHEN 仅搜索式(`CASE WHEN cond THEN ...`),简单式 `CASE <operand>` 拒绝;
-  子查询为**非相关**(计划期执行一次);EXISTS 不提前终止于首条匹配但仍按批
-  拉取(实现为"取到首个非空批即停")。
-- IN 的成员判定按标量精确相等(Int64 与 Float64 不跨类型匹配);IN 子查询结果
-  整体物化(大结果集走半连接见路线图)。
+- CASE WHEN 仅搜索式(`CASE WHEN cond THEN ...`),简单式 `CASE <operand>` 拒绝。
+- **相关子查询去相关**:EXISTS / IN → 半/反半连接,等值相关的标量聚合 →
+  分组拉升 + 左外连接(MIN/MAX/SUM/AVG;COUNT 空组语义不同,明确拒绝);
+  非相关子查询仍走计划期求值。相关子查询的残余条件(非等值相关谓词)在
+  半连接拼接块上求值。
+- IN 的成员判定按标量精确相等(Int64 与 Float64 不跨类型匹配)。
 
 ## 开发
 

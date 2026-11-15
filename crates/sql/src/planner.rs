@@ -44,6 +44,9 @@ pub struct PlanContext<'a> {
     /// 可见的 WITH CTE(名 → 体)。对子查询/派生表同样可见(Q15 形状);
     /// 非递归:CTE 体计划时只看到它之前的 CTE。
     pub ctes: &'a [(String, Query)],
+    /// 绑定参数($1..$n;simple query 恒为空)。占位符在 plan_expr 求值时
+    /// 替换为绑定值字面量 —— 类型保真(日期/数值不降级为文本)。
+    pub params: &'a [ScalarValue],
 }
 
 /// FROM 作用域:多表(别名, schema)的有序集合,列解析返回扁平下标。
@@ -385,6 +388,7 @@ pub fn plan_query(q: &Query, ctx: &PlanContext<'_>) -> Result<PlannedQuery> {
         catalog: ctx.catalog,
         data: ctx.data.clone(),
         ctes: &merged_ctes,
+        params: ctx.params,
     };
     let planned = plan_select(
         select,
@@ -1964,6 +1968,7 @@ fn plan_from(
                         catalog: ctx.catalog,
                         data: ctx.data.clone(),
                         ctes: &ctx.ctes[..pos],
+                        params: ctx.params,
                     };
                     let pq = plan_query(cte_q, &sub_ctx)?;
                     let alias = alias_opt.unwrap_or_else(|| tname.clone());
@@ -2919,10 +2924,44 @@ fn plan_create_table(create: &sqlparser::ast::CreateTable) -> Result<StatementPl
 
 // ---------- 表达式 ----------
 
+/// 占位符解析失败的统一错误(未绑定/越界/形式非法)。
+fn param_placeholder_error(p: &str, n_params: usize) -> Error {
+    if p.starts_with('$') {
+        Error::sql(format!(
+            "placeholder {p} out of range ({n_params} parameters bound)"
+        ))
+    } else {
+        Error::not_supported(
+            "positional placeholder '?'; use numbered placeholders $1..$n",
+        )
+    }
+}
+
+
 /// SQL 表达式 → 执行表达式。`scope` 提供列解析;无 FROM 时不允许列引用。
 pub fn plan_expr(e: &SE, scope: Option<&Scope>, ctx: &PlanContext<'_>) -> Result<Expr> {
     match e {
-        SE::Value(v) => Ok(Expr::Literal(value_to_scalar(&v.value)?)),
+        SE::Value(v) => match &v.value {
+            // 绑定参数:$n 按序号取值(与求值顺序无关);`?` 不支持(无法
+            // 在计划期确定序号语义,统一 PG 风格 $1..$n)
+            Value::Placeholder(p) => {
+                let idx = p
+                    .strip_prefix('$')
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&n| n >= 1);
+                match idx.and_then(|n| ctx.params.get(n - 1)) {
+                    Some(sv) => Ok(Expr::Literal(sv.clone())),
+                    None => Err(param_placeholder_error(p, ctx.params.len())),
+                }
+            }
+            _ => Ok(Expr::Literal(value_to_scalar(&v.value)?)),
+        },
+        SE::IsNull(inner) => {
+            Ok(Expr::IsNull { expr: Box::new(plan_expr(inner, scope, ctx)?), negated: false })
+        }
+        SE::IsNotNull(inner) => {
+            Ok(Expr::IsNull { expr: Box::new(plan_expr(inner, scope, ctx)?), negated: true })
+        }
         SE::Array(arr) => {
             // 数组字面量:元素必须为常量(列引用/聚合在数组里不支持)
             let mut items = Vec::with_capacity(arr.elem.len());
@@ -3559,6 +3598,7 @@ mod tests {
             catalog,
             data,
             ctes: &[],
+            params: &[],
         }
     }
 
