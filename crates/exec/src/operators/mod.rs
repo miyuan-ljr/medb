@@ -7,5 +7,6 @@ pub mod index_scan;
 pub mod limit;
 pub mod project;
 pub mod seq_scan;
+pub mod semi_join;
 pub mod sort;
 pub mod values;

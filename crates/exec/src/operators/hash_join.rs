@@ -359,7 +359,7 @@ impl HashJoinExec {
 }
 
 /// 构建引用按**连续同批**分段(保持引用顺序 = 输出行序)。
-fn build_ref_runs(refs: &[(u32, u32)]) -> Vec<(u32, Vec<usize>)> {
+pub(crate) fn build_ref_runs(refs: &[(u32, u32)]) -> Vec<(u32, Vec<usize>)> {
     let mut runs: Vec<(u32, Vec<usize>)> = Vec::new();
     for (ci, ri) in refs {
         match runs.last_mut() {
@@ -371,7 +371,7 @@ fn build_ref_runs(refs: &[(u32, u32)]) -> Vec<(u32, Vec<usize>)> {
 }
 
 /// 按分段取构建侧单列(段内 gather,跨段 concat;保持引用顺序)。
-fn gather_build_column(
+pub(crate) fn gather_build_column(
     build_data: &[DataChunk],
     runs: &[(u32, Vec<usize>)],
     c: usize,

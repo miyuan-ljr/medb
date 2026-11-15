@@ -20,6 +20,7 @@ use exec::executor::{BoxedExecutor, ExecuteContext};
 use exec::expr::{BinaryOp, Expr};
 use exec::operators::hash_agg::AggHashExec;
 use exec::operators::hash_join::{HashJoinExec, JoinType};
+use exec::operators::semi_join::HashSemiJoinExec;
 use exec::operators::seq_scan::{QueryDataSource, SeqScanExec};
 use exec::operators::sort::{SortExec, SortKey};
 use exec::operators::values::ValuesExec;
@@ -32,6 +33,7 @@ use sqlparser::ast::{
     TableWithJoins, UnaryOperator, Value,
 };
 
+use crate::decorrelate::{self, SqKind};
 use crate::optimizer::{self, Estimator, split_conjuncts, sql_expr_tables};
 
 /// 计划上下文:批大小 + 元数据 + 表数据源。
@@ -363,7 +365,9 @@ pub fn plan_query(q: &Query, ctx: &PlanContext<'_>) -> Result<PlannedQuery> {
             limit_value = Some(literal_u64(limit, "LIMIT")?);
         }
     }
-    // WITH:自身 CTE + 外层可见 CTE 合并(同名遮蔽:自身优先)
+    // WITH:自身 CTE + 外层可见 CTE 合并(同名遮蔽:自身优先)。
+    // 合并结果装进内层 PlanContext:表达式里的标量/EXISTS/IN 子查询
+    // 经 eval_subquery_rows(ctx) 计划时同样可见(Q15 形状)。
     let mut merged_ctes: Vec<(String, Query)> = ctx.ctes.to_vec();
     if let Some(with) = &q.with {
         if with.recursive {
@@ -376,12 +380,17 @@ pub fn plan_query(q: &Query, ctx: &PlanContext<'_>) -> Result<PlannedQuery> {
             merged_ctes.insert(0, (cte.alias.name.value.clone(), *cte.query.clone()));
         }
     }
+    let inner_ctx = PlanContext {
+        batch_size: ctx.batch_size,
+        catalog: ctx.catalog,
+        data: ctx.data.clone(),
+        ctes: &merged_ctes,
+    };
     let planned = plan_select(
         select,
         order_by,
         limit_value.map(|k| (k, offset_value != 0)),
-        ctx,
-        &merged_ctes,
+        &inner_ctx,
     )?;
     finish_with_limit(planned, offset_value, limit_value)
 }
@@ -511,7 +520,6 @@ fn plan_select(
     order_by: &[sqlparser::ast::OrderByExpr],
     limit_hint: Option<(u64, bool)>, // (LIMIT k, 是否有 OFFSET)
     ctx: &PlanContext<'_>,
-    ctes: &[(String, Query)],
 ) -> Result<PlannedQuery> {
     if select.distinct.is_some() {
         return Err(Error::not_supported("SELECT DISTINCT"));
@@ -525,12 +533,38 @@ fn plan_select(
     let pipelines = std::cell::RefCell::new(HashMap::new());
     let steps = match select.from.as_slice() {
         [] => Vec::new(),
-        from => plan_from(from, ctx, ctes, &pipelines)?,
+        from => plan_from(from, ctx, &pipelines)?,
     };
     let mut scope = Scope::empty();
     for s in &steps {
         scope.push(s.alias.clone(), &s.schema);
     }
+    // 相关子查询去相关预处理:WHERE 里的 EXISTS/IN/相关标量聚合摘下为连接包装;
+    // 标量值列挂合成 __sq 表(真实表之后),比较谓词改写为对该表的列引用
+    let mut sq = if steps.is_empty() {
+        decorrelate::SqPlan {
+            wraps: Vec::new(),
+            synthetic: Vec::new(),
+            route_conjuncts: Vec::new(),
+            ref_exprs: Vec::new(),
+        }
+    } else {
+        let real_width: usize = scope.table_widths().iter().sum();
+        decorrelate::plan_where_subqueries(select.selection.as_ref(), &scope, ctx, real_width)?
+    };
+    if !sq.synthetic.is_empty() {
+        let synth = TableSchema {
+            id: 0,
+            name: "__sq".to_string(),
+            columns: sq.synthetic.clone(),
+            primary_key: vec![],
+            version: 1,
+            indexes: vec![],
+        };
+        scope.push("__sq".to_string(), &synth);
+    }
+    let sq_synthetic_pos = steps.len();
+    let sq_real_width: usize = scope.table_widths().iter().sum::<usize>() - sq.synthetic.len();
     let scope_ref = if steps.is_empty() { None } else { Some(&scope) };
     let offsets = prefix_offsets(&scope.table_widths());
     let input_schema: Vec<ColumnDesc> = if steps.is_empty() {
@@ -822,6 +856,8 @@ fn plan_select(
         let mut deferred: Vec<(usize, Expr)> = Vec::new();
         // 持有合取项克隆(条件池借引用;克隆避免闭包生命周期纠缠)
         let mut pool_src: Vec<SE> = Vec::new();
+        // 相关子查询包装后的顶层谓词(标量值列引用;包装应用后过滤)
+        let mut post_sq_preds: Vec<Expr> = Vec::new();
         // LEFT 步骤的 ON:哈希等值键 + 匹配期 match_cond(非等值;LEFT 下
         // 未过条件的左行仍 NULL 补齐)
         let mut left_keys: Vec<(Vec<Expr>, Vec<Expr>)> =
@@ -835,6 +871,13 @@ fn plan_select(
                 ));
             }
             let touched = sql_expr_tables(c, &scope)?;
+            if touched.contains(&sq_synthetic_pos) {
+                // __sq 值列引用:标量提升谓词,连接包装应用后过滤
+                let e = plan_expr(c, scope_ref, ctx)?;
+                check_bool(&e, &input_schema, "filter")?;
+                post_sq_preds.push(e);
+                return Ok(());
+            }
             match touched.as_slice() {
                 [] => {
                     let e = plan_expr(c, scope_ref, ctx)?;
@@ -887,8 +930,10 @@ fn plan_select(
                 }
             }
         }
-        if let Some(where_expr) = &select.selection {
-            for c in split_conjuncts(where_expr) {
+        if select.selection.is_some() {
+            // 去相关改写后的合取项列表(EXISTS/IN 已摘除;标量比较已改写);
+            // steps 非空时恒由 decorrelate 计算并覆盖全部合取项
+            for c in &sq.route_conjuncts {
                 route(c, true)?;
             }
         }
@@ -924,6 +969,13 @@ fn plan_select(
             }
         }
         for (_, e) in &deferred {
+            collect_flat(e, &mut refs);
+        }
+        // 连接包装的探测键/匹配条件 + 顶层标量提升谓词引用的列
+        for e in &sq.ref_exprs {
+            collect_flat(e, &mut refs);
+        }
+        for e in &post_sq_preds {
             collect_flat(e, &mut refs);
         }
         for (j, (keys, builds)) in left_keys.iter().enumerate() {
@@ -1013,6 +1065,61 @@ fn plan_select(
 
         let mut exec: BoxedExecutor = st.exec.expect("FROM pipeline must exist");
         expl = st.expl;
+        // 相关子查询包装:半/反半连接(EXISTS/IN)与标量提升左外连接,
+        // 按摘除顺序套在 FROM 流水线外;标量值列随之追加在探测列之后
+        let probe_schema: Vec<ColumnDesc> = input_schema[..sq_real_width].to_vec();
+        for w in sq.wraps.drain(..) {
+            match w.kind {
+                SqKind::Semi { anti } => {
+                    let label = format!(
+                        "SemiJoin{} (keys={}{})",
+                        if anti { " ANTI" } else { "" },
+                        w.probe_keys.len(),
+                        if w.cond.is_some() { " +cond" } else { "" },
+                    );
+                    exec = Box::new(HashSemiJoinExec::new(
+                        exec,
+                        w.build,
+                        probe_schema.clone(),
+                        w.build_schema,
+                        w.probe_keys,
+                        w.build_keys,
+                        w.cond,
+                        anti,
+                    ));
+                    expl = Some(ExplNode::with(
+                        label,
+                        vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+                    ));
+                }
+                SqKind::ScalarLift => {
+                    let n_keys = w.probe_keys.len();
+                    exec = Box::new(HashJoinExec::new(
+                        exec,
+                        w.build,
+                        probe_schema.clone(),
+                        w.build_schema,
+                        w.probe_keys,
+                        w.build_keys,
+                        None,
+                        None,
+                        JoinType::LeftOuter,
+                    ));
+                    expl = Some(ExplNode::with(
+                        format!("LeftJoin (scalar lift, keys={n_keys})"),
+                        vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+                    ));
+                }
+            }
+        }
+        // 标量提升谓词(引用 __sq 值列):包装应用后过滤
+        for e in post_sq_preds.drain(..) {
+            exec = Box::new(FilterExec::new(exec, e));
+            expl = Some(ExplNode::with(
+                "Filter (scalar subquery)".to_string(),
+                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+            ));
+        }
         // 条件池兜底:未被任何步骤应用的条件(理论上不可达)在顶层过滤
         for (pi, entry) in pool.iter().enumerate() {
             if applied.contains(&pi) {
@@ -1199,9 +1306,6 @@ struct PipelineState {
     exec: Option<BoxedExecutor>,
     /// 流水线当前列顺序(scope 位置;每步后重排为已连接集合的规范序)
     cur_order: Vec<usize>,
-    /// 列下标偏移:流水线位置 i 对应扁平下标 i + col_shift。
-    /// 首表扫描(非表 0)时为该表偏移;累计集合含表 0 后恒为 0。
-    col_shift: usize,
     /// 流水线估计行数
     est_rows: f64,
     expl: Option<ExplNode>,
@@ -1259,6 +1363,69 @@ fn permute_to_canonical(exec: BoxedExecutor, cur: &[usize], em: &EmitCtx<'_>) ->
     Box::new(ProjectExec::new(exec, schema, exprs))
 }
 
+/// 扁平下标 → 规范表序布局(每表全宽)中的位置。
+/// DP 连接序可产生跳表累积集(如先 {0,2} 再接 1),常数平移不成立,
+/// 必须按布局逐表定位。
+fn flat_in_layout(f: usize, tables: &[usize], em: &EmitCtx<'_>) -> Result<usize> {
+    debug_assert!(tables.windows(2).all(|w| w[0] < w[1]), "layout must be sorted");
+    let mut pos = 0;
+    for &p in tables {
+        let off = em.offsets[p];
+        let w = em.steps[p].schema.columns.len();
+        if (off..off + w).contains(&f) {
+            return Ok(pos + (f - off));
+        }
+        pos += w;
+    }
+    Err(Error::internal(format!(
+        "column {f} outside canonical layout {tables:?}"
+    )))
+}
+
+/// 表达式列下标:扁平 → 规范布局位置。
+fn rebase_to_layout(e: Expr, tables: &[usize], em: &EmitCtx<'_>) -> Result<Expr> {
+    match e {
+        Expr::Column(f) => Ok(Expr::Column(flat_in_layout(f, tables, em)?)),
+        Expr::Binary { op, left, right } => Ok(Expr::binary(
+            op,
+            rebase_to_layout(*left, tables, em)?,
+            rebase_to_layout(*right, tables, em)?,
+        )),
+        Expr::Function { name, args } => Ok(Expr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| rebase_to_layout(a, tables, em))
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
+            expr: Box::new(rebase_to_layout(*expr, tables, em)?),
+            negated,
+        }),
+        Expr::Case { whens, else_expr } => Ok(Expr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, r)| {
+                    Ok((
+                        rebase_to_layout(c, tables, em)?,
+                        rebase_to_layout(r, tables, em)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_expr: else_expr
+                .map(|e| rebase_to_layout(*e, tables, em))
+                .transpose()?
+                .map(Box::new),
+        }),
+        Expr::InList { expr, list, negated } => Ok(Expr::InList {
+            expr: Box::new(rebase_to_layout(*expr, tables, em)?),
+            list,
+            negated,
+        }),
+        other => Ok(other),
+    }
+}
+
 /// flush 一个 INNER 连接组:DP 枚举连接顺序,逐表扫描 + HashJoin 组合。
 fn flush_group(
     st: &mut PipelineState,
@@ -1284,11 +1451,11 @@ fn flush_group(
 
     for (k, &node) in plan.order.iter().enumerate() {
         if node == optimizer::VIRTUAL {
-            continue; // 首节点为既有流水线(col_shift = 0,全扁平)
+            continue; // 首节点为既有流水线(布局 = 其 cur_order 规范序)
         }
         if k == 0 {
             // 首表扫描:列 = 该表局部下标(偏移 = offsets[node]);
-            // 后续连接的累计侧表达式按 st.col_shift 重基
+            // 后续连接的累计侧表达式按规范布局定位(rebase_to_layout)
             let (exec, idx_label) = table_scan(
                 &em.steps[node],
                 &em.scan_preds[node],
@@ -1299,7 +1466,6 @@ fn flush_group(
             )?;
             st.exec = Some(exec);
             st.cur_order = vec![node];
-            st.col_shift = em.offsets[node];
             st.est_rows = plan.est_rows[0];
             st.expl = Some(ExplNode::leaf(
                 idx_label.unwrap_or_else(|| scan_label(em, node, base_of(em, node))),
@@ -1356,7 +1522,6 @@ fn emit_inner_join(
     est_out: f64,
 ) -> Result<()> {
     let prefix: Vec<usize> = st.cur_order.clone();
-    let acc_shift = st.col_shift; // 累计侧:位置 i ↔ 扁平 i + acc_shift
     let t_offset = em.offsets[t];
     let t_width = em.steps[t].schema.columns.len();
 
@@ -1379,12 +1544,13 @@ fn emit_inner_join(
         }
         if let Some(pair) = &entry.join_pair {
             if !build_accumulated {
-                // probe = 累计(位置 = 扁平 - acc_shift),build = t(局部重基)
+                // probe = 累计(规范布局定位),build = t(局部重基)
                 let probe_side = pair_side(pair, prefix_member(&prefix, pair));
                 let build_side = pair_side(pair, t);
-                probe_keys.push(rebase_columns(
+                probe_keys.push(rebase_to_layout(
                     plan_expr(probe_side, em.scope_ref, em.plan_ctx)?,
-                    acc_shift,
+                    &prefix,
+                    em,
                 )?);
                 build_keys.push(rebase_columns(
                     plan_expr(build_side, em.scope_ref, em.plan_ctx)?,
@@ -1406,24 +1572,26 @@ fn emit_inner_join(
                     e,
                     t_offset,
                     t_width,
+                    &prefix,
                     prefix_width,
-                    acc_shift,
+                    em,
                     build_accumulated,
                 )?;
                 residual.push(e);
                 residual_sql.push(format!("{}", entry.expr));
                 continue;
             }
-            // 交换:probe = t 扫描(局部重基),build = 累计(重基 acc_shift)
+            // 交换:probe = t 扫描(局部重基),build = 累计(规范布局定位)
             let probe_side = pair_side(pair, t);
             let build_side = pair_side(pair, prefix_member(&prefix, pair));
             probe_keys.push(rebase_columns(
                 plan_expr(probe_side, em.scope_ref, em.plan_ctx)?,
                 t_offset,
             )?);
-            build_keys.push(rebase_columns(
+            build_keys.push(rebase_to_layout(
                 plan_expr(build_side, em.scope_ref, em.plan_ctx)?,
-                acc_shift,
+                &prefix,
+                em,
             )?);
             key_sql.push(format!("{probe_side} = {build_side}"));
             applied.insert(pi);
@@ -1439,8 +1607,9 @@ fn emit_inner_join(
                     e,
                     t_offset,
                     t_width,
+                    &prefix,
                     prefix_width,
-                    acc_shift,
+                    em,
                     build_accumulated,
                 )?;
                 residual.push(e);
@@ -1459,8 +1628,9 @@ fn emit_inner_join(
             e,
             t_offset,
             t_width,
+            &prefix,
             prefix_width,
-            acc_shift,
+            em,
             build_accumulated,
         )?;
         residual.push(e);
@@ -1562,8 +1732,6 @@ fn emit_inner_join(
         ));
     }
     st.cur_order = new_cur;
-    // 规范序后,流水线位置 i ↔ 扁平 canonical_flat[0] + i
-    st.col_shift = em.offsets[st.cur_order[0]];
     st.est_rows = est_out;
     st.exec = Some(exec);
     Ok(())
@@ -1635,7 +1803,6 @@ fn emit_left_join(
         vec![st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
     ));
     st.cur_order.push(k); // FROM 序追加,天然规范(集合含表 0 → 全扁平)
-    st.col_shift = 0;
     st.exec = Some(exec);
     Ok(())
 }
@@ -1643,15 +1810,16 @@ fn emit_left_join(
 /// 连接后组合列的扁平下标重映射。
 ///
 /// - 正常(build = 新表):组合列序 = 累计规范序 ++ t 局部;
-///   累计部分位置 = 扁平 - acc_shift,t 部分位置 = prefix_width + 扁平 - t_offset。
+///   累计部分位置 = 规范布局定位,t 部分位置 = prefix_width + 扁平 - t_offset。
 /// - 交换(build = 累计):组合列序 = t 局部 ++ 累计规范序;
-///   t 部分 = 扁平 - t_offset,累计部分 = t_width + 扁平 - acc_shift。
+///   t 部分 = 扁平 - t_offset,累计部分 = t_width + 规范布局定位。
 fn remap_for_join(
     e: Expr,
     t_offset: usize,
     t_width: usize,
+    prefix: &[usize],
     prefix_width: usize,
-    acc_shift: usize,
+    em: &EmitCtx<'_>,
     swapped: bool,
 ) -> Result<Expr> {
     match e {
@@ -1661,24 +1829,24 @@ fn remap_for_join(
                 if in_t {
                     Ok(Expr::Column(f - t_offset))
                 } else {
-                    Ok(Expr::Column(t_width + f - acc_shift))
+                    Ok(Expr::Column(t_width + flat_in_layout(f, prefix, em)?))
                 }
             } else if in_t {
                 Ok(Expr::Column(prefix_width + f - t_offset))
             } else {
-                Ok(Expr::Column(f - acc_shift))
+                Ok(Expr::Column(flat_in_layout(f, prefix, em)?))
             }
         }
         Expr::Binary { op, left, right } => Ok(Expr::binary(
             op,
-            remap_for_join(*left, t_offset, t_width, prefix_width, acc_shift, swapped)?,
-            remap_for_join(*right, t_offset, t_width, prefix_width, acc_shift, swapped)?,
+            remap_for_join(*left, t_offset, t_width, prefix, prefix_width, em, swapped)?,
+            remap_for_join(*right, t_offset, t_width, prefix, prefix_width, em, swapped)?,
         )),
         Expr::Function { name, args } => Ok(Expr::Function {
             name,
             args: args
                 .into_iter()
-                .map(|a| remap_for_join(a, t_offset, t_width, prefix_width, acc_shift, swapped))
+                .map(|a| remap_for_join(a, t_offset, t_width, prefix, prefix_width, em, swapped))
                 .collect::<Result<Vec<_>>>()?,
         }),
         Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
@@ -1686,8 +1854,9 @@ fn remap_for_join(
                 *expr,
                 t_offset,
                 t_width,
+                prefix,
                 prefix_width,
-                acc_shift,
+                em,
                 swapped,
             )?),
             negated,
@@ -1697,13 +1866,15 @@ fn remap_for_join(
                 .into_iter()
                 .map(|(c, r)| {
                     Ok((
-                        remap_for_join(c, t_offset, t_width, prefix_width, acc_shift, swapped)?,
-                        remap_for_join(r, t_offset, t_width, prefix_width, acc_shift, swapped)?,
+                        remap_for_join(c, t_offset, t_width, prefix, prefix_width, em, swapped)?,
+                        remap_for_join(r, t_offset, t_width, prefix, prefix_width, em, swapped)?,
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?,
             else_expr: else_expr
-                .map(|e| remap_for_join(*e, t_offset, t_width, prefix_width, acc_shift, swapped))
+                .map(|e| {
+                    remap_for_join(*e, t_offset, t_width, prefix, prefix_width, em, swapped)
+                })
                 .transpose()?
                 .map(Box::new),
         }),
@@ -1716,8 +1887,9 @@ fn remap_for_join(
                 *expr,
                 t_offset,
                 t_width,
+                prefix,
                 prefix_width,
-                acc_shift,
+                em,
                 swapped,
             )?),
             list,
@@ -1743,13 +1915,11 @@ struct RelationStep {
 fn plan_from(
     from: &[TableWithJoins],
     ctx: &PlanContext<'_>,
-    ctes: &[(String, Query)],
     pipelines: &std::cell::RefCell<HashMap<String, BoxedExecutor>>,
 ) -> Result<Vec<RelationStep>> {
     fn push_relation(
         relation: &TableFactor,
         ctx: &PlanContext<'_>,
-        ctes: &[(String, Query)],
         pipelines: &std::cell::RefCell<HashMap<String, BoxedExecutor>>,
         steps: &mut Vec<RelationStep>,
     ) -> Result<()> {
@@ -1782,17 +1952,18 @@ fn plan_from(
             None => {
                 let tname = object_name_to_string(name.as_ref().expect("table name"))?;
                 // CTE 优先于物理表;体计划只见它之前的 CTE(非递归)
-                let cte_pos = ctes
+                let cte_pos = ctx
+                    .ctes
                     .iter()
                     .position(|(n, _)| n.eq_ignore_ascii_case(&tname));
                 if let Some(pos) = cte_pos {
-                    let (cname, cte_q) = &ctes[pos];
+                    let (cname, cte_q) = &ctx.ctes[pos];
                     let _ = cname;
                     let sub_ctx = PlanContext {
                         batch_size: ctx.batch_size,
                         catalog: ctx.catalog,
                         data: ctx.data.clone(),
-                        ctes: &ctes[..pos],
+                        ctes: &ctx.ctes[..pos],
                     };
                     let pq = plan_query(cte_q, &sub_ctx)?;
                     let alias = alias_opt.unwrap_or_else(|| tname.clone());
@@ -1833,7 +2004,7 @@ fn plan_from(
     let mut steps: Vec<RelationStep> = Vec::new();
     for twj in from {
         // 第一个 TableWithJoins 的主关系是驱动表;后续的是逗号连接(CROSS JOIN)
-        push_relation(&twj.relation, ctx, ctes, pipelines, &mut steps)?;
+        push_relation(&twj.relation, ctx, pipelines, &mut steps)?;
         for join in &twj.joins {
             let (jt, on) = match &join.join_operator {
                 // `JOIN` 与 `INNER JOIN` 同义(sqlparser 分列两个变体)
@@ -1854,7 +2025,7 @@ fn plan_from(
                     return Err(Error::not_supported(format!("join type {other:?}")));
                 }
             };
-            push_relation(&join.relation, ctx, ctes, pipelines, &mut steps)?;
+            push_relation(&join.relation, ctx, pipelines, &mut steps)?;
             let j = steps.len() - 1;
             steps[j].join_type = jt;
             steps[j].on = on;
@@ -2492,7 +2663,7 @@ fn plan_insert(insert: &sqlparser::ast::Insert, ctx: &PlanContext<'_>) -> Result
             Ok(StatementPlan::Insert { table, rows })
         }
         SetExpr::Select(select) => {
-            let query = plan_select(select, &[], None, ctx, ctx.ctes)?;
+            let query = plan_select(select, &[], None, ctx)?;
             check_insert_select_arity(&table, &targets, &query)?;
             Ok(StatementPlan::InsertSelect {
                 table,
@@ -3173,7 +3344,7 @@ fn literal_u64(e: &SE, what: &str) -> Result<u64> {
 
 // ---------- 名称与类型解析 ----------
 
-fn object_name_to_string(name: &ObjectName) -> Result<String> {
+pub(crate) fn object_name_to_string(name: &ObjectName) -> Result<String> {
     let mut parts = Vec::with_capacity(name.0.len());
     for part in &name.0 {
         match part.as_ident() {
@@ -3193,7 +3364,7 @@ fn object_name_to_string(name: &ObjectName) -> Result<String> {
     Ok(parts.remove(0))
 }
 
-fn resolve_table(catalog: &dyn CatalogStore, name: &str) -> Result<TableSchema> {
+pub(crate) fn resolve_table(catalog: &dyn CatalogStore, name: &str) -> Result<TableSchema> {
     if let Some(t) = catalog.get_table(name) {
         return Ok(t);
     }
