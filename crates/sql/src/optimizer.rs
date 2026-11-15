@@ -600,6 +600,72 @@ fn or_common_pair<'a>(e: &'a SE, scope: &Scope, est: &Estimator<'_>) -> Option<J
     None
 }
 
+/// 从 OR-of-AND 形态的条件中提取**每表可下推的析取过滤**:
+/// 对表 t,过滤 = OR(各分支的 t 单表合取项之 AND)。
+/// 健全性:某行不满足该过滤 = 它在每个分支的 t 侧合取都失败 → 该行在
+/// 任何分支下都无法参与连接 → 过滤不改变连接结果。
+/// 仅当每个分支都贡献 ≥1 条 t 合取项时才返回该表(否则分支退化为 TRUE,
+/// 过滤失效);键对等值/跨表条件不进单表过滤(由连接负责)。
+pub fn disjunctive_table_filters<'a>(
+    e: &'a SE,
+    scope: &Scope,
+) -> Result<Vec<(usize, SE)>> {
+    let mut branches: Vec<&SE> = Vec::new();
+    flatten_or(e, &mut branches);
+    if branches.len() < 2 {
+        return Ok(Vec::new());
+    }
+    // 每表收集"按分支分组"的单表合取项(分支顺序 = 析取顺序)
+    let mut per_table: std::collections::BTreeMap<usize, Vec<Vec<&SE>>> = Default::default();
+    for b in &branches {
+        let mut group: std::collections::BTreeMap<usize, Vec<&SE>> = Default::default();
+        for c in split_conjuncts(b) {
+            let tables = sql_expr_tables(c, scope)?;
+            if let [t] = tables.as_slice() {
+                group.entry(*t).or_default().push(c);
+            }
+        }
+        for (t, conj) in group {
+            per_table.entry(t).or_default().push(conj);
+        }
+    }
+    let n = branches.len();
+    let mut out = Vec::new();
+    for (t, groups) in per_table {
+        if groups.len() != n {
+            continue; // 有分支不含该表的条件 → 该表过滤退化为 TRUE,不下推
+        }
+        // OR( AND(分支合取...) )
+        let mut or_acc: Option<SE> = None;
+        for conj in groups {
+            let mut and_acc: Option<SE> = None;
+            for c in conj {
+                and_acc = Some(match and_acc {
+                    None => c.clone(),
+                    Some(prev) => SE::BinaryOp {
+                        left: Box::new(SE::Nested(Box::new(prev))),
+                        op: BinaryOperator::And,
+                        right: Box::new(SE::Nested(Box::new(c.clone()))),
+                    },
+                });
+            }
+            let Some(and_e) = and_acc else { continue };
+            or_acc = Some(match or_acc {
+                None => SE::Nested(Box::new(and_e)),
+                Some(prev) => SE::BinaryOp {
+                    left: Box::new(SE::Nested(Box::new(prev))),
+                    op: BinaryOperator::Or,
+                    right: Box::new(SE::Nested(Box::new(and_e))),
+                },
+            });
+        }
+        if let Some(f) = or_acc {
+            out.push((t, f));
+        }
+    }
+    Ok(out)
+}
+
 /// 构建连接条件池:从一组合取项中筛出跨表(≥2 表)条件并分类。
 pub fn build_pool<'a>(
     conjuncts: &[&'a SE],
@@ -1145,6 +1211,37 @@ mod tests {
     fn conjunct_asts(sql: &str) -> Vec<SE> {
         let w = where_of(sql);
         split_conjuncts(&w).into_iter().map(|c| c.clone()).collect()
+    }
+
+    #[test]
+    fn disjunctive_filters_extracted_per_table() {
+        let scope = scope3();
+        // 两个分支都含 a/b 单表条件 + 跨表键 → a、b 各得一条析取过滤
+        let w = where_of(
+            "SELECT * FROM a, b WHERE (a.x = 1 AND b.y = 2 AND a.k = b.k)              OR (a.x = 3 AND b.y = 4 AND a.k = b.k)",
+        );
+        let mut filters = disjunctive_table_filters(&w, &scope).unwrap();
+        filters.sort_by_key(|(t, _)| *t);
+        assert_eq!(filters.len(), 2, "a、b 两表都应可下推: {filters:?}");
+        let (t0, f0) = &filters[0];
+        let (t1, f1) = &filters[1];
+        assert_eq!((*t0, *t1), (0, 1), "表 0=a、表 1=b");
+        // 文本形态:OR( AND(单表合取) )
+        let s0 = format!("{f0}");
+        assert!(s0.contains("a.x"), "a 侧过滤应含 a.x: {s0}");
+        assert!(!s0.contains("b."), "a 侧过滤不得含 b 列: {s0}");
+
+        // 某分支缺 b 条件 → b 不可下推,仅 a 可
+        let w2 = where_of(
+            "SELECT * FROM a, b WHERE (a.x = 1 AND b.y = 2 AND a.k = b.k) OR (a.x = 3 AND a.k = b.k)",
+        );
+        let mut f2 = disjunctive_table_filters(&w2, &scope).unwrap();
+        assert_eq!(f2.len(), 1, "缺分支贡献的表不下推: {f2:?}");
+        assert_eq!(f2.pop().unwrap().0, 0, "只有 a 可下推");
+
+        // 非 OR 条件 → 空
+        let w3 = where_of("SELECT * FROM a, b WHERE a.x = 1 AND a.k = b.k");
+        assert!(disjunctive_table_filters(&w3, &scope).unwrap().is_empty());
     }
 
     #[test]

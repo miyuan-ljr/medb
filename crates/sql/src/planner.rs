@@ -829,6 +829,22 @@ fn plan_select(
         let pool_refs: Vec<&SE> = pool_src.iter().collect();
         let pool = optimizer::build_pool(&pool_refs, &scope, &est)?;
 
+        // ---------- OR 析取式单表下推(Q19 形状)----------
+        // 跨表 OR 条件的每个分支拆出各表自己的合取项,按表组成
+        // "OR of AND" 下推到该表扫描;完整 OR 仍保留为 residual 强制
+        // (键对跨分支不保证一致,下推过滤只是必要条件)。扫描输入缩小,
+        // 连接与残余求值都吃这份收益。
+        for entry in &pool {
+            let filters = optimizer::disjunctive_table_filters(entry.expr, &scope)?;
+            for (t, fse) in filters {
+                let e = plan_expr(&fse, Some(&scope), ctx)?;
+                check_bool(&e, &input_schema, "filter")?;
+                scan_preds[t].push(e);
+                scan_sql[t].push(format!("{fse}"));
+                scan_sels[t].push(est.selectivity(&fse));
+            }
+        }
+
         // ---------- 投影剪枝:收集全查询引用列,换算每表局部 needed 位图 ----------
         // 引用来源:扫描下推谓词 / 延迟 WHERE / JOIN 键与残余(pool)/
         // 投影 + 排序隐藏键 / 分组 + 聚合参数 / HAVING(SQL 级)。
