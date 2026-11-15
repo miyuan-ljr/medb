@@ -301,10 +301,13 @@ impl QueryDataSource for LsmDataSource {
         Ok(parts.concat())
     }
 
-    /// AP 列存路径:标量表 + 无事务门控;Date 列已支持;LOB/数组/向量回退。
-    /// **AP 列存路径**:segment(仅 SST 数据)+ memtable overlay 合并。
+    /// **AP 列存路径**:返回拼接语义的多块列向量(segment 块 + memtable
+    /// delta 块)。列存副本的目的是加速 SST 读取 —— segment 缓存保持纯净
+    /// (memtable 非空时也**不标量化**),memtable 增量在查询时转向量化:
+    /// 解码成独立 delta 块,被覆盖/删除的 segment 行用键成员判定整行剔除
+    /// (`Vector::select`,向量化压缩)。
     /// 门控:事务内读回退行存(overlay 不含事务缓冲,保读己之写)。
-    fn scan_columns(&self, table: &TableSchema) -> Result<Option<Vec<Vector>>> {
+    fn scan_columns(&self, table: &TableSchema) -> Result<Option<Vec<Vec<Vector>>>> {
         let Some(ap) = &self.ap else {
             return Ok(None);
         };
@@ -322,7 +325,7 @@ impl QueryDataSource for LsmDataSource {
                 return Ok(None);
             }
         }
-        let Some((generation, _seg_max_seq)) = ap.segment_info(table.id) else {
+        let Some((generation, seg_max_seq)) = ap.segment_info(table.id) else {
             return Ok(None); // 无 segment → 行存路径(首次 flush 后才有)
         };
         // 取/建解码缓存(段文件 → 列向量;gen 变化自动失效)
@@ -330,7 +333,7 @@ impl QueryDataSource for LsmDataSource {
             Some(c) if c.generation == generation => c,
             _ => {
                 let path =
-                    columnar_file::segment_path(&ap.dir(), table.id, generation, _seg_max_seq);
+                    columnar_file::segment_path(&ap.dir(), table.id, generation, seg_max_seq);
                 let seg = match columnar_file::read_segment(&path, table.id) {
                     Ok(Some(seg)) => seg,
                     Ok(None) => return Ok(None), // 段缺失(被删/代次超前)→ 行存回退
@@ -360,11 +363,7 @@ impl QueryDataSource for LsmDataSource {
                     .collect::<Result<Vec<_>>>()?;
                 let c = Arc::new(ApCache {
                     generation: generation,
-                    key_pos: keys
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, k)| (k, i))
-                        .collect(),
+                    keys,
                     cols,
                     rows: seg.rows.len(),
                 });
@@ -372,63 +371,64 @@ impl QueryDataSource for LsmDataSource {
                 c
             }
         };
-        // memtable overlay:AP 只覆盖 SST 数据,memtable 增量在此合并
-        // (memtable seq 恒大于已 flush seq → overlay 恒为最新版本)
+        // memtable 增量 → delta 块(查询时向量化;memtable seq 恒大于已
+        // flush seq → delta 块中的版本恒为最新)
         let (from, to) = row_range(table.id);
         let mt = self.lsm.scan_memtable(&from, &to, self.read_ts)?;
         if mt.is_empty() {
-            return Ok(Some(cache.cols.clone()));
+            return Ok(Some(vec![cache.cols.clone()]));
         }
-        let mut vals: Vec<Vec<ScalarValue>> = cache
-            .cols
-            .iter()
-            .map(|v| (0..v.len()).map(|i| v.scalar_at(i)).collect::<Vec<_>>())
-            .collect();
-        let mut del_pos: std::collections::HashSet<usize> = Default::default();
-        let mut appended = 0usize;
+        // 影子键集:memtable 覆盖/删除的行键(update + tombstone)
+        let shadow: std::collections::HashSet<&[u8]> =
+            mt.iter().map(|(k, _, _)| k.as_slice()).collect();
+        // delta 块:memtable 中存活的行(update 新值 + 新插入;墓碑只进影子集)
+        let mut dvals: Vec<Vec<ScalarValue>> = vec![Vec::new(); table.columns.len()];
         for (k, _seq, v) in &mt {
-            match v {
-                Some(bytes) => {
-                    let mut s = bytes.as_slice();
-                    let mut row = common::codec::decode_row(&mut s)?;
-                    if row.len() < table.columns.len() {
-                        row.resize(table.columns.len(), ScalarValue::Null);
-                    } else if row.len() > table.columns.len() {
-                        row.truncate(table.columns.len());
-                    }
-                    if let Some(&pos) = cache.key_pos.get(k) {
-                        for c in 0..vals.len() {
-                            vals[c][pos] = row[c].clone();
-                        }
-                    } else {
-                        for c in 0..vals.len() {
-                            vals[c].push(row[c].clone());
-                        }
-                        appended += 1;
-                    }
-                }
-                None => {
-                    if let Some(&pos) = cache.key_pos.get(k) {
-                        del_pos.insert(pos);
-                    }
-                }
+            let Some(bytes) = v else { continue };
+            let _ = k;
+            let mut s = bytes.as_slice();
+            let mut row = common::codec::decode_row(&mut s)?;
+            if row.len() < table.columns.len() {
+                row.resize(table.columns.len(), ScalarValue::Null);
+            } else if row.len() > table.columns.len() {
+                row.truncate(table.columns.len());
+            }
+            for (c, cell) in row.iter().enumerate() {
+                dvals[c].push(cell.clone());
             }
         }
-        // 构建最终列:缓存部分跳过删除位 + 追加行
-        let cached = cache.rows;
-        let cols = (0..table.columns.len())
-            .map(|c| {
-                let kept: Vec<ScalarValue> = (0..cached)
-                    .filter(|i| !del_pos.contains(i))
-                    .map(|i| vals[c][i].clone())
-                    .chain(
-                        (0..appended).map(|i| vals[c][cached + i].clone()),
-                    )
+        let mut chunks: Vec<Vec<Vector>> = Vec::with_capacity(2);
+        // segment 块:无影子键 → 缓存原样复用(零拷贝);有 → 向量化剔除
+        let seg_shadowed = cache.keys.iter().any(|k| shadow.contains(k.as_slice()));
+        if cache.rows > 0 {
+            if seg_shadowed {
+                let keep: Vec<bool> = cache
+                    .keys
+                    .iter()
+                    .map(|k| !shadow.contains(k.as_slice()))
                     .collect();
-                Vector::from_scalars(table.columns[c].ty.clone(), kept)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Some(cols))
+                let cols = cache
+                    .cols
+                    .iter()
+                    .map(|v| v.select(&keep))
+                    .collect::<Result<Vec<_>>>()?;
+                if cols.first().map(|v| v.len()).unwrap_or(0) > 0 {
+                    chunks.push(cols);
+                }
+            } else {
+                chunks.push(cache.cols.clone());
+            }
+        }
+        if dvals.first().map(|v| !v.is_empty()).unwrap_or(false) {
+            let cols = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(c, desc)| Vector::from_scalars(desc.ty.clone(), dvals[c].clone()))
+                .collect::<Result<Vec<_>>>()?;
+            chunks.push(cols);
+        }
+        Ok(Some(chunks))
     }
 }
 
@@ -498,10 +498,11 @@ impl ApStore {
     }
 }
 
-/// 解码后的列缓存(一段 segment 的列向量 + 行键位置索引)。
+/// 解码后的列缓存(一段 segment 的列向量 + 行键)。
 pub(crate) struct ApCache {
     pub generation: u64,
-    pub key_pos: HashMap<Vec<u8>, usize>,
+    /// 行键(与列向量行序一致;delta 影子剔除用)
+    pub keys: Vec<Vec<u8>>,
     pub cols: Vec<Vector>,
     pub rows: usize,
 }
@@ -619,7 +620,10 @@ impl Engine {
                 }
             }
         }
-        // 陈旧检测:SST 覆盖该表行键范围且 max_seq > 段 max_seq → 段过期
+        // 陈旧检测(两段式):段名 max_seq 只含行键 seq,而 SstMeta.max_seq
+        // 跨全部键空间(catalog/stats 与行数据同 SST)→ 直接比较会误报。
+        // ① 廉价筛:SST 与该表行键范围重叠且 max_seq > 段 max_seq → 可疑;
+        // ② 精确验证:只扫该表行键,取可见版本最大 seq 比较。
         let sst_metas = lsm.sst_metas();
         let stale_tids: Vec<u64> = gens
             .iter()
@@ -630,6 +634,16 @@ impl Engine {
                     .any(|m| m.overlaps_range(&from, &to) && m.max_seq > info.1)
             })
             .map(|(tid, _)| *tid)
+            .filter(|tid| {
+                // 精确验证:行键范围的最大可见 seq 仍 > 段 max_seq 才算真陈旧
+                let (from, to) = storage::table::row_range(*tid);
+                let row_max = lsm
+                    .scan(&from, &to)
+                    .map(|entries| entries.iter().map(|(_, seq, _)| *seq).max().unwrap_or(0))
+                    .unwrap_or(0);
+                let seg_max = gens.get(tid).map(|(_, m)| *m).unwrap_or(0);
+                row_max > seg_max
+            })
             .collect();
         for tid in stale_tids {
             gens.remove(&tid); // 无段 → 行存回退,下次 flush 重建

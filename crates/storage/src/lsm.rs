@@ -45,7 +45,7 @@ impl From<&StorageConfig> for LsmOptions {
         Self {
             write_buffer_bytes: c.write_buffer_bytes,
             wal_segment_bytes: c.wal_segment_bytes,
-            wal_sync: false,
+            wal_sync: c.wal_sync,
             sst_block_size: c.sst_block_size,
             bloom_bits_per_key: c.bloom_bits_per_key,
             l0_compaction_threshold: c.l0_compaction_threshold,
@@ -300,6 +300,8 @@ impl LsmStore {
 
     /// **仅 memtable**(活跃 + 冻结表)的合并扫描:AP 列存路径用它取
     /// "尚未 flush 进 segment 的增量"(segment 只覆盖 SST 数据)。
+    /// 与 `scan_at` 不同,**墓碑以 (key, seq, None) 输出** —— AP 读路径
+    /// 需要"谁被删了"来做 segment 行的影子剔除。
     pub fn scan_memtable(&self, from: &[u8], to: &[u8], ts: u64) -> Result<Vec<ScanEntry>> {
         if from >= to {
             return Ok(Vec::new());
@@ -327,7 +329,7 @@ impl LsmStore {
                 sources.push(entries);
             }
         }
-        Ok(merge_visible_per_key(sources, ts))
+        Ok(merge_with_tombstones(sources, ts))
     }
 
     // ---------- flush / compaction ----------
@@ -411,7 +413,13 @@ impl LsmStore {
             writer.add(&encode_internal_key(user_key, *seq, kind), value.as_deref())?;
         }
         let (_out, meta) = writer.finish(id, level)?;
-        // BufWriter 已在 finish 中 flush
+        // 掉电安全:WAL reset 之前 SST 必须已持久(sync tmp → 同卷 rename 不
+        // 改变数据持久性;compaction 产物同样走这里)。wal_sync=false 时跳过,
+        // 持久性退化为"进程崩溃安全"。
+        if self.opts.wal_sync {
+            let f = std::fs::OpenOptions::new().write(true).open(&path)?;
+            f.sync_data()?;
+        }
         // 原子改名:tmp → 最终名(读者只认最终名)
         let final_path = self.sst_path(id, level);
         std::fs::rename(&path, &final_path)?;
@@ -635,6 +643,50 @@ fn merge_visible_per_key(
     out
 }
 
+/// memtable 版本合并:与 [`merge_visible_per_key`] 同构,但最新可见版本为
+/// 墓碑时输出 `(key, seq, None)`(整键隐藏的语义交由调用方执行)。
+fn merge_with_tombstones(
+    sources: Vec<Vec<(InternalKey, Option<Vec<u8>>)>>,
+    read_ts: u64,
+) -> Vec<ScanEntry> {
+    let mut all: Vec<(InternalKey, Option<Vec<u8>>)> = sources.into_iter().flatten().collect();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out: Vec<ScanEntry> = Vec::new();
+    let mut i = 0usize;
+    while i < all.len() {
+        let Ok(d0) = crate::key::decode_internal_key(&all[i].0.0) else {
+            i += 1;
+            continue;
+        };
+        let user = d0.user_key.to_vec();
+        let mut j = i;
+        let mut emitted = false;
+        while j < all.len() {
+            let Ok(d) = crate::key::decode_internal_key(&all[j].0.0) else {
+                j += 1;
+                continue;
+            };
+            if d.user_key != user {
+                break;
+            }
+            if !emitted && d.seq <= read_ts {
+                if d.kind == KeyKind::Put {
+                    if let Some(v) = &all[j].1 {
+                        out.push((user.clone(), d.seq, Some(v.clone())));
+                    }
+                } else {
+                    out.push((user.clone(), d.seq, None));
+                }
+                emitted = true;
+            }
+            j += 1;
+        }
+        i = j;
+    }
+    out
+}
+
 fn next_file_id_from_dir(sst_dir: &Path) -> Result<u64> {
     let mut max = 0u64;
     for entry in std::fs::read_dir(sst_dir)? {
@@ -713,6 +765,33 @@ mod tests {
         };
         let root = MemoryTracker::new_root("test", None);
         LsmStore::open(dir, opts, &root).unwrap()
+    }
+
+    /// 持久性默认值:生产配置 WAL/SST 默认 fsync(掉电不丢已确认提交)。
+    #[test]
+    fn storage_config_defaults_to_durable_wal_sync() {
+        assert!(common::config::StorageConfig::default().wal_sync);
+        let opts = LsmOptions::from(&common::config::StorageConfig::default());
+        assert!(opts.wal_sync, "LsmOptions 必须继承配置的 wal_sync");
+    }
+
+    /// scan_memtable 输出墓碑(AP 影子剔除依赖"谁被删了")。
+    #[test]
+    fn scan_memtable_emits_tombstones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(tmp.path());
+        store.put(b"k1", b"v1").unwrap();
+        store.put(b"k2", b"v2").unwrap();
+        let ts = store.last_sequence();
+        store.put(b"k1", b"v1x").unwrap();
+        store.delete(b"k2").unwrap();
+        let entries = store.scan_memtable(b"k", b"l", u64::MAX).unwrap();
+        let k1 = entries.iter().find(|(k, _, _)| k == b"k1").unwrap();
+        assert_eq!(k1.2.as_deref(), Some(b"v1x".as_slice()));
+        let k2 = entries.iter().find(|(k, _, _)| k == b"k2").unwrap();
+        assert!(k2.2.is_none(), "被删除的键必须以墓碑形式出现");
+        assert!(entries.len() == 2, "每键一个最新可见版本");
+        let _ = ts;
     }
 
     #[test]

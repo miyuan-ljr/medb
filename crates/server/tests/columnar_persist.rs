@@ -64,9 +64,9 @@ fn count(engine: &Arc<Engine>, table: &str) -> u64 {
     }
 }
 
-fn sum(engine: &Arc<Engine>, expr: &str) -> f64 {
+fn sum(engine: &Arc<Engine>, table: &str, expr: &str) -> f64 {
     match engine
-        .execute_script(&format!("SELECT SUM({expr}) FROM lineitem"))
+        .execute_script(&format!("SELECT SUM({expr}) FROM {table}"))
         .unwrap()
         .pop()
         .unwrap()
@@ -119,7 +119,7 @@ fn columnar_segment_and_overlay_across_restart() {
     {
         let engine = open(&data_dir);
         assert_eq!(count(&engine, "lineitem"), 3, "段发现恢复行数");
-        assert_eq!(sum(&engine, "l_quantity"), 60.0, "段恢复数量列");
+        assert_eq!(sum(&engine, "lineitem", "l_quantity"), 60.0, "段恢复数量列");
 
         // 段之后的变更:更新 + 删除 + 新增(全部只进 memtable/WAL)
         engine
@@ -133,7 +133,7 @@ fn columnar_segment_and_overlay_across_restart() {
             .unwrap();
         assert_eq!(count(&engine, "lineitem"), 3, "overlay 后行数(1 改 1 删 1 增)");
         assert_eq!(
-            sum(&engine, "l_quantity"),
+            sum(&engine, "lineitem", "l_quantity"),
             99.0 + 30.0 + 40.0,
             "overlay 应包含 UPDATE/INSERT,排除 DELETE"
         );
@@ -143,7 +143,7 @@ fn columnar_segment_and_overlay_across_restart() {
     {
         let engine = open(&data_dir);
         assert_eq!(count(&engine, "lineitem"), 3, "重启后 overlay 行数");
-        assert_eq!(sum(&engine, "l_quantity"), 99.0 + 30.0 + 40.0);
+        assert_eq!(sum(&engine, "lineitem", "l_quantity"), 99.0 + 30.0 + 40.0);
         // AP 列存路径在重启后读数正确
         let mut outcomes = engine
             .execute_script(
@@ -193,7 +193,7 @@ fn overlay_hits_segment_after_in_process_flush() {
         .execute_script("UPDATE lineitem SET l_quantity = 99 WHERE l_orderkey = 1")
         .unwrap();
     assert_eq!(count(&engine, "lineitem"), 3, "段 + memtable overlay");
-    assert_eq!(sum(&engine, "l_quantity"), 99.0 + 20.0 + 30.0);
+    assert_eq!(sum(&engine, "lineitem", "l_quantity"), 99.0 + 20.0 + 30.0);
 }
 
 #[test]
@@ -304,6 +304,127 @@ fn stale_segment_detected_at_open_crash_window() {
     let new_seg = segment_file(&data_dir, id).expect("flush 后应有新段");
     assert_ne!(new_seg, seg, "重建应产生新代文件");
     assert_eq!(count(&engine, "lineitem"), 4);
+}
+
+#[test]
+fn ap_multi_chunk_delta_semantics() {
+    // memtable 增量 = 向量化 delta 块(segment 块 + delta 块拼接):
+    // update/delete 打影子剔除 segment 行,insert 落 delta 块;
+    // 谓词/排序跨块求值,结果与行存路径一致。
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    engine
+        .execute_script(
+            "CREATE TABLE lineitem (\
+             l_orderkey BIGINT NOT NULL PRIMARY KEY, \
+             l_quantity BIGINT NOT NULL, \
+             l_shipdate DATE NOT NULL)",
+        )
+        .unwrap();
+    engine
+        .execute_script(
+            "INSERT INTO lineitem VALUES \
+             (1, 10, DATE '2024-01-01'), \
+             (2, 20, DATE '2024-02-01'), \
+             (3, 30, DATE '2024-03-01'), \
+             (4, 40, DATE '2024-04-01'), \
+             (5, 50, DATE '2024-05-01')",
+        )
+        .unwrap();
+    flush(&engine);
+    // segment 块 = 5 行;memtable delta:update 1 行 + delete 1 行 + insert 2 行
+    engine
+        .execute_script("UPDATE lineitem SET l_quantity = 99 WHERE l_orderkey = 3")
+        .unwrap();
+    engine
+        .execute_script("DELETE FROM lineitem WHERE l_orderkey = 4")
+        .unwrap();
+    engine
+        .execute_script(
+            "INSERT INTO lineitem VALUES \
+             (6, 60, DATE '2024-06-01'), \
+             (7, 70, DATE '2024-07-01')",
+        )
+        .unwrap();
+
+    // 拼接语义:6 行(5 - 1 删 + 2 增),被更新的行只出现一次(新值)
+    assert_eq!(count(&engine, "lineitem"), 6);
+    assert_eq!(
+        sum(&engine, "lineitem", "l_quantity"),
+        10.0 + 20.0 + 99.0 + 50.0 + 60.0 + 70.0
+    );
+
+    // 谓词跨两块求值:segment 块命中 (1,5) + delta 块命中 (6,7),排除影子 (3,4)
+    let mut outcomes = engine
+        .execute_script(
+            "SELECT l_orderkey FROM lineitem \
+             WHERE l_shipdate >= DATE '2024-01-15' AND l_shipdate < DATE '2024-06-15' \
+             ORDER BY l_orderkey",
+        )
+        .unwrap();
+    match outcomes.pop().unwrap() {
+        Outcome::Query { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![ScalarValue::Int64(2)],
+                vec![ScalarValue::Int64(3)], // update 后仍在段内键序位,新值由 delta 块提供
+                vec![ScalarValue::Int64(5)],
+                vec![ScalarValue::Int64(6)],
+            ]
+        ),
+        other => panic!("expected query, got {other:?}"),
+    }
+
+    // ORDER BY DESC + LIMIT 跨块
+    let mut outcomes = engine
+        .execute_script(
+            "SELECT l_orderkey, l_quantity FROM lineitem \
+             ORDER BY l_orderkey DESC LIMIT 2",
+        )
+        .unwrap();
+    match outcomes.pop().unwrap() {
+        Outcome::Query { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![ScalarValue::Int64(7), ScalarValue::Int64(70)],
+                vec![ScalarValue::Int64(6), ScalarValue::Int64(60)],
+            ]
+        ),
+        other => panic!("expected query, got {other:?}"),
+    }
+}
+
+#[test]
+fn ap_multi_batch_split_across_chunks() {
+    // segment 块 > batch_size(默认 2048)+ delta 块 → 执行器逐块切批交付,
+    // 聚合结果与单块一致。
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path());
+    engine
+        .execute_script("CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL)")
+        .unwrap();
+    let mut values = String::new();
+    for i in 0..5000u64 {
+        if i > 0 {
+            values.push_str(", ");
+        }
+        values.push_str(&format!("({i}, {i})"));
+    }
+    engine
+        .execute_script(&format!("INSERT INTO t VALUES {values}"))
+        .unwrap();
+    flush(&engine);
+    engine.execute_script("INSERT INTO t VALUES (9999, 9999)").unwrap();
+    assert_eq!(count(&engine, "t"), 5001);
+    assert_eq!(sum(&engine, "t", "b"), (0..5000u64).sum::<u64>() as f64 + 9999.0);
+    // 谓词跨批:只命中 delta 块一行
+    let mut outcomes = engine
+        .execute_script("SELECT a FROM t WHERE b = 9999")
+        .unwrap();
+    match outcomes.pop().unwrap() {
+        Outcome::Query { rows, .. } => assert_eq!(rows, vec![vec![ScalarValue::Int64(9999)]]),
+        other => panic!("expected query, got {other:?}"),
+    }
 }
 
 #[test]

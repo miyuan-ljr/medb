@@ -27,6 +27,9 @@ sst_block_size = 16384             # 16 KiB
 bloom_bits_per_key = 10            # 误报率 ~1%
 # L0 文件数达到该阈值触发全量压缩
 l0_compaction_threshold = 4
+# WAL 每次追加后 fsync(SST 落盘同样 sync)—— 掉电不丢已确认提交。
+# false 时仅进程崩溃安全,小事务吞吐更高(基准/一次性导入可关)
+wal_sync = true
 
 [log]
 # 未设置 RUST_LOG 时的默认级别

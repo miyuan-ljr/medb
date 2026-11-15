@@ -107,9 +107,13 @@ postgres=# DELETE FROM users WHERE id = 1;
   INSERT 0 n / UPDATE n / DELETE n / CREATE TABLE / BEGIN / COMMIT 命令标签
 - 列存 segment 文件(`columnar_file`):每表一份 `columnar/{table_id}.{gen}.{max_seq}.seg`,
   列主序 + codec 编码 + CRC32 + tmp/rename 原子替换;只覆盖 SST 数据,
-  memtable 增量由 AP 读路径 overlay 合并;flush 钩子(LSM `set_flush_hook`)
-  在冻结表移除前重建段(overlay 无缺口),打开期按段名 max_seq 与 SST 比对
-  做陈旧检测(crash 窗口 → 行存回退),段损坏 → 告警 + 回退行存
+  memtable 增量在查询时转向量化(独立 delta 块 + 影子键剔除,segment 缓存
+  不标量化);flush 钩子(LSM `set_flush_hook`)在冻结表移除前重建段
+  (读路径无缺口),打开期两段式陈旧检测(crash 窗口 → 行存回退),
+  段损坏 → 告警 + 回退行存
+- **持久性**(`storage.wal_sync`,默认开):WAL 追加即 fsync + SST 落盘
+  sync_data(WAL reset 前必须持久)—— 掉电不丢已确认提交;关掉仅剩
+  进程崩溃安全,小事务吞吐更高
 - **TPC-H 基础(以 TPC-H 形状为验收标准,`server/tests/tpch.rs`)**:
   - **多表 FROM + JOIN 计划**:FROM 展开为有序关系步骤(逗号连接 = CROSS JOIN),
     每步 `SeqScan(下推过滤)→ HashJoin`;等值条件两侧各引一表 → 哈希键(probe 侧扁平下标、
@@ -162,9 +166,10 @@ postgres=# DELETE FROM users WHERE id = 1;
   - **谓词下推**:扫描谓词随解码过滤(`scan_table_filtered`),未命中行不进
     物化 —— JOIN build 侧、聚合输入、内存占用同步缩小;
   - **AP 列存路径**:标量表(Boolean/Int64/Float64/Utf8/Date)自动提交读
-    走列存 segment(整列向量,免逐行解码;SST 数据 + memtable overlay 合并,
-    UPDATE/DELETE 实时可见);补齐 **null 位图**与 **Date 列**支持,与行存
-    NULL 语义一致;门控:事务内读回退行存(overlay 不含事务缓冲,保证读己之写)、
+    走列存 segment(整列向量,免逐行解码;**多块拼接**:segment 块 +
+    memtable delta 块,UPDATE/DELETE 实时可见且 segment 缓存保持纯净);
+    补齐 **null 位图**与 **Date 列**支持,与行存 NULL 语义一致;
+    门控:事务内读回退行存(overlay 不含事务缓冲,保证读己之写)、
     LOB/数组/向量列回退、无段/段损坏回退(派生数据,永不影响正确性);
   - **并行框架**(`exec::parallel`):`scope_map` 作用域线程分片(保序拼接),
     应用于 LSM 解码过滤与 HashJoin 探测行组装;`engine.parallelism` 配置

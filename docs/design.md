@@ -85,28 +85,39 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 - 合并 = 各输入 scan → 内部键排序 → 同 user_key 取首条(最新)→ 墓碑直接丢
   (无更低层级)。O(n log n),数据量上来换分级/流式。
 
-### 3.6 恢复
+### 3.6 恢复与持久性边界
 - WAL 重放重建 memtable(`put_untracked`,恢复期不限额)。
 - 扫 sst/ 目录按文件名 `{id:020}.{level}.sst` 重建清单;.tmp 残留清理。
 - 两个来源的划分恰好覆盖"已 flush / 未 flush",无丢失窗口。
+- **持久性分级**(`storage.wal_sync`,默认 **true**):true = WAL 每次追加
+  sync_data + SST 落盘 sync(WAL reset 之前必须持久,flush/compaction 产物
+  同路径)→ 掉电不丢已确认提交;false = 仅进程崩溃安全(OS 页缓存存活),
+  小事务吞吐更高(基准/一次性导入可关)。
 
 ### 3.7 列存副本(HTAP)
 - **v2(现行,segment 架构)**:列存副本**只覆盖 SST 数据**,落盘为每表一份
   segment 文件(`columnar/{table_id}.{gen:05}.{max_seq}.seg`);memtable 增量
-  由 AP 读路径以 memtable overlay 合并(scan_memtable,活跃表 + 冻结表)。
-  segment 随 SST 生命周期存在:flush 钩子(LSM `set_flush_hook`,auto-flush
-  与手动 FLUSH 共用)→ 全表扫描重建为新代(代次 +1,旧代文件删除,tmp+rename
-  原子);ALTER ADD COLUMN → 删段失效(AP 回退行存,下次 flush 重建);
-  DROP TABLE → 删段 + 清代次/缓存。
+  由 AP 读路径在查询时转向量化(见下)。segment 随 SST 生命周期存在:
+  flush 钩子(LSM `set_flush_hook`,auto-flush 与手动 FLUSH 共用)→ 全表
+  扫描重建为新代(代次 +1,旧代文件删除,tmp+rename 原子);ALTER ADD COLUMN
+  → 删段失效(AP 回退行存,下次 flush 重建);DROP TABLE → 删段 + 清代次/缓存。
 - 一致性关键点:
-  - **flush 钩子在冻结表(imm)移除前触发** —— 重建期间 memtable overlay
-    仍含被 flush 的数据,"segment + overlay" 全程无缺口;
-  - **打开期陈旧检测**:crash 落在 flush 与重建之间时,SST 会比 segment 新。
-    文件名自带 segment max_seq(零 IO),与 SstMeta.max_seq(键范围重叠者)
-    比较 → 段过期则弃用(行存回退),下次 flush 重建;
+  - **flush 钩子在冻结表(imm)移除前触发** —— 重建期间 memtable 增量
+    仍含被 flush 的数据,"segment + delta 块" 全程无缺口;
+  - **打开期陈旧检测(两段式)**:段名 max_seq 只含行键 seq,而
+    SstMeta.max_seq 跨全部键空间(catalog/stats 与行数据同 SST)→ 直接比较
+    必然误报。① 廉价筛:SST 与行键范围重叠且 max_seq > 段 max_seq → 可疑;
+    ② 精确验证:只扫该表行键取可见版本最大 seq。真陈旧(crash 落在 flush
+    与重建之间)→ 弃段行存回退,下次 flush 重建;
   - 段损坏 → 告警 + 注销代次 + 行存回退(派生数据,不阻塞查询)。
-- 读取:segment 解码一次缓存(ApCache:列向量 + 行键位置),gen 变化自动失效;
-  memtable overlay 按 key_pos 原位覆盖更新 / 追加新键 / 跳过墓碑。
+- **读取(多块拼接语义)**:`scan_columns` 返回 `Vec<Vec<Vector>>`(块列表,
+  拼接 = 整表)。segment 解码缓存保持纯净(mutable 场景**不标量化**);
+  memtable 增量查询时转向量化:delta 解码成独立列块,update/delete 的行键
+  进影子集,segment 块按键成员判定整行剔除(`Vector::select`,向量化压缩,
+  无影子时缓存原样复用零拷贝)。执行器按队列逐块走向量化谓词求值与切批。
+  **依赖 `scan_memtable` 输出墓碑**(`(key, seq, None)`,storage 专用合并),
+  否则删除行无法从 segment 块剔除(v2 踩过:共用 `merge_visible_per_key`
+  把墓碑整键隐藏,DELETE 后 segment 块多出幽灵行)。
 - 后续:二级索引建在 segment 上(`BTreeMap<编码值, BTreeSet<row_key>>`,
   每段一棵索引树);字典/RLE 编码;增量 delta 行 + 后台 merge。
 
@@ -345,15 +356,14 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
   各线程解码组批(512 行)→ 向量化求值 → 按片序拼接(保插入序)。
   planner 的 `table_scan` 把合取谓词直接传给 SeqScan(不再叠加 FilterExec)。
   收益:未命中行不进物化,JOIN build 侧/聚合输入/内存同步缩小。
-- **AP 列存路径**:`QueryDataSource::scan_columns(table) -> Option<Vec<Vector>>`。
-  引擎实现:segment(仅 SST 数据)解码缓存逐列读出 → memtable overlay 合并 →
-  exec Vector(null 位图)。
+- **AP 列存路径**:`QueryDataSource::scan_columns(table) -> Option<Vec<Vec<Vector>>>`
+  (多块拼接语义)。引擎实现:segment 解码缓存块 + memtable delta 块(查询时
+  向量化,见 §3.7)。
   - 门控(任一不满足即回退行存):事务内读(overlay 不含事务缓冲,保读己之写)、
     LOB/数组/向量列、无 segment(首次 flush 前)/段缺失/段损坏;
-  - **覆盖一致性**:AP 只覆盖 SST;memtable 增量(含 WAL 重放恢复的)由
-    overlay 合并,update 原位覆盖、新键追加、墓碑剔除 —— 读写时序安全性由
-    flush 钩子的 imm 顺序保证(见 §3.7);
-  - **崩溃恢复**:打开期按文件名恢复 (代次, max_seq) 并做陈旧检测(见 §3.7);
+  - 执行器(SeqScan)按队列逐块求值:下推谓词逐块向量化 eval + select,
+    空块跳过;> batch_size 的块用 head 切批;
+  - **崩溃恢复**:打开期两段式陈旧检测(见 §3.7);
   - 解码缓存:段文件首次 AP 访问时整段解码为列向量缓存,gen 变化自动失效;
   - 列间长度一致性校验(misalignment = corruption 错误);
   - v1 教训(内存副本 + 水位线重放):重启后空/陈旧内存副本会遮蔽行存;

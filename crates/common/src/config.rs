@@ -130,6 +130,9 @@ pub struct StorageConfig {
     pub bloom_bits_per_key: usize,
     /// L0 文件数达到该阈值触发压缩。
     pub l0_compaction_threshold: usize,
+    /// WAL 每次追加后 fsync(SST 落盘同样 sync_data)—— 掉电不丢已确认提交。
+    /// false = 仅进程崩溃安全(OS 页缓存还在),小事务吞吐更高。
+    pub wal_sync: bool,
 }
 
 impl Default for StorageConfig {
@@ -141,6 +144,7 @@ impl Default for StorageConfig {
             sst_block_size: DEFAULT_SST_BLOCK_SIZE,
             bloom_bits_per_key: DEFAULT_BLOOM_BITS_PER_KEY,
             l0_compaction_threshold: DEFAULT_L0_COMPACTION_THRESHOLD,
+            wal_sync: true,
         }
     }
 }

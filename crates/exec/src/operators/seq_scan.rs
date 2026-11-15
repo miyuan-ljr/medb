@@ -2,8 +2,8 @@
 //!
 //! exec 不依赖 storage:数据源以 [`QueryDataSource`] trait 注入(由 server
 //! 的 Engine 实现)。惰性选择读取路径:
-//! ① **AP 列存**:数据源按列返回(标量表 + 无事务门控),谓词直接在列块上
-//!    求值压缩 —— 免逐行解码;
+//! ① **AP 列存**:数据源按列返回若干整块(segment + memtable delta,拼接
+//!    语义),谓词逐块向量化求值压缩 —— 免逐行解码;
 //! ② **行存 + 下推**:`scan_table_filtered` 解码期过滤,未命中行不进物化
 //!    (默认实现 = 整表拉取后分批过滤,引擎覆盖为并行解码过滤);
 //! ③ 行存全表。
@@ -72,10 +72,14 @@ pub trait QueryDataSource: Send + Sync {
         Ok(out)
     }
 
-    /// **AP 列存路径**:按列返回整表列向量(列序 = schema 列序;无 null 位图
-    /// 时全非空)。返回 None = 该表不可列式读取(类型不支持 / 一致性门控 /
-    /// 副本缺失),调用方回退行存路径。
-    fn scan_columns(&self, table: &TableSchema) -> Result<Option<Vec<crate::vector::Vector>>> {
+    /// **AP 列存路径**:按列返回若干整块列向量(列序 = schema 列序)。
+    /// 多块语义 = **拼接结果**(如 segment 块 + memtable delta 块);实现方
+    /// 保证跨块无重复行。每块独立走向量化谓词求值。返回 None = 该表不可
+    /// 列式读取(类型不支持 / 一致性门控 / 段缺失),调用方回退行存路径。
+    fn scan_columns(
+        &self,
+        table: &TableSchema,
+    ) -> Result<Option<Vec<Vec<crate::vector::Vector>>>> {
         let _ = table;
         Ok(None)
     }
@@ -92,8 +96,11 @@ pub struct SeqScanExec {
     needed: Option<Vec<bool>>,
     /// 行存路径:物化行集(下推过滤后)
     rows: Option<Vec<Row>>,
-    /// 列存路径:整表列块(AP 路径;列向量由副本所有,块为查询内副本)
-    column_chunk: Option<Option<DataChunk>>,
+    /// 列存路径:整块列块队列(AP 路径;segment + memtable delta 各一块,
+    /// 谓词逐块向量化求值),空队列即扫完
+    column_chunks: std::collections::VecDeque<DataChunk>,
+    /// 列存路径已选定(即使队列为空也不回退行存)
+    columnar_started: bool,
     /// 物化行集的内存记账(超查询/全局限额 → MemoryLimitExceeded)
     mem: Option<Reservation>,
     next: usize,
@@ -130,7 +137,8 @@ impl SeqScanExec {
             pushdown,
             needed,
             rows: None,
-            column_chunk: None,
+            column_chunks: Default::default(),
+            columnar_started: false,
             mem: None,
             next: 0,
         }
@@ -140,51 +148,57 @@ impl SeqScanExec {
 impl Executor for SeqScanExec {
     fn next_batch(&mut self, ctx: &mut ExecuteContext) -> Result<Option<DataChunk>> {
         // 三条路径,惰性选择:
-        // ① AP 列存:数据源可按列返回(标量表 + 一致性门控),谓词在列块上求值;
+        // ① AP 列存:数据源按列返回若干整块(segment + memtable delta 拼接),
+        //    谓词逐块求值压缩 —— 免逐行解码;
         // ② 行存 + 下推:谓词随解码过滤(存储引擎覆盖实现;默认整表拉取后过滤);
         // ③ 行存全表。
-        if self.column_chunk.is_none() && self.rows.is_none() {
-            let columnar = self.source.scan_columns(&self.table)?;
-            if let Some(mut columns) = columnar {
-                // 列存路径:整表一块(列向量由副本持有,此为查询内拷贝)
-                if let Some(pred) = &self.pushdown {
-                    let mut chunk = DataChunk::new(columns)?;
-                    let mask = pred.eval(&chunk)?;
-                    let sel: Vec<bool> = (0..chunk.num_rows())
-                        .map(|i| !mask.null_at(i) && mask.bool_values()[i])
-                        .collect();
-                    chunk = chunk.select(&sel, &ctx.mem.tracker)?;
-                    columns = chunk.into_columns();
+        if self.rows.is_none() && !self.columnar_started {
+            match self.source.scan_columns(&self.table)? {
+                Some(chunks) => {
+                    self.columnar_started = true;
+                    for columns in chunks {
+                        let mut chunk = DataChunk::new(columns)?;
+                        if let Some(pred) = &self.pushdown {
+                            let mask = pred.eval(&chunk)?;
+                            let sel: Vec<bool> = (0..chunk.num_rows())
+                                .map(|i| !mask.null_at(i) && mask.bool_values()[i])
+                                .collect();
+                            chunk = chunk.select(&sel, &ctx.mem.tracker)?;
+                        }
+                        if chunk.num_rows() > 0 {
+                            self.column_chunks.push_back(chunk);
+                        }
+                    }
                 }
-                self.column_chunk = Some(Some(DataChunk::new(columns)?));
-            } else {
-                let rows = match (&self.pushdown, &self.needed) {
-                    (Some(pred), Some(needed)) => {
-                        self.source
-                            .scan_table_filtered(&self.table, Some(pred), needed)?
-                    }
-                    (None, Some(needed)) => {
-                        self.source.scan_table_filtered(&self.table, None, needed)?
-                    }
-                    (Some(pred), None) => {
-                        let all = vec![true; self.table.columns.len()];
-                        self.source
-                            .scan_table_filtered(&self.table, Some(pred), &all)?
-                    }
-                    (None, None) => self.source.scan_table(&self.table)?,
-                };
-                // 物化行集计入配额树(与 DataChunk 记账同一棵树)
-                let bytes = rows
-                    .iter()
-                    .map(|r| crate::chunk::row_approx_bytes(&self.dtypes, r))
-                    .sum();
-                let res = ctx.mem.tracker.try_reserve(bytes)?;
-                self.mem = Some(res);
-                self.rows = Some(rows);
+                None => {
+                    let rows = match (&self.pushdown, &self.needed) {
+                        (Some(pred), Some(needed)) => {
+                            self.source
+                                .scan_table_filtered(&self.table, Some(pred), needed)?
+                        }
+                        (None, Some(needed)) => {
+                            self.source.scan_table_filtered(&self.table, None, needed)?
+                        }
+                        (Some(pred), None) => {
+                            let all = vec![true; self.table.columns.len()];
+                            self.source
+                                .scan_table_filtered(&self.table, Some(pred), &all)?
+                        }
+                        (None, None) => self.source.scan_table(&self.table)?,
+                    };
+                    // 物化行集计入配额树(与 DataChunk 记账同一棵树)
+                    let bytes = rows
+                        .iter()
+                        .map(|r| crate::chunk::row_approx_bytes(&self.dtypes, r))
+                        .sum();
+                    let res = ctx.mem.tracker.try_reserve(bytes)?;
+                    self.mem = Some(res);
+                    self.rows = Some(rows);
+                }
             }
         }
-        // 列存路径:块耗尽(slot=None)→ 结束
-        if self.column_chunk.is_some() {
+        // 列存路径:队列耗尽 → 结束
+        if self.columnar_started {
             return self.next_columnar_batch(ctx);
         }
         let rows = self.rows.as_ref().expect("rows fetched above");
@@ -205,20 +219,19 @@ impl Executor for SeqScanExec {
 }
 
 impl SeqScanExec {
-    /// 列存路径的批切分(整块 > batch_size 时用 head 逐步取出)。
+    /// 列存路径的批切分:队首块 ≤ batch_size 直接整块交付;大块用 head
+    /// 逐步取出,余下压缩放回。
     fn next_columnar_batch(&mut self, ctx: &mut ExecuteContext) -> Result<Option<DataChunk>> {
-        let slot = self.column_chunk.as_mut().expect("columnar prepared");
-        let Some(chunk) = slot.take() else {
+        let Some(front) = self.column_chunks.front_mut() else {
             return Ok(None);
         };
-        if chunk.num_rows() <= ctx.batch_size {
-            return Ok(Some(chunk));
+        if front.num_rows() <= ctx.batch_size {
+            return Ok(self.column_chunks.pop_front());
         }
-        let head = chunk.head(ctx.batch_size, &ctx.mem.tracker)?;
-        // 余下部分放回(下次继续切)
-        let rest_sel: Vec<bool> = (0..chunk.num_rows()).map(|i| i >= ctx.batch_size).collect();
-        let rest = chunk.select(&rest_sel, &ctx.mem.tracker)?;
-        *slot = Some(rest);
+        let head = front.head(ctx.batch_size, &ctx.mem.tracker)?;
+        let rest_sel: Vec<bool> = (0..front.num_rows()).map(|i| i >= ctx.batch_size).collect();
+        let rest = front.select(&rest_sel, &ctx.mem.tracker)?;
+        *front = rest;
         Ok(Some(head))
     }
 }
