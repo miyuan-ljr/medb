@@ -1135,6 +1135,7 @@ dependencies = [
  "medb-storage",
  "parking_lot",
  "pgwire",
+ "serde",
  "serde_json",
  "sqlparser",
  "tempfile",

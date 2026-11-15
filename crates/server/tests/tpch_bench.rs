@@ -507,6 +507,7 @@ fn tpch_benchmark() {
     // 那是写多读少场景的代价,不属于本基准的测量目标。
     let t = Instant::now();
     engine.flush().unwrap();
+    let t_flush_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("flush-before-query: {:?}", t.elapsed());
 
     for (t, expect) in [
@@ -529,6 +530,7 @@ fn tpch_benchmark() {
         "query", "rows", "warm(ms)", "avg(ms)", "min(ms)"
     );
     let mut total = 0.0f64;
+    let mut records: Vec<BenchRecord> = Vec::with_capacity(QUERIES.len());
     for (name, sql) in QUERIES {
         let t0 = Instant::now();
         let rows = exec(&engine, sql); // warm(含首次自动 ANALYZE)
@@ -543,12 +545,216 @@ fn tpch_benchmark() {
         let avg = times.iter().sum::<f64>() / times.len() as f64;
         let min = times.iter().cloned().fold(f64::MAX, f64::min);
         total += avg;
+        records.push(BenchRecord {
+            query: name.to_string(),
+            rows,
+            avg_ms: avg,
+            min_ms: min,
+        });
         println!(
             "{:<6} {:>8} {:>10.1} {:>10.1} {:>8.1}",
             name, rows, warm, avg, min
         );
     }
     println!("{:<6} {:>20.1}", "TOTAL(avg sum)", total);
+
+    // ---------- 逐 SQL 对比报告(与上次基线 Δ% / 占比 / 对 PG 比值) ----------
+    report_and_save_baseline(
+        &records,
+        total,
+        load_main.as_secs_f64() * 1000.0,
+        t_flush_ms,
+    );
+}
+
+// ---------- 基线对比(每次运行持久化 + 与上次逐 SQL 对比) ----------
+
+/// PostgreSQL 18.6 同数据同机参考值(EXPLAIN ANALYZE 计时,默认配置,
+/// 2026-11 实测)。机器/配置变化时仅作量级参考。
+const PG_REFERENCE_MS: &[(&str, f64)] = &[
+    ("Q1", 16.7),
+    ("Q3", 10.3),
+    ("Q5", 9.3),
+    ("Q6", 3.3),
+    ("Q7", 8.3),
+    ("Q10", 3.2),
+    ("Q11", 6.9),
+    ("Q12", 5.9),
+    ("Q14", 4.9),
+    ("Q18", 16.4),
+    ("Q19", 4.6),
+];
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct BenchRecord {
+    query: String,
+    rows: usize,
+    avg_ms: f64,
+    min_ms: f64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Baseline {
+    profile: String,
+    load_execute_ms: f64,
+    flush_ms: f64,
+    total_avg_ms: f64,
+    queries: Vec<BenchRecord>,
+    saved_at: String,
+}
+
+fn baseline_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("target/tpch_baseline.json")
+}
+
+fn history_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("target/tpch_history.jsonl")
+}
+
+fn build_profile_tag() -> String {
+    if cfg!(debug_assertions) {
+        "debug".to_string()
+    } else {
+        "release".to_string()
+    }
+}
+
+/// 打印与上次基线的逐 SQL 对比表,并把本次结果持久化为新基线 + 追加历史。
+///
+/// 表格列:avg(本次均值)/ prev(上次基线)/ Δ%(变化)/ share(占总耗时)/
+/// vsPG(与 PG 参考值的倍数)。**优化方向看两列**:share 大 = 总耗时大头;
+/// vsPG 大 = 相对主流库差距最大的形状(单表聚合 / 连接 / 子查询)。
+fn report_and_save_baseline(records: &[BenchRecord], total: f64, load_ms: f64, flush_ms: f64) {
+    let profile = build_profile_tag();
+    let prev: Option<Baseline> = std::fs::read(baseline_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+
+    let comparable = prev
+        .as_ref()
+        .is_some_and(|p| p.profile == profile && p.total_avg_ms > 0.0);
+    if let Some(p) = &prev {
+        if !comparable {
+            println!(
+                "\n[note] 上次基线 profile={} 与本次({})不可比,跳过 Δ%",
+                p.profile, profile
+            );
+        }
+    }
+
+    println!(
+        "\n{:<6} {:>8} {:>9} {:>9} {:>9} {:>8} {:>7}",
+        "query", "avg(ms)", "prev", "Δ%", "share%", "vsPG", "min(ms)"
+    );
+    for r in records {
+        let pg = PG_REFERENCE_MS
+            .iter()
+            .find(|(n, _)| *n == r.query)
+            .map(|(_, v)| *v)
+            .unwrap_or(f64::NAN);
+        let share = if total > 0.0 { r.avg_ms / total * 100.0 } else { 0.0 };
+        let vs_pg = if pg > 0.0 { r.avg_ms / pg } else { f64::NAN };
+        let (prev_avg, delta) = if comparable {
+            prev.as_ref()
+                .unwrap()
+                .queries
+                .iter()
+                .find(|p| p.query == r.query)
+                .map(|p| {
+                    let d = if p.avg_ms > 0.0 {
+                        (r.avg_ms - p.avg_ms) / p.avg_ms * 100.0
+                    } else {
+                        f64::NAN
+                    };
+                    (p.avg_ms, d)
+                })
+                .unwrap_or((f64::NAN, f64::NAN))
+        } else {
+            (f64::NAN, f64::NAN)
+        };
+        println!(
+            "{:<6} {:>8.1} {:>9.1} {:>+8.1}% {:>7.1}% {:>6.2}x {:>7.1}",
+            r.query, r.avg_ms, prev_avg, delta, share, vs_pg, r.min_ms
+        );
+    }
+    let prev_total = if comparable {
+        prev.as_ref().unwrap().total_avg_ms
+    } else {
+        f64::NAN
+    };
+    let total_delta = if comparable {
+        (total - prev_total) / prev_total * 100.0
+    } else {
+        f64::NAN
+    };
+    println!(
+        "{:<6} {:>8.1} {:>9.1} {:>+8.1}% {:>7.1}% {:>6.2}x",
+        "TOTAL",
+        total,
+        prev_total,
+        total_delta,
+        100.0,
+        total / PG_REFERENCE_MS.iter().map(|(_, v)| v).sum::<f64>()
+    );
+
+    // 优化方向提示:占比前三(总耗时大头)+ 相对 PG 差距前三(形状差距)
+    let mut by_share = records.to_vec();
+    by_share.sort_by(|a, b| b.avg_ms.partial_cmp(&a.avg_ms).unwrap());
+    let hints: Vec<String> = by_share
+        .iter()
+        .take(3)
+        .map(|r| {
+            let pg = PG_REFERENCE_MS
+                .iter()
+                .find(|(n, _)| *n == r.query)
+                .map(|(_, v)| *v)
+                .unwrap_or(1.0);
+            format!(
+                "{} {:.1}ms (share {:.0}%, vsPG {:.1}x)",
+                r.query,
+                r.avg_ms,
+                if total > 0.0 { r.avg_ms / total * 100.0 } else { 0.0 },
+                r.avg_ms / pg
+            )
+        })
+        .collect();
+    println!("\n[next] 优化方向(占比前三): {}", hints.join(" | "));
+
+    // 持久化:基线覆盖 + 历史追加
+    let baseline = Baseline {
+        profile,
+        load_execute_ms: load_ms,
+        flush_ms,
+        total_avg_ms: total,
+        queries: records.to_vec(),
+        saved_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default(),
+    };
+    if let Some(parent) = baseline_path().parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(
+        baseline_path(),
+        serde_json::to_string_pretty(&baseline).unwrap(),
+    )
+    .unwrap();
+    let mut history_line = serde_json::to_string(&baseline).unwrap();
+    history_line.push('\n');
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path())
+        .unwrap()
+        .write_all(history_line.as_bytes())
+        .unwrap();
+    println!(
+        "[saved] {} (基线) / {} (历史追加)",
+        baseline_path().display(),
+        history_path().display()
+    );
 }
 
 /// 把装载 SQL 与 11 条查询导出到目录(默认 target/tpch_sql),供
