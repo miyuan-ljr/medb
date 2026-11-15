@@ -774,7 +774,7 @@ fn plan_select(
         // 引用来源:扫描下推谓词 / 延迟 WHERE / JOIN 键与残余(pool)/
         // 投影 + 排序隐藏键 / 分组 + 聚合参数 / HAVING(SQL 级)。
         let mut refs: std::collections::HashSet<usize> = Default::default();
-        let mut collect_flat = |e: &Expr, out: &mut std::collections::HashSet<usize>| {
+        let collect_flat = |e: &Expr, out: &mut std::collections::HashSet<usize>| {
             collect_column_refs(e, out);
         };
         for preds in &scan_preds {
@@ -785,9 +785,17 @@ fn plan_select(
         for (_, e) in &deferred {
             collect_flat(e, &mut refs);
         }
-        for (keys, _) in &left_keys {
+        for (j, (keys, builds)) in left_keys.iter().enumerate() {
             for e in keys {
                 collect_flat(e, &mut refs);
+            }
+            // build 侧键是表内局部下标(rebase 过)→ 平移回扁平下标再入集
+            for e in builds {
+                let mut local: std::collections::HashSet<usize> = Default::default();
+                collect_column_refs(e, &mut local);
+                for i in local {
+                    refs.insert(offsets[j] + i);
+                }
             }
         }
         for ms in &left_match {

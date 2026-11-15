@@ -11,7 +11,6 @@
 //! - [`table`]:表数据键布局(行键 / 目录键 / 范围);
 //! - [`columnar`]:列存副本 trait 与内存实现(HTAP AP 路径)。
 
-pub mod columnar;
 pub mod columnar_file;
 pub mod compaction;
 pub mod key;
@@ -22,7 +21,6 @@ pub mod sstable;
 pub mod table;
 pub mod wal;
 
-pub use columnar::{ColumnVector, ColumnarReplica, InMemoryColumnarReplica};
 pub use compaction::{CompactionStrategy, CompactionTask, LeveledStrategy};
 pub use key::{InternalKey, KeyKind};
 pub use lsm::{LsmOptions, LsmStats, LsmStore};

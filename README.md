@@ -4,7 +4,8 @@
 
 - **存储引擎**:LSM tree(行存主库)
 - **执行引擎**:向量化(批式列存 + 类型化内核)
-- **HTAP**:行存为 TP 主库,列存副本异步同步服务 AP 查询(钩子已就位)
+- **HTAP**:行存为 TP 主库,列存 segment(只覆盖 SST)随 flush 重建,
+  memtable 增量由 AP 读路径 overlay 合并
 - **客户端**:现成 psql / 任意 PostgreSQL 驱动(PG wire 协议)
 
 ## 快速开始
@@ -36,7 +37,7 @@ postgres=# DELETE FROM users WHERE id = 1;
                  │  exec           │  向量化执行:Vector/DataChunk/算子
                  ├─────────────────┤
                  │  storage        │  LSM:memtable/WAL/SST/compaction
-                 │  columnar       │  列存副本(HTAP AP 路径钩子)
+                 │  columnar_file  │  列存 segment(AP,flush 钩子重建)
                  ├─────────────────┤
                  │  memory         │  mimalloc + 配额树 + arena
                  ├─────────────────┤
@@ -52,7 +53,7 @@ postgres=# DELETE FROM users WHERE id = 1;
 | --- | --- |
 | `medb-common`(common) | 错误、`DataType`/`ScalarValue`、schema、行编码、varint、配置 |
 | `medb-memory`(memory) | 全局分配器(mimalloc,feature 可关)、`MemoryTracker` 配额树、`Arena` |
-| `medb-storage`(storage) | 内部键编码、memtable(跳表)、WAL、SST(block/bloom/index)、压缩、恢复、列存副本 |
+| `medb-storage`(storage) | 内部键编码、memtable(跳表)、WAL、SST(block/bloom/index)、压缩、恢复、列存 segment 文件 |
 | `medb-exec`(exec) | `Vector`(null 位图)/`DataChunk`、表达式内核、`Executor` 拉取框架、算子 |
 | `medb-catalog`(catalog) | 元数据 trait + 内存实现 |
 | `medb-sql`(sql) | 解析 + 骨架计划器(无 FROM SELECT → 流水线) |
@@ -104,7 +105,11 @@ postgres=# DELETE FROM users WHERE id = 1;
   (读己之写)、COMMIT 原子落盘、事务内 DDL 拒绝、多会话隔离测试
 - PG 协议端到端:RowDescription/DataRow/CommandComplete/ErrorResponse、
   INSERT 0 n / UPDATE n / DELETE n / CREATE TABLE / BEGIN / COMMIT 命令标签
-- 列存副本 trait + 内存实现(CDC upsert/delete/drop_table/scan_column)
+- 列存 segment 文件(`columnar_file`):每表一份 `columnar/{table_id}.{gen}.{max_seq}.seg`,
+  列主序 + codec 编码 + CRC32 + tmp/rename 原子替换;只覆盖 SST 数据,
+  memtable 增量由 AP 读路径 overlay 合并;flush 钩子(LSM `set_flush_hook`)
+  在冻结表移除前重建段(overlay 无缺口),打开期按段名 max_seq 与 SST 比对
+  做陈旧检测(crash 窗口 → 行存回退),段损坏 → 告警 + 回退行存
 - **TPC-H 基础(以 TPC-H 形状为验收标准,`server/tests/tpch.rs`)**:
   - **多表 FROM + JOIN 计划**:FROM 展开为有序关系步骤(逗号连接 = CROSS JOIN),
     每步 `SeqScan(下推过滤)→ HashJoin`;等值条件两侧各引一表 → 哈希键(probe 侧扁平下标、
@@ -157,10 +162,10 @@ postgres=# DELETE FROM users WHERE id = 1;
   - **谓词下推**:扫描谓词随解码过滤(`scan_table_filtered`),未命中行不进
     物化 —— JOIN build 侧、聚合输入、内存占用同步缩小;
   - **AP 列存路径**:标量表(Boolean/Int64/Float64/Utf8/Date)自动提交读
-    走列存副本(整列向量,免逐行解码);列存副本补齐 **null 位图**与
-    **Date 列**支持,与行存 NULL 语义一致;门控:事务内读回退行存
-    (副本只镜像已提交状态,保证读己之写)、LOB/数组/向量列回退;
-    **重启从 LSM 全量重建副本**(空副本不再被误当可信);
+    走列存 segment(整列向量,免逐行解码;SST 数据 + memtable overlay 合并,
+    UPDATE/DELETE 实时可见);补齐 **null 位图**与 **Date 列**支持,与行存
+    NULL 语义一致;门控:事务内读回退行存(overlay 不含事务缓冲,保证读己之写)、
+    LOB/数组/向量列回退、无段/段损坏回退(派生数据,永不影响正确性);
   - **并行框架**(`exec::parallel`):`scope_map` 作用域线程分片(保序拼接),
     应用于 LSM 解码过滤与 HashJoin 探测行组装;`engine.parallelism` 配置
     (默认 CPU 核数,上限 8);
@@ -188,8 +193,9 @@ postgres=# DELETE FROM users WHERE id = 1;
 
 - **M1 事务剩余**:写冲突检测(first-committer-wins)、语句级保存点、
   隔离级别提升(快照隔离)
-- **M3 HTAP 落地**:AP 扫描走列存副本(行/列双跑一致性对照);
-  列存 segment 文件(字典/RLE 编码)+ 后台 compaction
+- **M3 HTAP 落地剩余**:二级索引建在列存 segment 上
+  (`BTreeMap<编码值, BTreeSet<row_key>>`,每段一棵索引树);
+  段级列剪枝、字典/RLE 编码、增量 delta 行 + 后台 merge
 - **M2/M4/M5**:RIGHT/FULL JOIN、**相关子查询**(EXISTS/IN 引用外层列)与
   FROM 派生表、CREATE VIEW、COUNT(DISTINCT)、TPC-H 数据加载(dbgen tbl 导入)、
   extended query protocol(psql \d)、块缓存、

@@ -7,7 +7,7 @@
 //!
 //! row_id 派生自 `alloc_sequences`(重启水位 = WAL/SST 最大 seq),单调不复用。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -28,7 +28,7 @@ use sql::parser::parse_statements;
 use sql::planner::{PlanContext, PlannedQuery, StatementPlan, plan_statement};
 use storage::lsm::LsmStore;
 use storage::table::{catalog_key, catalog_range, row_key, row_range};
-use storage::{ColumnarReplica, InMemoryColumnarReplica};
+use storage::columnar_file::{self as columnar_file, SegmentRow};
 use tracing::{debug, info, warn};
 
 /// 一条语句的执行结果(协议无关,由 handlers 映射到 pgwire Response)。
@@ -115,8 +115,6 @@ impl StatsStore {
 /// 全量(或抽样)扫描重建统计(自动 ANALYZE 与 ANALYZE 语句共用)。
 /// 抽样目标 100 万行:超过时按等步长抽样,NDV 为样本下界估计。
 const ANALYZE_SAMPLE_ROWS: usize = 1 << 20;
-/// 列存增量写次数超过此值 → 自动持久化列存快照。
-const COLUMNAR_PERSIST_THRESHOLD: u64 = 100_000;
 
 /// 解码一片 entry 并按谓词过滤(并行解码的工作单元)。
 /// 组批(512 行)向量化求值谓词,命中行按序返回。
@@ -185,60 +183,6 @@ fn decode_filtered_slice(
     Ok(out)
 }
 
-/// 列存 ColumnVector → exec Vector;Empty(空表/不支持)→ None。
-fn column_vector_to_exec(
-    cv: storage::columnar::ColumnVector,
-    _ty: common::types::DataType,
-) -> Result<Option<Vector>> {
-    use storage::columnar::ColumnValues;
-    fn to_validity(nulls: Option<Vec<bool>>, len: usize) -> Option<exec::vector::Validity> {
-        nulls.map(|mask| {
-            let mut v = exec::vector::Validity::all_valid(len);
-            for (i, is_null) in mask.iter().enumerate() {
-                if *is_null {
-                    v.unset(i);
-                }
-            }
-            v
-        })
-    }
-    // nulls 先于 values 消费(避免借用冲突)
-    let values_len = cv.values_len();
-    let validity = to_validity(cv.nulls, values_len);
-    let v = match cv.values {
-        ColumnValues::Bool(values) => {
-            Vector::new(exec::vector::ColumnData::Bool(values), validity)?
-        }
-        ColumnValues::Int64(values) => {
-            Vector::new(exec::vector::ColumnData::Int64(values), validity)?
-        }
-        ColumnValues::Float64(values) => {
-            Vector::new(exec::vector::ColumnData::Float64(values), validity)?
-        }
-        ColumnValues::Utf8(values) => Vector::new(
-            exec::vector::ColumnData::Utf8 {
-                data: values.concat().into_bytes(),
-                offsets: {
-                    let mut o = Vec::with_capacity(values.len() + 1);
-                    let mut acc = 0u32;
-                    o.push(0);
-                    for s in &values {
-                        acc += s.len() as u32;
-                        o.push(acc);
-                    }
-                    o
-                },
-            },
-            validity,
-        )?,
-        ColumnValues::Date(values) => {
-            Vector::new(exec::vector::ColumnData::Date(values), validity)?
-        }
-        ColumnValues::Empty => return Ok(None),
-    };
-    Ok(Some(v))
-}
-
 fn compute_table_stats(lsm: &Arc<LsmStore>, table: &TableSchema) -> TableStats {
     let (from, to) = row_range(table.id);
     let Ok(entries) = lsm.scan(&from, &to) else {
@@ -278,7 +222,7 @@ struct LsmDataSource {
     overlay: Arc<std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
     stats: Arc<StatsStore>,
     /// AP 列存副本句柄;None = 事务内(副本只见已提交状态,回退行存)
-    columnar: Option<Arc<InMemoryColumnarReplica>>,
+    ap: Option<Arc<ApStore>>,
     /// 并行度(解码/过滤线程数)
     threads: usize,
 }
@@ -358,10 +302,14 @@ impl QueryDataSource for LsmDataSource {
     }
 
     /// AP 列存路径:标量表 + 无事务门控;Date 列已支持;LOB/数组/向量回退。
+    /// **AP 列存路径**:segment(仅 SST 数据)+ memtable overlay 合并。
+    /// 门控:事务内读回退行存(overlay 不含事务缓冲,保读己之写)。
     fn scan_columns(&self, table: &TableSchema) -> Result<Option<Vec<Vector>>> {
-        let Some(replica) = &self.columnar else {
+        let Some(ap) = &self.ap else {
             return Ok(None);
         };
+        // 类型门控:非标量列(Date/Binary/Array/Vector 中仅 Date 支持段内编解码
+        // —— codec 全类型都支持,但保留 Binary/Array/Vector 检查以防旧段)
         for c in &table.columns {
             if !matches!(
                 c.ty,
@@ -374,21 +322,188 @@ impl QueryDataSource for LsmDataSource {
                 return Ok(None);
             }
         }
-        let mut cols = Vec::with_capacity(table.columns.len());
-        for (i, c) in table.columns.iter().enumerate() {
-            let cv = replica.scan_column(common::ids::TableId(table.id), i, &c.ty)?;
-            let Some(v) = column_vector_to_exec(cv, c.ty.clone())? else {
-                return Ok(None); // 空表(或类型不符)→ 行存路径
-            };
-            cols.push(v);
+        let Some((generation, _seg_max_seq)) = ap.segment_info(table.id) else {
+            return Ok(None); // 无 segment → 行存路径(首次 flush 后才有)
+        };
+        // 取/建解码缓存(段文件 → 列向量;gen 变化自动失效)
+        let cache = match ap.cache(table.id) {
+            Some(c) if c.generation == generation => c,
+            _ => {
+                let path =
+                    columnar_file::segment_path(&ap.dir(), table.id, generation, _seg_max_seq);
+                let seg = match columnar_file::read_segment(&path, table.id) {
+                    Ok(Some(seg)) => seg,
+                    Ok(None) => return Ok(None), // 段缺失(被删/代次超前)→ 行存回退
+                    Err(e) => {
+                        // 段损坏:派生数据不阻塞查询 → 注销代次 + 行存回退,
+                        // 下次 flush 重建新段(文件按代次整份替换)。
+                        warn!(table = %table.name, error = %e, "columnar segment corrupt; row-store fallback");
+                        ap.remove(table.id);
+                        return Ok(None);
+                    }
+                };
+                // 列主序组装:cell 解码 → 每列 Vector(null 经 validity)
+                let mut col_vals: Vec<Vec<ScalarValue>> =
+                    vec![Vec::with_capacity(seg.rows.len()); table.columns.len()];
+                let mut keys = Vec::with_capacity(seg.rows.len());
+                for r in &seg.rows {
+                    keys.push(r.key.clone());
+                    for (c, cell) in r.row.iter().enumerate() {
+                        col_vals[c].push(cell.clone());
+                    }
+                }
+                let cols = table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(c, desc)| Vector::from_scalars(desc.ty.clone(), col_vals[c].clone()))
+                    .collect::<Result<Vec<_>>>()?;
+                let c = Arc::new(ApCache {
+                    generation: generation,
+                    key_pos: keys
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, k)| (k, i))
+                        .collect(),
+                    cols,
+                    rows: seg.rows.len(),
+                });
+                ap.set_cache(table.id, c.clone());
+                c
+            }
+        };
+        // memtable overlay:AP 只覆盖 SST 数据,memtable 增量在此合并
+        // (memtable seq 恒大于已 flush seq → overlay 恒为最新版本)
+        let (from, to) = row_range(table.id);
+        let mt = self.lsm.scan_memtable(&from, &to, self.read_ts)?;
+        if mt.is_empty() {
+            return Ok(Some(cache.cols.clone()));
         }
-        // 列间长度一致性(副本损坏防护)
-        let len = cols[0].len();
-        if cols.iter().any(|v| v.len() != len) {
-            return Err(Error::corruption("columnar columns misaligned"));
+        let mut vals: Vec<Vec<ScalarValue>> = cache
+            .cols
+            .iter()
+            .map(|v| (0..v.len()).map(|i| v.scalar_at(i)).collect::<Vec<_>>())
+            .collect();
+        let mut del_pos: std::collections::HashSet<usize> = Default::default();
+        let mut appended = 0usize;
+        for (k, _seq, v) in &mt {
+            match v {
+                Some(bytes) => {
+                    let mut s = bytes.as_slice();
+                    let mut row = common::codec::decode_row(&mut s)?;
+                    if row.len() < table.columns.len() {
+                        row.resize(table.columns.len(), ScalarValue::Null);
+                    } else if row.len() > table.columns.len() {
+                        row.truncate(table.columns.len());
+                    }
+                    if let Some(&pos) = cache.key_pos.get(k) {
+                        for c in 0..vals.len() {
+                            vals[c][pos] = row[c].clone();
+                        }
+                    } else {
+                        for c in 0..vals.len() {
+                            vals[c].push(row[c].clone());
+                        }
+                        appended += 1;
+                    }
+                }
+                None => {
+                    if let Some(&pos) = cache.key_pos.get(k) {
+                        del_pos.insert(pos);
+                    }
+                }
+            }
         }
+        // 构建最终列:缓存部分跳过删除位 + 追加行
+        let cached = cache.rows;
+        let cols = (0..table.columns.len())
+            .map(|c| {
+                let kept: Vec<ScalarValue> = (0..cached)
+                    .filter(|i| !del_pos.contains(i))
+                    .map(|i| vals[c][i].clone())
+                    .chain(
+                        (0..appended).map(|i| vals[c][cached + i].clone()),
+                    )
+                    .collect();
+                Vector::from_scalars(table.columns[c].ty.clone(), kept)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Some(cols))
     }
+}
+
+/// AP 列存段存储:segment 目录 + 每表代次 + 解码列缓存。
+/// 列存副本只覆盖 SST 数据;memtable 增量由读路径以 overlay 合并。
+pub(crate) struct ApStore {
+    dir: std::path::PathBuf,
+    /// table_id → (generation, segment max_seq)。缺失 = 无段(行存回退)。
+    gens: Mutex<HashMap<u64, (u64, u64)>>,
+    caches: Mutex<HashMap<u64, Arc<ApCache>>>,
+}
+
+impl ApStore {
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// 当前段 (generation, max_seq);无段返回 None。
+    pub fn segment_info(&self, table_id: u64) -> Option<(u64, u64)> {
+        self.gens.lock().get(&table_id).copied()
+    }
+
+    pub fn set_gen(&self, table_id: u64, generation: u64, max_seq: u64) {
+        self.gens.lock().insert(table_id, (generation, max_seq));
+    }
+
+    pub fn remove(&self, table_id: u64) {
+        self.gens.lock().remove(&table_id);
+        self.caches.lock().remove(&table_id);
+    }
+
+    /// 删除某表全部 segment 文件并清空代次/缓存(ALTER 失效 / DROP 清理)。
+    /// 文件必须当场删除:残留旧代文件会让重启后的代次发现恢复出过期 schema。
+    pub fn remove_table(&self, table_id: u64) {
+        self.remove_files_matching(table_id, |_| false);
+        self.remove(table_id);
+    }
+
+    /// 删除某表满足条件的 segment 文件(keep 返回 true 的保留)。
+    pub(crate) fn remove_files_matching(
+        &self,
+        table_id: u64,
+        keep: impl Fn(&str) -> bool,
+    ) {
+        let prefix = format!("{table_id}.");
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && name.ends_with(".seg") && !keep(&name) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    pub fn cache(&self, table_id: u64) -> Option<Arc<ApCache>> {
+        self.caches.lock().get(&table_id).cloned()
+    }
+
+    pub fn set_cache(&self, table_id: u64, cache: Arc<ApCache>) {
+        self.caches.lock().insert(table_id, cache);
+    }
+
+    pub fn invalidate_cache(&self, table_id: u64) {
+        self.caches.lock().remove(&table_id);
+    }
+}
+
+/// 解码后的列缓存(一段 segment 的列向量 + 行键位置索引)。
+pub(crate) struct ApCache {
+    pub generation: u64,
+    pub key_pos: HashMap<Vec<u8>, usize>,
+    pub cols: Vec<Vector>,
+    pub rows: usize,
 }
 
 /// 引擎持有的活跃快照(GC 水位 = 最小活跃快照);语句结束自动注销。
@@ -417,12 +532,8 @@ pub struct Engine {
     memory: Arc<MemoryManager>,
     catalog: Arc<InMemoryCatalog>,
     lsm: Arc<LsmStore>,
-    columnar: Arc<InMemoryColumnarReplica>,
+    ap: Arc<ApStore>,
     stats: Arc<StatsStore>,
-    /// 列存快照水位线(table_id → 已镜像的最大 LSM seq)
-    columnar_wm: Mutex<std::collections::HashMap<u64, u64>>,
-    /// 列存增量写次数(超阈值自动持久化快照)
-    columnar_dirty: std::sync::atomic::AtomicU64,
     active_snapshots: Mutex<BTreeSet<u64>>,
     /// 提交锁:唯一性探测与写盘在同一把锁下串行,消除 check-then-write 竞争
     commit_lock: Mutex<()>,
@@ -481,152 +592,77 @@ impl Engine {
             info!(tables = restored_stats, "table stats restored from lsm");
         }
 
-        // 列存副本是内存镜像,重启即失 —— 从 LSM 全量重建,
-        // 使 AP 列存路径与行存始终一致(增量 CDC 见路线图)
-        let columnar = Arc::new(InMemoryColumnarReplica::new());
-        let columnar_wm: Mutex<std::collections::HashMap<u64, u64>> =
-            Mutex::new(std::collections::HashMap::new());
-        let col_dir = config.storage.data_dir.join("columnar");
-        let mut mirrored_rows = 0u64;
-        let mut snap_recovered = 0u64;
-        let mut replayed = 0u64;
-        for schema in catalog.list_tables() {
-            let schema_arc = Arc::new(schema.clone());
-            // ① 优先加载列存快照(列格式 + 水位线);缺失/损坏 → 全量重建
-            let snap_path = storage::columnar_file::snapshot_path(&col_dir, schema.id);
-            #[allow(unused_assignments)] // 重建分支在循环内重新赋值
-            let mut wm = 0u64;
-            let mut snap_recovered_this = false;
-            match storage::columnar_file::read_snapshot(&snap_path, schema.id) {
-                Ok(Some(snap)) => {
-                    wm = snap.watermark;
-                    columnar.bulk_load(schema.id, snap.entries);
-                    snap_recovered += 1;
-                    snap_recovered_this = true;
-                }
-                Ok(None) => {
-                    let (from, to) = row_range(schema.id);
-                    let Ok(entries) = lsm.scan(&from, &to) else {
-                        continue;
-                    };
-                    for (key, _seq, value) in entries {
-                        let Some(bytes) = value else { continue };
-                        let mut slice = bytes.as_slice();
-                        let Ok(mut row) = common::codec::decode_row(&mut slice) else {
-                            continue;
-                        };
-                        if row.len() < schema.columns.len() {
-                            row.resize(schema.columns.len(), ScalarValue::Null);
-                        } else if row.len() > schema.columns.len() {
-                            row.truncate(schema.columns.len());
-                        }
-                        if let Err(e) = columnar.upsert(&schema_arc, &key, row) {
-                            warn!(table = %schema.name, error = %e, "columnar rebuild failed");
-                            break;
-                        }
-                        mirrored_rows += 1;
-                    }
-                    wm = lsm.last_sequence();
-                }
-                Err(e) => {
-                    warn!(table = %schema.name, error = %e, "columnar snapshot corrupt; full rebuild");
-                    let (from, to) = row_range(schema.id);
-                    let Ok(entries) = lsm.scan(&from, &to) else {
-                        continue;
-                    };
-                    for (key, _seq, value) in entries {
-                        let Some(bytes) = value else { continue };
-                        let mut slice = bytes.as_slice();
-                        let Ok(mut row) = common::codec::decode_row(&mut slice) else {
-                            continue;
-                        };
-                        if row.len() < schema.columns.len() {
-                            row.resize(schema.columns.len(), ScalarValue::Null);
-                        } else if row.len() > schema.columns.len() {
-                            row.truncate(schema.columns.len());
-                        }
-                        if let Err(e) = columnar.upsert(&schema_arc, &key, row) {
-                            warn!(table = %schema.name, error = %e, "columnar rebuild failed");
-                            break;
-                        }
-                        mirrored_rows += 1;
-                    }
-                    wm = lsm.last_sequence();
-                }
-            }
-            // ② 重放快照水位之后的 LSM 变更(upsert / 删除)
-            let (from, to) = row_range(schema.id);
-            let Ok(entries) = lsm.scan(&from, &to) else {
-                continue;
-            };
-            // 快照恢复的表:记录副本键集,重放后移除已不在 LSM 可见集的键
-            // (LSM 扫描会剔除墓碑键,删除必须经此补齐)
-            let snapshot_keys: Option<std::collections::HashSet<Vec<u8>>> = if snap_recovered_this {
-                Some(
-                    columnar
-                        .collect_table(schema.id)
-                        .map(|entries| entries.into_iter().map(|(k, _)| k).collect())
-                        .unwrap_or_default(),
-                )
-            } else {
-                None
-            };
-            let mut seen: std::collections::HashSet<Vec<u8>> =
-                std::collections::HashSet::with_capacity(entries.len());
-            for (key, seq, value) in entries {
-                seen.insert(key.clone());
-                if seq <= wm {
+        // AP 列存段:磁盘上的 segment 只覆盖 SST 数据(memtable 由读路径
+        // overlay 合并)。打开时按文件名恢复每表 (代次, max_seq),解码缓存
+        // 在首次 AP 查询时惰性加载。
+        // 崩溃兜底:若 crash 落在 "LSM flush 完成 → segment 重建" 之间,SST
+        // 会有比 segment 更新的数据(max_seq 比较,文件名自带,零 IO 检测)
+        // → 该表代次视为 0,AP 回退行存,下次 flush 重建后恢复。
+        let columnar_dir = config.storage.data_dir.join("columnar");
+        std::fs::create_dir_all(&columnar_dir)?;
+        let mut gens: HashMap<u64, (u64, u64)> = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(&columnar_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some((tid, generation, max_seq)) =
+                    storage::columnar_file::parse_segment_file_name(name)
+                else {
                     continue;
+                };
+                if !catalog.get_table_by_id(tid).is_some() {
+                    continue; // 无主 segment(表已删)→ 留待覆盖
                 }
-                match value {
-                    Some(bytes) => {
-                        let mut slice = bytes.as_slice();
-                        let Ok(mut row) = common::codec::decode_row(&mut slice) else {
-                            continue;
-                        };
-                        if row.len() < schema.columns.len() {
-                            row.resize(schema.columns.len(), ScalarValue::Null);
-                        } else if row.len() > schema.columns.len() {
-                            row.truncate(schema.columns.len());
-                        }
-                        columnar.apply_mirror(schema.id, &key, Some(row));
-                    }
-                    None => columnar.apply_mirror(schema.id, &key, None),
-                }
-                wm = wm.max(seq);
-                replayed += 1;
-            }
-            if let Some(keys) = snapshot_keys {
-                for k in keys {
-                    if !seen.contains(&k) {
-                        columnar.apply_mirror(schema.id, &k, None);
-                        replayed += 1;
-                    }
+                let e = gens.entry(tid).or_insert((0, 0));
+                if generation > e.0 {
+                    *e = (generation, max_seq);
                 }
             }
-            columnar_wm.lock().insert(schema.id, wm);
         }
-        if snap_recovered > 0 || replayed > 0 {
-            info!(
-                snapshots = snap_recovered,
-                rebuilt_rows = mirrored_rows,
-                replayed = replayed,
-                "columnar replica restored"
+        // 陈旧检测:SST 覆盖该表行键范围且 max_seq > 段 max_seq → 段过期
+        let sst_metas = lsm.sst_metas();
+        let stale_tids: Vec<u64> = gens
+            .iter()
+            .filter(|(tid, info)| {
+                let (from, to) = storage::table::row_range(**tid);
+                sst_metas
+                    .iter()
+                    .any(|m| m.overlaps_range(&from, &to) && m.max_seq > info.1)
+            })
+            .map(|(tid, _)| *tid)
+            .collect();
+        for tid in stale_tids {
+            gens.remove(&tid); // 无段 → 行存回退,下次 flush 重建
+            warn!(
+                table_id = tid,
+                "columnar segment stale vs sst (crash between flush and rebuild?); row-store fallback until next flush"
             );
         }
-        Ok(Arc::new(Self {
+        let ap = Arc::new(ApStore {
+            dir: columnar_dir,
+            gens: Mutex::new(gens),
+            caches: Mutex::new(HashMap::new()),
+        });
+        let engine = Arc::new(Self {
             config,
             memory,
             catalog,
             lsm,
-            columnar,
+            ap,
             stats,
-            columnar_wm,
-            columnar_dirty: std::sync::atomic::AtomicU64::new(0),
             active_snapshots: Mutex::new(BTreeSet::new()),
             commit_lock: Mutex::new(()),
             _restored_tables: AtomicU64::new(restored),
-        }))
+        });
+        // flush 钩子:auto-flush(内存满)与手动 FLUSH 共用 → SST 一有新数据,
+        // 列存 segment 立即跟进。重建失败不致命(AP 回退行存 + 陈旧检测兜底)。
+        let hook_engine = engine.clone();
+        engine.lsm.set_flush_hook(Some(Arc::new(move || {
+            if let Err(e) = hook_engine.rebuild_columnar_segments() {
+                warn!(error = %e, "columnar segment rebuild after flush failed; row-store fallback");
+            }
+        })));
+        Ok(engine)
     }
 
     pub fn catalog(&self) -> Arc<InMemoryCatalog> {
@@ -679,8 +715,8 @@ impl Engine {
             read_ts,
             overlay,
             stats: self.stats.clone(),
-            // 事务内回退行存:副本只镜像已提交状态,看不到本事务写缓冲
-            columnar: columnar_ok.then_some(self.columnar.clone()),
+            // 事务内回退行存:segment 只覆盖已 flush 的 SST 数据,看不到本事务写缓冲
+            ap: columnar_ok.then_some(self.ap.clone()),
             threads: self.config.engine.parallelism,
         })
     }
@@ -716,6 +752,8 @@ impl Engine {
     }
 
     /// 手动转储:冻结 memtable 写成 L0 SST,重置 WAL。返回是否发生了 flush。
+    /// 列存 segment 重建由 LSM flush 钩子完成 —— auto-flush(内存满)与手动
+    /// flush 走同一条路径,保证 SST 有新数据时 segment 必然跟进。
     pub fn flush(&self) -> Result<bool> {
         self.lsm.flush()
     }
@@ -748,48 +786,42 @@ impl Engine {
         self.stats.get(table_id)
     }
 
-    /// 镜像后推进列存水位线(须在 commit_lock 内调用,与 LSM 写串行)。
-    fn bump_columnar_wm(&self, table_id: u64) {
-        let seq = self.lsm.last_sequence();
-        {
-            let mut wm = self.columnar_wm.lock();
-            let e = wm.entry(table_id).or_insert(0);
-            if seq > *e {
-                *e = seq;
-            }
-        }
-        // 超阈值自动持久化快照
-        if self
-            .columnar_dirty
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
-            >= COLUMNAR_PERSIST_THRESHOLD
-        {
-            self.columnar_dirty
-                .store(0, std::sync::atomic::Ordering::Relaxed);
-            if let Err(e) = self.persist_columnar_snapshots() {
-                warn!(error = %e, "columnar snapshot persist failed");
-            }
-        }
-    }
-
-    /// 把全部已镜像表的列存快照写到磁盘(tmp + rename 原子替换)。
-    pub fn persist_columnar_snapshots(&self) -> Result<()> {
-        let dir = self.config.storage.data_dir.join("columnar");
+    /// 将全部表的 LSM 可见数据重建为列存 segment(LSM flush 钩子触发,
+    /// 与 LSM 写串行 —— 钩子在 write_lock 内调用)。
+    /// segment = SST 全量真值;代次 +1,旧代文件删除,解码缓存失效。
+    fn rebuild_columnar_segments(&self) -> Result<()> {
+        let dir = self.ap.dir();
         std::fs::create_dir_all(&dir)?;
         for schema in self.catalog.list_tables() {
-            let Some(entries) = self.columnar.collect_table(schema.id) else {
+            let (from, to) = row_range(schema.id);
+            let Ok(entries) = self.lsm.scan(&from, &to) else {
                 continue;
             };
-            let wm = self
-                .columnar_wm
-                .lock()
-                .get(&schema.id)
-                .copied()
-                .unwrap_or(0);
-            let path = storage::columnar_file::snapshot_path(&dir, schema.id);
-            storage::columnar_file::write_snapshot(&path, schema.id, wm, &entries, &schema)?;
-            debug!(table = %schema.name, rows = entries.len(), "columnar snapshot written");
+            let mut seg_rows: Vec<SegmentRow> = Vec::with_capacity(entries.len());
+            let mut max_seq = 0u64;
+            for (key, seq, value) in entries {
+                let Some(bytes) = value else { continue };
+                let mut slice = bytes.as_slice();
+                let mut row = common::codec::decode_row(&mut slice)?;
+                if row.len() < schema.columns.len() {
+                    row.resize(schema.columns.len(), ScalarValue::Null);
+                } else if row.len() > schema.columns.len() {
+                    row.truncate(schema.columns.len());
+                }
+                max_seq = max_seq.max(seq);
+                seg_rows.push(SegmentRow { key, seq, row });
+            }
+            seg_rows.sort_by(|a, b| a.key.cmp(&b.key));
+            let generation = self.ap.segment_info(schema.id).map_or(1, |(g, _)| g + 1);
+            let path = columnar_file::segment_path(&dir, schema.id, generation, max_seq);
+            columnar_file::write_segment(&path, schema.id, &seg_rows, &schema)?;
+            // 清理旧代文件(保留刚写的这份)
+            let new_name = path.file_name().and_then(|n| n.to_str()).map(String::from);
+            self.ap
+                .remove_files_matching(schema.id, |n| new_name.as_deref() == Some(n));
+            self.ap.set_gen(schema.id, generation, max_seq);
+            self.ap.invalidate_cache(schema.id);
+            debug!(table = %schema.name, rows = seg_rows.len(), "columnar segment rebuilt");
         }
         Ok(())
     }
@@ -960,42 +992,6 @@ impl Engine {
                 let _guard = self.commit_lock.lock();
                 self.check_unique(&table_arc, unique_encs, index_tombstones)?;
                 self.lsm.write_batch(&entries)?;
-                // 列存副本只镜像行写(行键恒 16 字节;索引键更长)
-                for (key, value) in &entries {
-                    if key.len() != 16 {
-                        continue; // 索引条目
-                    }
-                    let mut mirror_ok = true;
-                    match value {
-                        Some(bytes) => {
-                            let mut slice = bytes.as_slice();
-                            let row = common::codec::decode_row(&mut slice)?;
-                            if let Err(e) = self.columnar.upsert(&table_arc, key, row) {
-                                mirror_ok = false;
-                                warn!(
-                                    table = %table_arc.name,
-                                    error = %e,
-                                    "columnar replica apply failed"
-                                );
-                            }
-                        }
-                        None => {
-                            if let Err(e) =
-                                self.columnar.delete(common::ids::TableId(table.id), key)
-                            {
-                                mirror_ok = false;
-                                warn!(
-                                    table = %table_arc.name,
-                                    error = %e,
-                                    "columnar replica delete failed"
-                                );
-                            }
-                        }
-                    }
-                    if mirror_ok {
-                        self.bump_columnar_wm(table.id);
-                    }
-                }
             }
         }
         Ok(())
@@ -1420,10 +1416,8 @@ impl Engine {
             .map(|(k, v)| (k.clone(), Some(v.clone())))
             .collect();
         {
-            // 行重写 + 列存镜像在同一把提交锁下,水位线才有一致的快照语义
             let _guard = self.commit_lock.lock();
             self.lsm.write_batch(&batch_refs)?;
-            self.bump_columnar_wm(current.id);
         }
 
         // 2. catalog 版本递增
@@ -1438,16 +1432,9 @@ impl Engine {
             return Err(e);
         }
 
-        // 4. 列存副本整体重建(简单正确;增量刷新见路线图)
-        self.columnar.drop_table(common::ids::TableId(next.id))?;
-        let next_arc = Arc::new(next.clone());
-        for (key, value) in &batch {
-            let mut slice = value.as_slice();
-            let row = common::codec::decode_row(&mut slice)?;
-            if let Err(e) = self.columnar.upsert(&next_arc, key, row) {
-                warn!(table = name, error = %e, "columnar replica rebuild failed");
-            }
-        }
+        // 4. 列存 segment 失效:旧 segment 列数与 schema 不符,直接删文件 +
+        // 清代次(下次 flush 时按新 schema 全量重建;在此之前走行存回退)
+        self.ap.remove_table(next.id);
         info!(table = name, version = next.version, column = %next.columns.last().unwrap().name, "column added");
         Ok(Outcome::Tag {
             prefix: "ALTER TABLE".into(),
@@ -1470,22 +1457,10 @@ impl Engine {
         {
             let _guard = self.commit_lock.lock();
             self.lsm.write_batch(&batch)?;
-            self.columnar_wm.lock().remove(&dropped.id);
-            self.columnar_dirty
-                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
         self.stats.remove(dropped.id);
-        self.columnar.drop_table(common::ids::TableId(dropped.id))?;
-        // 删除列存快照文件(缺失忽略)
-        let snap = storage::columnar_file::snapshot_path(
-            &self.config.storage.data_dir.join("columnar"),
-            dropped.id,
-        );
-        match std::fs::remove_file(&snap) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!(table = name, error = %e, "columnar snapshot remove failed"),
-        }
+        // 删除列存 segment 文件 + 代次/缓存
+        self.ap.remove_table(dropped.id);
         info!(table = name, "table dropped");
         Ok(Outcome::Tag {
             prefix: "DROP TABLE".into(),
@@ -1553,31 +1528,6 @@ impl Engine {
         for (id, table) in &touched {
             if let Some(s) = self.stats.update(*id, |s| s.stale = true) {
                 persist_stats(&self.lsm, table, &s);
-            }
-        }
-        for (table, key, value) in writes {
-            if key.len() != 16 {
-                continue; // 索引条目不镜像列存
-            }
-            let mut mirror_ok = true;
-            match value {
-                Some(encoded) => {
-                    let mut slice = encoded.as_slice();
-                    let row = common::codec::decode_row(&mut slice)?;
-                    if let Err(e) = self.columnar.upsert(&table, &key, row) {
-                        mirror_ok = false;
-                        warn!(table = %table.name, error = %e, "columnar replica apply failed");
-                    }
-                }
-                None => {
-                    if let Err(e) = self.columnar.delete(common::ids::TableId(table.id), &key) {
-                        mirror_ok = false;
-                        warn!(table = %table.name, error = %e, "columnar replica delete failed");
-                    }
-                }
-            }
-            if mirror_ok {
-                self.bump_columnar_wm(table.id);
             }
         }
         Ok(())

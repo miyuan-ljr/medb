@@ -6,12 +6,12 @@
 
 ```
 sql(front) → exec(向量化) → storage(LSM 行存)
-                ↑                    ↓ CDC(计划)
-              memory(配额/arena)   columnar(列存副本,AP)
+                ↑                    ↓ flush 钩子(重建 segment)
+              memory(配额/arena)   storage::columnar_file(列存段,AP)
 ```
 
 依赖方向固定为 common ← memory ← {exec, storage} ← sql/catalog ← server。
-storage 不依赖 exec(列存用 `storage::columnar::ColumnVector`,exec 侧转换)。
+storage 不依赖 exec(列存段解码为 `common` ScalarValue,exec 侧转 Vector)。
 
 ## 2. 内存分配机制
 
@@ -91,10 +91,24 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 - 两个来源的划分恰好覆盖"已 flush / 未 flush",无丢失窗口。
 
 ### 3.7 列存副本(HTAP)
-- v1:`ColumnarReplica` trait + `InMemoryColumnarReplica`(BTreeMap 键→行,
-  scan_column 按键序输出列向量,两次 scan 列内对齐)。
-- 生产化:TP 写路径旁路 CDC → 副本增量;列存 segment 文件 + delta 行 +
-  后台 merge;字典/RLE 编码;AP 算子直接消费列(exec 侧转换 ColumnVector)。
+- **v2(现行,segment 架构)**:列存副本**只覆盖 SST 数据**,落盘为每表一份
+  segment 文件(`columnar/{table_id}.{gen:05}.{max_seq}.seg`);memtable 增量
+  由 AP 读路径以 memtable overlay 合并(scan_memtable,活跃表 + 冻结表)。
+  segment 随 SST 生命周期存在:flush 钩子(LSM `set_flush_hook`,auto-flush
+  与手动 FLUSH 共用)→ 全表扫描重建为新代(代次 +1,旧代文件删除,tmp+rename
+  原子);ALTER ADD COLUMN → 删段失效(AP 回退行存,下次 flush 重建);
+  DROP TABLE → 删段 + 清代次/缓存。
+- 一致性关键点:
+  - **flush 钩子在冻结表(imm)移除前触发** —— 重建期间 memtable overlay
+    仍含被 flush 的数据,"segment + overlay" 全程无缺口;
+  - **打开期陈旧检测**:crash 落在 flush 与重建之间时,SST 会比 segment 新。
+    文件名自带 segment max_seq(零 IO),与 SstMeta.max_seq(键范围重叠者)
+    比较 → 段过期则弃用(行存回退),下次 flush 重建;
+  - 段损坏 → 告警 + 注销代次 + 行存回退(派生数据,不阻塞查询)。
+- 读取:segment 解码一次缓存(ApCache:列向量 + 行键位置),gen 变化自动失效;
+  memtable overlay 按 key_pos 原位覆盖更新 / 追加新键 / 跳过墓碑。
+- 后续:二级索引建在 segment 上(`BTreeMap<编码值, BTreeSet<row_key>>`,
+  每段一棵索引树);字典/RLE 编码;增量 delta 行 + 后台 merge。
 
 ## 4. 向量化执行
 
@@ -192,12 +206,12 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
   CREATE/DROP 同步写目录区;Engine::open 扫目录区重建 catalog。
   CREATE 先改内存 catalog 再落目录区,失败则回滚内存。
 - INSERT:计划期求值 + 按列收敛(精确类型 / Int64→Float64 / NOT NULL 检查)→
-  执行期 alloc_sequences 取 row_id 段 → 单个 write_batch(一条 WAL 记录)→
-  列存副本逐行 upsert(失败仅告警,不回滚行存 —— 计划期已保证类型正确)。
-- DELETE:整表扫描(键+行)→ 谓词在整批上向量化求值 → 命中键进写批打墓碑 →
-  副本逐键 delete。
-- DROP TABLE:catalog 移除 + 数据范围打墓碑 + 目录键墓碑,同一写批;副本来
-  drop_table。同名重建分配新 table id,天然看不到旧数据。
+  执行期 alloc_sequences 取 row_id 段 → 单个 write_batch(一条 WAL 记录)。
+  写路径**不碰列存**:segment 由 flush 钩子统一重建(见 §3.7)。
+- DELETE:整表扫描(键+行)→ 谓词在整批上向量化求值 → 命中键进写批打墓碑。
+  AP 读由 overlay 剔除墓碑键,flush 重建后段中物理清除。
+- DROP TABLE:catalog 移除 + 数据范围打墓碑 + 目录键墓碑,同一写批;再删除
+  该表全部 segment 文件并清代次/缓存。同名重建分配新 table id,天然看不到旧数据。
 - 多语句脚本:逐条执行,任一失败即停并返回错误(已执行的不回滚,无事务 —— M1)。
 
 ## 5. 服务端
@@ -280,13 +294,16 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 - **引用收集**(`optimizer::collect_sql_columns`):SQL 级列引用收集器,
   与 collect_sql_tables 同构遍历但收集列;来源覆盖:扫描下推谓词(planned
   flat)、延迟 WHERE、JOIN 键与残余(pool SQL)、投影 + 排序隐藏键、
-  分组 + 聚合参数(rewriter.pruning_exprs)、HAVING(SQL 级,先于重写收集)。
+  分组 + 聚合参数(rewriter.pruning_exprs)、HAVING(SQL 级,先于重写收集)、
+  **LEFT JOIN build 侧哈希键**(表内局部下标,收集时平移回扁平下标 ——
+  v2 踩过:只收 probe 侧键,build 扫描丢连接键 → LEFT JOIN 全部 NULL 补齐;
+  旧内存副本忽略 needed 掩盖了该 bug,segment+行存剪枝后暴露)。
 - **解码剪枝**(`codec::decode_row_partial` + `skip_value`):编码自描述
   (tag + 定长/变长载荷),未标记列只推进游标不物化 —— Utf8/Binary 的
   String 分配完全省掉;剪枝含 Date(4B)时游标推进要精确(v1 踩过:
   skip 把 4B Date 误当 8B 导致错位)。
 - **表示约定**:剪枝列槽位 = Null 占位(行仍全宽,下游扁平下标不变)。
-- 列存路径暂忽略剪枝(副本向量克隆本就廉价);slot 语义边界见路线图。
+- 列存路径暂忽略剪枝(段解码缓存整段加载);段级列剪枝见路线图。
 
 ### 5.5.5b 类型化哈希键与 Top-N
 
@@ -329,19 +346,18 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
   planner 的 `table_scan` 把合取谓词直接传给 SeqScan(不再叠加 FilterExec)。
   收益:未命中行不进物化,JOIN build 侧/聚合输入/内存同步缩小。
 - **AP 列存路径**:`QueryDataSource::scan_columns(table) -> Option<Vec<Vector>>`。
-  引擎实现:列存副本逐列读出 → 转 exec Vector(含 null 位图转换)。
-  - 门控(任一不满足即回退行存):事务内读(副本只镜像已提交状态,
-    必须保读己之写)、LOB/数组/向量列、副本缺失;
-  - **持久化**:`columnar_file` 每表一份快照(`columnar/{table_id}.col`),
-    列主序 + codec 值编码 + CRC32 + tmp/rename 原子替换;头部带**水位线**
-    (已镜像的最大 LSM seq)。持久化时机:FLUSH TABLES、累计 10 万次镜像写。
-    恢复 = 快照 bulk_load + LSM 重放(seq > 水位);**删除补齐**:LSM 扫描
-    会把墓碑键从结果剔除,快照中存在但 LSM 不可见的键在重放后移除(v1 踩过:
-    删除后重启复活一行);快照损坏 → 告警 + 全量重建(派生数据,安全);
-  - **重启重建**:无快照时 Engine::open 从 LSM 全量重建 ——
-    空副本不可信,否则重启后新写入的行会"遮蔽"历史行(v1 踩过);
-  - 列存副本 v1.1:每列带 null 位图(与行存 NULL 语义一致),Date 列支持;
-  - 列间长度一致性校验(misalignment = corruption 错误)。
+  引擎实现:segment(仅 SST 数据)解码缓存逐列读出 → memtable overlay 合并 →
+  exec Vector(null 位图)。
+  - 门控(任一不满足即回退行存):事务内读(overlay 不含事务缓冲,保读己之写)、
+    LOB/数组/向量列、无 segment(首次 flush 前)/段缺失/段损坏;
+  - **覆盖一致性**:AP 只覆盖 SST;memtable 增量(含 WAL 重放恢复的)由
+    overlay 合并,update 原位覆盖、新键追加、墓碑剔除 —— 读写时序安全性由
+    flush 钩子的 imm 顺序保证(见 §3.7);
+  - **崩溃恢复**:打开期按文件名恢复 (代次, max_seq) 并做陈旧检测(见 §3.7);
+  - 解码缓存:段文件首次 AP 访问时整段解码为列向量缓存,gen 变化自动失效;
+  - 列间长度一致性校验(misalignment = corruption 错误);
+  - v1 教训(内存副本 + 水位线重放):重启后空/陈旧内存副本会遮蔽行存;
+    segment 架构以"派生数据 + 回退 + 陈旧检测"根治,不再有重放状态。
 - **并行框架**(`exec::parallel`):`scope_map` / `scope_map_try` ——
   `std::thread::scope` 分片借用(无需 'static),连续分片保序拼接。
   应用:LSM 解码过滤(engine)、HashJoin 探测行组装(≥256 行才并行,

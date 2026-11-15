@@ -75,6 +75,10 @@ pub struct LsmStore {
     gc_watermark: AtomicU64,
     compaction: Box<dyn CompactionStrategy>,
     readers: Mutex<HashMap<u64, Arc<SstReader>>>,
+    /// flush 成功后的通知钩子(auto-flush 与手动 flush 共用)。
+    /// 上层(Engine)借此把 SST 新数据写入列存 segment。在 write_lock 内触发,
+    /// 钩子体内不得再进入本 store 的写路径。
+    flush_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl LsmStore {
@@ -141,6 +145,7 @@ impl LsmStore {
             gc_watermark: AtomicU64::new(u64::MAX),
             compaction: Box::new(compaction),
             readers: Mutex::new(known_ids.drain().collect()),
+            flush_hook: Mutex::new(None),
         });
         Ok(store)
     }
@@ -293,6 +298,38 @@ impl LsmStore {
         self.scan_at(from, to, u64::MAX)
     }
 
+    /// **仅 memtable**(活跃 + 冻结表)的合并扫描:AP 列存路径用它取
+    /// "尚未 flush 进 segment 的增量"(segment 只覆盖 SST 数据)。
+    pub fn scan_memtable(&self, from: &[u8], to: &[u8], ts: u64) -> Result<Vec<ScanEntry>> {
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        let mem = self.mem.read().clone();
+        let imms = self.imm.read().clone();
+        let mut memtables = vec![mem];
+        memtables.extend(imms);
+        let mut sources: Vec<Vec<(InternalKey, Option<Vec<u8>>)>> = Vec::new();
+        for mt in &memtables {
+            let entries: Vec<(InternalKey, Option<Vec<u8>>)> = mt
+                .scan_all()
+                .into_iter()
+                .filter(|(k, _, _)| k.as_slice() >= from && k.as_slice() < to)
+                .map(|(k, seq, v)| {
+                    let kind = if v.is_some() {
+                        KeyKind::Put
+                    } else {
+                        KeyKind::Delete
+                    };
+                    (encode_internal_key(&k, seq, kind), v)
+                })
+                .collect();
+            if !entries.is_empty() {
+                sources.push(entries);
+            }
+        }
+        Ok(merge_visible_per_key(sources, ts))
+    }
+
     // ---------- flush / compaction ----------
 
     /// 冻结当前 memtable 并写成 L0 SST,重置 WAL。可从外部手动触发。
@@ -322,6 +359,12 @@ impl LsmStore {
 
         // SST 落盘成功后才切换内存状态并丢 WAL(顺序保证不丢数据)
         self.manifest.update(|m| m.add_l0(meta.clone()));
+        self.compact_locked_if_needed()?;
+        // 钩子在冻结表(imm)移除前触发:重建列存期间 imm 仍可读,
+        // AP 读路径 "segment + memtable overlay" 全程无缺口。
+        if let Some(hook) = self.flush_hook.lock().clone() {
+            hook();
+        }
         self.imm.write().retain(|m| !Arc::ptr_eq(m, &old));
         old.release_accounting();
         self.wal.lock().reset()?;
@@ -331,9 +374,22 @@ impl LsmStore {
             size = meta.file_size,
             "flushed memtable to L0"
         );
-
-        self.compact_locked_if_needed()?;
         Ok(true)
+    }
+
+    /// 注册 flush 完成钩子(覆盖式;传 None 注销)。
+    pub fn set_flush_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.flush_hook.lock() = hook;
+    }
+
+    /// 当前全部 SST 元数据(打开期做列存段新旧比对用)。
+    pub fn sst_metas(&self) -> Vec<crate::sstable::SstMeta> {
+        let snapshot = self.manifest.snapshot();
+        let mut metas = Vec::new();
+        for level in &snapshot.levels {
+            metas.extend(level.iter().cloned());
+        }
+        metas
     }
 
     fn write_sst(&self, entries: &[ScanEntry], id: u64, level: u32) -> Result<SstMeta> {

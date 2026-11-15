@@ -1,13 +1,14 @@
-//! 列存副本持久化 e2e:快照 + LSM 增量重放(水位线)。
+//! 列存 segment 持久化 e2e:flush 写段 + 重启段发现 + memtable overlay。
 //!
-//! 场景:
-//! 1. 建表 + 装载 → FLUSH TABLES(写列存快照)→ 重启:快照加载,行数正确;
-//! 2. 快照后继续 UPDATE/DELETE/INSERT(只在 LSM,seq > 水位)→ 重启:重放正确;
-//! 3. 不 FLUSH 直接重启(快照缺失)→ 全量重建路径正确;
-//! 4. 列存路径(AP)在重启后读数正确;
-//! 5. DROP TABLE 清理快照文件。
+//! 架构约定:segment 只覆盖 SST 数据;memtable 增量由 AP 读路径 overlay
+//! 合并(WAL 重放后同样成立)。场景:
+//! 1. 建表 + 装载 → FLUSH(写 segment)→ 重启:段发现,读数正确;
+//! 2. 段之后 UPDATE/DELETE/INSERT(仅 memtable/WAL)→ 重启:overlay 正确;
+//! 3. 损坏 segment → AP 查询回退行存,数据不丢;
+//! 4. DROP TABLE 清理 segment 文件;
+//! 5. 不 FLUSH 直接重启(无段)→ 行存路径正确。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use catalog::CatalogStore;
@@ -28,13 +29,24 @@ fn flush(engine: &Arc<Engine>) {
         .unwrap();
 }
 
-/// lineitem 表的真实 table id(catalog 从 1000 起分配)。
 fn lineitem_id(engine: &Arc<Engine>) -> u64 {
     engine.catalog().get_table("lineitem").unwrap().id
 }
 
-fn snapshot_file(dir: &Path, table_id: u64) -> std::path::PathBuf {
-    dir.join("columnar").join(format!("{table_id}.col"))
+/// 该表当前 segment 文件(至多一份;旧代在重建时清理)。
+fn segment_file(dir: &Path, table_id: u64) -> Option<PathBuf> {
+    let cdir = dir.join("columnar");
+    let prefix = format!("{table_id}.");
+    std::fs::read_dir(cdir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&prefix) && n.ends_with(".seg"))
+                .unwrap_or(false)
+        })
 }
 
 fn count(engine: &Arc<Engine>, table: &str) -> u64 {
@@ -70,11 +82,11 @@ fn sum(engine: &Arc<Engine>, expr: &str) -> f64 {
 }
 
 #[test]
-fn columnar_snapshot_and_replay_across_restart() {
+fn columnar_segment_and_overlay_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_path_buf();
 
-    // —— 第一段:建表 + 装载 + FLUSH(写快照)——
+    // —— 第一段:建表 + 装载 + FLUSH(写 segment)——
     {
         let engine = open(&data_dir);
         engine
@@ -96,20 +108,20 @@ fn columnar_snapshot_and_replay_across_restart() {
             .unwrap();
         assert_eq!(count(&engine, "lineitem"), 3);
         flush(&engine);
+        let li_id = lineitem_id(&engine);
         assert!(
-            snapshot_file(&data_dir, lineitem_id(&engine)).exists(),
-            "FLUSH 应写列存快照"
+            segment_file(&data_dir, li_id).is_some(),
+            "FLUSH 应写列存 segment"
         );
     }
 
-    // —— 第二段:重启(快照加载)→ 快照后变更(仅 LSM,水位重放)→ 重启 ——
+    // —— 第二段:重启(段发现)→ 段后变更(仅 memtable,overlay 合并)→ 重启 ——
     {
         let engine = open(&data_dir);
-        let li_id = lineitem_id(&engine);
-        assert_eq!(count(&engine, "lineitem"), 3, "快照恢复行数");
-        assert_eq!(sum(&engine, "l_quantity"), 60.0, "快照恢复数量列");
+        assert_eq!(count(&engine, "lineitem"), 3, "段发现恢复行数");
+        assert_eq!(sum(&engine, "l_quantity"), 60.0, "段恢复数量列");
 
-        // 快照之后的变更:更新 + 删除 + 新增(全部只落 LSM)
+        // 段之后的变更:更新 + 删除 + 新增(全部只进 memtable/WAL)
         engine
             .execute_script("UPDATE lineitem SET l_quantity = 99 WHERE l_orderkey = 1")
             .unwrap();
@@ -119,19 +131,19 @@ fn columnar_snapshot_and_replay_across_restart() {
         engine
             .execute_script("INSERT INTO lineitem VALUES (4, 40, 400.0, DATE '2024-04-01')")
             .unwrap();
-        assert_eq!(count(&engine, "lineitem"), 3);
-    }
-
-    // —— 第三段:重启(快照 + 增量重放)——
-    {
-        let engine = open(&data_dir);
-        let li_id = lineitem_id(&engine);
-        assert_eq!(count(&engine, "lineitem"), 3, "重放后行数(2 删 1 增)");
+        assert_eq!(count(&engine, "lineitem"), 3, "overlay 后行数(1 改 1 删 1 增)");
         assert_eq!(
             sum(&engine, "l_quantity"),
             99.0 + 30.0 + 40.0,
-            "重放应包含 UPDATE/INSERT,排除 DELETE"
+            "overlay 应包含 UPDATE/INSERT,排除 DELETE"
         );
+    }
+
+    // —— 第三段:重启(WAL 重放 memtable → overlay 依旧成立)——
+    {
+        let engine = open(&data_dir);
+        assert_eq!(count(&engine, "lineitem"), 3, "重启后 overlay 行数");
+        assert_eq!(sum(&engine, "l_quantity"), 99.0 + 30.0 + 40.0);
         // AP 列存路径在重启后读数正确
         let mut outcomes = engine
             .execute_script(
@@ -161,29 +173,31 @@ fn columnar_snapshot_and_replay_across_restart() {
 }
 
 #[test]
-fn no_flush_rebuild_still_correct() {
+fn overlay_hits_segment_after_in_process_flush() {
+    // flush 钩子:进程内 FLUSH 后 segment 立即包含 SST 数据;
+    // 后续写仍在 memtable → overlay 合并,读数始终一致。
     let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().to_path_buf();
-    {
-        let engine = open(&data_dir);
-        engine
-            .execute_script(
-                "CREATE TABLE lineitem (l_orderkey BIGINT NOT NULL, l_quantity BIGINT NOT NULL)",
-            )
-            .unwrap();
-        engine
-            .execute_script("INSERT INTO lineitem VALUES (1, 10), (2, 20)")
-            .unwrap();
-        // 不 FLUSH:无快照文件(增量次数远低于阈值)
-    }
-    {
-        let engine = open(&data_dir);
-        assert_eq!(count(&engine, "lineitem"), 2, "无快照 → 全量重建路径");
-    }
+    let engine = open(dir.path());
+    engine
+        .execute_script("CREATE TABLE lineitem (l_orderkey BIGINT NOT NULL, l_quantity BIGINT NOT NULL)")
+        .unwrap();
+    engine
+        .execute_script("INSERT INTO lineitem VALUES (1, 10), (2, 20)")
+        .unwrap();
+    flush(&engine);
+    assert_eq!(count(&engine, "lineitem"), 2, "flush 后段 + 空 overlay");
+    engine
+        .execute_script("INSERT INTO lineitem VALUES (3, 30)")
+        .unwrap();
+    engine
+        .execute_script("UPDATE lineitem SET l_quantity = 99 WHERE l_orderkey = 1")
+        .unwrap();
+    assert_eq!(count(&engine, "lineitem"), 3, "段 + memtable overlay");
+    assert_eq!(sum(&engine, "l_quantity"), 99.0 + 20.0 + 30.0);
 }
 
 #[test]
-fn corrupt_snapshot_falls_back_to_rebuild() {
+fn corrupt_segment_falls_back_to_row_store() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_path_buf();
     {
@@ -197,29 +211,28 @@ fn corrupt_snapshot_falls_back_to_rebuild() {
             .execute_script("INSERT INTO lineitem VALUES (1, 10), (2, 20), (3, 30)")
             .unwrap();
         flush(&engine);
-        assert!(snapshot_file(&data_dir, lineitem_id(&engine)).exists());
     }
-    // 损坏快照(翻转中段字节)
-    let li_id = {
+    // 损坏 segment(翻转中段字节)
+    let seg = {
         let engine = open(&data_dir);
-        lineitem_id(&engine)
+        let id = lineitem_id(&engine);
+        segment_file(&data_dir, id).unwrap()
     };
-    let snap = snapshot_file(&data_dir, li_id);
-    let mut bytes = std::fs::read(&snap).unwrap();
+    let mut bytes = std::fs::read(&seg).unwrap();
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
-    std::fs::write(&snap, &bytes).unwrap();
+    std::fs::write(&seg, &bytes).unwrap();
 
     let engine = open(&data_dir);
     assert_eq!(
         count(&engine, "lineitem"),
         3,
-        "快照损坏 → 告警 + 全量重建,数据不丢"
+        "段损坏 → 告警 + 行存回退,数据不丢"
     );
 }
 
 #[test]
-fn drop_table_removes_snapshot_file() {
+fn drop_table_removes_segment_file() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_path_buf();
     let engine = open(&data_dir);
@@ -233,10 +246,85 @@ fn drop_table_removes_snapshot_file() {
         .unwrap();
     flush(&engine);
     let li_id = lineitem_id(&engine);
-    assert!(snapshot_file(&data_dir, li_id).exists());
+    assert!(segment_file(&data_dir, li_id).is_some());
     engine.execute_script("DROP TABLE lineitem").unwrap();
     assert!(
-        !snapshot_file(&data_dir, li_id).exists(),
-        "DROP 应清理列存快照文件"
+        segment_file(&data_dir, li_id).is_none(),
+        "DROP 应清理列存 segment 文件"
     );
+}
+
+#[test]
+fn stale_segment_detected_at_open_crash_window() {
+    // 模拟 crash 窗口:flush 完成(L0 SST 已含数据)但 segment 重建尚未发生
+    // → 把 segment 文件名的 max_seq 改小,让打开期检测判定"段过期"。
+    // 期望:AP 回退行存,读数仍正确(派生数据允许过期,不允许错)。
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_path_buf();
+    {
+        let engine = open(&data_dir);
+        engine
+            .execute_script(
+                "CREATE TABLE lineitem (l_orderkey BIGINT NOT NULL, l_quantity BIGINT NOT NULL)",
+            )
+            .unwrap();
+        engine
+            .execute_script("INSERT INTO lineitem VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+        flush(&engine);
+    }
+    let seg = {
+        let engine = open(&data_dir);
+        let id = lineitem_id(&engine);
+        let seg = segment_file(&data_dir, id).unwrap();
+        // 伪造陈旧:文件名 max_seq 改小(SST 的真实 max_seq 必然更大)
+        let name = seg.file_name().unwrap().to_str().unwrap().to_string();
+        let stem = name.strip_suffix(".seg").unwrap();
+        let mut parts: Vec<String> = stem.split('.').map(String::from).collect();
+        let real_max: u64 = parts[2].parse().unwrap();
+        assert!(real_max > 0, "测试前置:flush 后 max_seq 应 > 0");
+        parts[2] = (real_max - 1).to_string();
+        let forged = format!("{}.seg", parts.join("."));
+        std::fs::rename(&seg, seg.with_file_name(forged)).unwrap();
+        seg
+    };
+    let engine = open(&data_dir);
+    // 检测后旧文件应被无视(行存回退);数据完整
+    assert_eq!(
+        count(&engine, "lineitem"),
+        3,
+        "段陈旧 → 行存回退,数据不丢"
+    );
+    // 下次 flush 重建后段恢复且代次继续增长(旧伪造文件被清理)
+    let id = lineitem_id(&engine);
+    engine
+        .execute_script("INSERT INTO lineitem VALUES (4, 40)")
+        .unwrap();
+    flush(&engine);
+    let new_seg = segment_file(&data_dir, id).expect("flush 后应有新段");
+    assert_ne!(new_seg, seg, "重建应产生新代文件");
+    assert_eq!(count(&engine, "lineitem"), 4);
+}
+
+#[test]
+fn no_flush_row_store_still_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_path_buf();
+    {
+        let engine = open(&data_dir);
+        engine
+            .execute_script(
+                "CREATE TABLE lineitem (l_orderkey BIGINT NOT NULL, l_quantity BIGINT NOT NULL)",
+            )
+            .unwrap();
+        engine
+            .execute_script("INSERT INTO lineitem VALUES (1, 10), (2, 20)")
+            .unwrap();
+        // 不 FLUSH:无 segment 文件
+        assert!(segment_file(&data_dir, lineitem_id(&engine)).is_none());
+    }
+    {
+        let engine = open(&data_dir);
+        assert_eq!(count(&engine, "lineitem"), 2, "无段 → 行存路径");
+    }
 }
