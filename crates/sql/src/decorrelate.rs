@@ -46,6 +46,12 @@ pub struct SqWrap {
     pub build_keys: Vec<Expr>,
     /// 半连接匹配期条件(拼接块:探测列 ++ 构建列)
     pub cond: Option<Expr>,
+    /// 改写后子查询的计划树行(EXPLAIN 构建侧子块展示用)
+    pub build_lines: Vec<String>,
+    /// 连接键的 SQL 原文(外表侧 = 内表侧;EXPLAIN 用)
+    pub key_sql: Vec<String>,
+    /// 匹配期条件的 SQL 原文
+    pub cond_sql: Option<String>,
 }
 
 /// WHERE 相关子查询的预处理产物。
@@ -58,6 +64,8 @@ pub struct SqPlan {
     pub route_conjuncts: Vec<SE>,
     /// 引用收集用(探测键 + 匹配条件),保证扫描投影不剪掉连接需要的列
     pub ref_exprs: Vec<Expr>,
+    /// 标量提升的**原始**比较谓词 AST(EXPLAIN 展示用;与 synthetic 同序)
+    pub scalar_preds: Vec<SE>,
 }
 
 /// WHERE 中相关子查询的识别与提升。`probe_width` = 外层真实流水线宽度。
@@ -72,6 +80,7 @@ pub fn plan_where_subqueries(
         synthetic: Vec::new(),
         route_conjuncts: Vec::new(),
         ref_exprs: Vec::new(),
+        scalar_preds: Vec::new(),
     };
     let Some(w) = where_expr else {
         return Ok(plan);
@@ -228,6 +237,8 @@ fn try_scalar_lift(
         value_type,
         true,
     ));
+    // 原始比较谓词(EXPLAIN 展示用,替换前留存)
+    plan.scalar_preds.push(conj.clone());
     // 子查询内收割的外层独占谓词(与外层 WHERE 重复的跳过)
     for se in &outer_only {
         let disp = format!("{se}");
@@ -290,7 +301,20 @@ fn finish_decorrelated(
         sel.selection = and_all(local.iter().cloned());
         if !appended.is_empty() {
             sel.projection
-                .extend(appended.iter().map(|e| SelectItem::UnnamedExpr(e.clone())));
+                .extend(appended.iter().map(|se| {
+                    // 追加列以列名命名输出(去掉 `alias.` 限定,EXPLAIN/下游引用更干净)
+                    let col = match se {
+                        SE::CompoundIdentifier(parts) => parts
+                            .last()
+                            .map(|i| i.value.clone())
+                            .unwrap_or_else(|| "__jk".to_string()),
+                        _ => "__jk".to_string(),
+                    };
+                    SelectItem::ExprWithAlias {
+                        expr: se.clone(),
+                        alias: Ident::new(col),
+                    }
+                }));
         }
         if matches!(kind, SqKind::ScalarLift) {
             sel.group_by = GroupByExpr::Expressions(
@@ -329,19 +353,25 @@ fn finish_decorrelated(
 
     let mut probe_keys: Vec<Expr> = Vec::new();
     let mut build_keys: Vec<Expr> = Vec::new();
+    // 键/条件的 AST 原文(EXPLAIN 展示;计划表达式仅列名,相关列会有歧义)
+    let mut key_sql: Vec<String> = Vec::new();
     if let Some(lhs) = in_lhs {
         probe_keys.push(plan_expr(lhs, Some(outer_scope), ctx)?);
         build_keys.push(Expr::Column(0));
+        key_sql.push(format!("{lhs} = {}", subquery_output_col(q)));
     }
     for (iside, oside) in &equi {
         let bk = plan_expr(iside, Some(&inner_scope), ctx)?;
         build_keys.push(remap_build(bk, &to_build));
         probe_keys.push(plan_expr(oside, Some(outer_scope), ctx)?);
+        key_sql.push(format!("{oside} = {iside}"));
     }
     let mut cond: Option<Expr> = None;
+    let mut cond_sql: Vec<String> = Vec::new();
     for r in &residual {
         let e = plan_expr(r, Some(&combined), ctx)?;
         let e = remap_cond(e, probe_width, &to_build, inner_width);
+        cond_sql.push(format!("{r}"));
         cond = Some(match cond {
             None => e,
             Some(c) => Expr::Binary {
@@ -353,6 +383,7 @@ fn finish_decorrelated(
     }
     let value_type =
         matches!(kind, SqKind::ScalarLift).then(|| planned.schema[0].ty.clone());
+    let build_lines = planned.explain.clone();
     Ok((
         SqWrap {
             kind,
@@ -361,10 +392,30 @@ fn finish_decorrelated(
             probe_keys,
             build_keys,
             cond,
+            build_lines,
+            key_sql,
+            cond_sql: (!cond_sql.is_empty()).then(|| cond_sql.join(" AND ")),
         },
         outer_only,
         value_type,
     ))
+}
+
+/// IN 构建键的子查询输出列 AST(恰好一列;追加列在尾部不参与)。
+fn subquery_output_col(q: &Query) -> SE {
+    use sqlparser::ast::{Value as SqlValue, ValueWithSpan};
+    let null = SE::Value(ValueWithSpan {
+        value: SqlValue::Null,
+        span: sqlparser::tokenizer::Span::empty(),
+    });
+    let Some(select) = body_select(q) else {
+        return null;
+    };
+    match select.projection.first() {
+        Some(SelectItem::UnnamedExpr(e)) => e.clone(),
+        Some(SelectItem::ExprWithAlias { expr, .. }) => expr.clone(),
+        _ => null,
+    }
 }
 
 // ---------- 子查询形状分析 ----------

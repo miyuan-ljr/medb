@@ -99,7 +99,7 @@ fn create_index_and_point_range_lookup() {
 
     // 无索引 → 全扫
     let plan = explain(&engine, "EXPLAIN SELECT * FROM t WHERE id = 42");
-    assert!(!plan.contains("IndexScan"), "建索引前不应有 IndexScan: {plan}");
+    assert!(!plan.contains("Index Scan"), "建索引前不应有 Index Scan: {plan}");
 
     engine
         .execute_script("CREATE INDEX idx_id ON t (id)")
@@ -111,7 +111,7 @@ fn create_index_and_point_range_lookup() {
     );
 
     let plan = explain(&engine, "EXPLAIN SELECT * FROM t WHERE id = 42");
-    assert!(plan.contains("IndexScan"), "等值点查应走索引: {plan}");
+    assert!(plan.contains("Index Scan"), "等值点查应走索引: {plan}");
 
     // 点查
     assert_eq!(
@@ -150,11 +150,11 @@ fn create_index_and_point_range_lookup() {
 
     // 非索引列谓词 → 全扫(无该列索引)
     let plan = explain(&engine, "EXPLAIN SELECT * FROM t WHERE val = 420");
-    assert!(!plan.contains("IndexScan"), "无索引列不应走索引: {plan}");
+    assert!(!plan.contains("Index Scan"), "无索引列不应走索引: {plan}");
 
     // 非选择性范围 → 优化器不选索引(代价劣于全扫)
     let plan = explain(&engine, "EXPLAIN SELECT * FROM t WHERE id < 1000000");
-    assert!(!plan.contains("IndexScan"), "覆盖全表的范围不应走索引: {plan}");
+    assert!(!plan.contains("Index Scan"), "覆盖全表的范围不应走索引: {plan}");
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn index_rebuilds_on_flush_and_survives_restart() {
             vec![vec![s(5000)]]
         );
         let plan = explain(&engine, "EXPLAIN SELECT * FROM t WHERE id = 500");
-        assert!(plan.contains("IndexScan"), "重启后索引仍被选择: {plan}");
+        assert!(plan.contains("Index Scan"), "重启后索引仍被选择: {plan}");
     }
 }
 
@@ -251,7 +251,7 @@ fn drop_index_and_ddl_guards() {
     engine.execute_script("DROP INDEX idx_id").unwrap();
     assert!(idx_file(dir.path(), tid(&engine, "t"), 0).is_none());
     let plan = explain(&engine, "EXPLAIN SELECT * FROM t WHERE id = 42");
-    assert!(!plan.contains("IndexScan"), "删索引后走全扫: {plan}");
+    assert!(!plan.contains("Index Scan"), "删索引后走全扫: {plan}");
     // 语义不受影响(表只有 id 0..29 → 点查 id = 4)
     assert_eq!(
         rows_of(engine.execute_script("SELECT COUNT(*) FROM t WHERE id = 4").unwrap()),
@@ -319,7 +319,7 @@ fn index_on_text_column() {
         .execute_script("CREATE INDEX idx_name ON users (name)")
         .unwrap();
     let plan = explain(&engine, "EXPLAIN SELECT * FROM users WHERE name = 'user042'");
-    assert!(plan.contains("IndexScan"), "Utf8 等值应走索引: {plan}");
+    assert!(plan.contains("Index Scan"), "Utf8 等值应走索引: {plan}");
     assert_eq!(
         rows_of(
             engine

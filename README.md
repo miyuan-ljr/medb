@@ -143,7 +143,9 @@ postgres=# DELETE FROM users WHERE id = 1;
   - **连接顺序枚举**:≤10 表子集 DP(代价 = 读取 + 物化侧哈希表 + 输出),
     每步选小侧物化(必要时交换 probe/build 并投影还原列序);>10 表贪心;
     LEFT JOIN 为重排屏障(语义正确性优先)
-  - **EXPLAIN <SELECT>**:统计驱动的计划树(扫描估行/下推过滤/连接键/物化侧)
+  - **EXPLAIN <SELECT>**:PG 风格缩进计划树(`-> ` 节点 + Sort Key/Hash Cond/Filter/
+    Output 细节行 + `Hash (build)` 构建侧 + rows≈ 估行;去相关子查询展示
+    原始谓词与构建侧子计划)
   - 顺带修正:LEFT JOIN 空产侧谓词此前被错误下推(会改变 NULL 补齐语义),
     统一路由后按"位置 ≥ 自身的 LEFT 步骤挡住下推"处理
 - **表达式 JIT(`exec::expr_compile`)**:

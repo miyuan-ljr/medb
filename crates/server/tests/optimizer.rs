@@ -59,9 +59,10 @@ fn explain_returns_plan_tree() {
         "EXPLAIN SELECT b.y FROM a JOIN b ON a.k = b.k WHERE a.x < 5",
     );
     let joined = lines.join("\n");
-    assert!(joined.contains("HashJoin"), "plan = {joined}");
-    assert!(joined.contains("on:"), "应有哈希键: {joined}");
-    assert!(joined.contains("filter:"), "应有下推过滤: {joined}");
+    assert!(joined.contains("Hash Join (inner)"), "plan = {joined}");
+    assert!(joined.contains("Hash Cond:"), "应有哈希键: {joined}");
+    assert!(joined.contains("Hash (build)"), "应标注哈希构建侧: {joined}");
+    assert!(joined.contains("Filter:"), "应有下推过滤: {joined}");
     // 根为最终投影,连接树在其下
     assert!(lines[0].starts_with("Project"), "plan = {lines:?}");
 }
@@ -90,9 +91,10 @@ fn cbo_avoids_cartesian_prefix() {
         &engine,
         "EXPLAIN SELECT a.x FROM b, c, a WHERE b.k = a.k AND c.k = a.k",
     );
-    for line in lines.iter().filter(|l| l.contains("HashJoin")) {
-        assert!(line.contains("on:"), "禁止无键笛卡尔连接: {lines:?}");
-    }
+    // 每个哈希连接都有键(Hash Cond 细节行);键缺失 = 笛卡尔连接
+    let joins = lines.iter().filter(|l| l.contains("Hash Join")).count();
+    let conds = lines.iter().filter(|l| l.contains("Hash Cond:")).count();
+    assert_eq!(joins, conds, "禁止无键笛卡尔连接: {lines:?}");
     // 每步累计基数都被等值条件压住(b×c 笛卡尔会有 ~50000 行中间结果)
     assert!(
         !lines.iter().any(|l| l.contains("rows≈50000")),

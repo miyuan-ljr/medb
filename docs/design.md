@@ -367,12 +367,25 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
 
 ### 5.5.4 EXPLAIN
 
-`EXPLAIN <SELECT>` → `StatementPlan::Explain { lines }`(不执行查询)。
-计划树自顶向下:Limit → Sort → Project → Aggregate → HashJoin → Scan,
-每节点带估行数 / 下推过滤 / 连接键 / 物化侧标签。planner 以 `ExplNode` 树
-累积、`flatten_expl` 摊平;LIMIT 在外层包装时整体缩进一级。
-索引命中时扫描标签为 `IndexScan <表> via <索引名> col=<列> rows≈<估行>
-range: [lo, hi)`(开/闭按谓词;EXPLAIN 是观察索引选择的窗口)。
+`EXPLAIN <SELECT>` → `StatementPlan::Explain { lines }`(不执行查询;相关
+子查询的计划期求值除外 —— 摘取合取项需要执行非相关部分)。
+展示形态对齐 **PostgreSQL EXPLAIN**:每层缩进 6 格,节点行 =
+`->  <操作>  rows≈N`,属性细节行(`Sort Key` / `Hash Cond` / `Join Filter` /
+`Filter` / `Output` / `Group Key` / `Aggregates` / `Index Cond`)与子节点箭头
+对齐;哈希构建侧渲染为合成 `Hash (build)` 节点;内部的列序修正投影
+(column restore)不展示。计划表达式经 `expr_text` 渲染为可读文本
+(列名经 schema 解析、字符串加引号);相关子查询的连接键/匹配条件/比较
+谓词用改写前的 SQL 原文(限定名消歧),构建侧子计划以预渲染行块附加
+(`raw_children`,整体平移缩进)。标签约定:`Seq Scan on <别名>` /
+`Index Scan on <表> using <索引名>`(Index Cond 等值点查压缩为 `col = x`)/
+`Hash Join (inner|left outer)` / `Hash Semi Join` / `Hash Anti Join` /
+`Hash Left Join`(标量提升,detail 标注 For)/ `Hash Aggregate` /
+`Sort (top-N k)` / `Limit (offset=.., fetch=..)`。
+Estimator 估行数以 `rows≈N` 跟随节点标签(聚合组数不可估,不显示)。
+planner 以 `ExplNode { label, est, details, children, hash_build, raw_children }`
+树累积、`flatten_expl` 渲染;根箭头在 EXPLAIN 语句出口剥除
+(`strip_root_arrow`,Limit 包装不再二次缩进)。EXPLAIN 是观察索引选择与
+CBO 连接顺序的窗口。
 
 ### 5.5.4b 二级索引的代价选择(`optimizer::plan_index_range`)
 

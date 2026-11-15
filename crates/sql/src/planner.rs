@@ -221,7 +221,7 @@ pub fn plan_statement(stmt: &Statement, ctx: &PlanContext<'_>) -> Result<Stateme
             let schema = vec![ColumnDesc::new("plan".to_string(), DataType::Utf8, true)];
             Ok(StatementPlan::Explain {
                 schema,
-                lines: pq.explain,
+                lines: strip_root_arrow(pq.explain),
             })
         }
         Statement::AlterTable(alter) => {
@@ -407,13 +407,14 @@ fn finish_with_limit(
     if offset == 0 && limit.is_none() {
         return Ok(planned);
     }
-    // EXPLAIN 树:Limit 置于根,原计划整体缩进一级
-    let label = match limit {
-        Some(l) => format!("Limit (offset {offset}, take {l})"),
-        None => format!("Offset ({offset})"),
+    // EXPLAIN 树:Limit 置于根;子树行已带 "  ->  " 缩进,无需再加
+    let label = match (offset, limit) {
+        (_, Some(l)) if offset > 0 => format!("Limit (offset={offset}, fetch={l})"),
+        (_, Some(l)) => format!("Limit (fetch={l})"),
+        _ => format!("Offset ({offset})"),
     };
     let mut explain = vec![label];
-    explain.extend(planned.explain.drain(..).map(|l| format!("  {l}")));
+    explain.extend(planned.explain.drain(..));
     let schema = planned.schema.clone();
     let executor = Box::new(LimitExec::new(planned.executor, offset as usize, limit));
     Ok(PlannedQuery {
@@ -551,6 +552,7 @@ fn plan_select(
             synthetic: Vec::new(),
             route_conjuncts: Vec::new(),
             ref_exprs: Vec::new(),
+            scalar_preds: Vec::new(),
         }
     } else {
         let real_width: usize = scope.table_widths().iter().sum();
@@ -1075,12 +1077,15 @@ fn plan_select(
         for w in sq.wraps.drain(..) {
             match w.kind {
                 SqKind::Semi { anti } => {
-                    let label = format!(
-                        "SemiJoin{} (keys={}{})",
-                        if anti { " ANTI" } else { "" },
-                        w.probe_keys.len(),
-                        if w.cond.is_some() { " +cond" } else { "" },
+                    let label = if anti { "Hash Anti Join" } else { "Hash Semi Join" }.to_string();
+                    let mut node = ExplNode::with(
+                        label,
+                        vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
                     );
+                    node = node.detail(format!("Hash Cond: {}", w.key_sql.join(" AND ")));
+                    if let Some(cond_sql) = &w.cond_sql {
+                        node = node.detail(format!("Join Filter: {cond_sql}"));
+                    }
                     exec = Box::new(HashSemiJoinExec::new(
                         exec,
                         w.build,
@@ -1091,13 +1096,15 @@ fn plan_select(
                         w.cond,
                         anti,
                     ));
-                    expl = Some(ExplNode::with(
-                        label,
-                        vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-                    ));
+                    expl = Some(node.raw_child(w.build_lines));
                 }
                 SqKind::ScalarLift => {
-                    let n_keys = w.probe_keys.len();
+                    let mut node = ExplNode::with(
+                        "Hash Left Join".to_string(),
+                        vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+                    );
+                    node = node.detail("For: scalar subquery lift (no match → NULL value)".to_string());
+                    node = node.detail(format!("Hash Cond: {}", w.key_sql.join(" AND ")));
                     exec = Box::new(HashJoinExec::new(
                         exec,
                         w.build,
@@ -1109,20 +1116,26 @@ fn plan_select(
                         None,
                         JoinType::LeftOuter,
                     ));
-                    expl = Some(ExplNode::with(
-                        format!("LeftJoin (scalar lift, keys={n_keys})"),
-                        vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-                    ));
+                    expl = Some(node.raw_child(w.build_lines));
                 }
             }
         }
-        // 标量提升谓词(引用 __sq 值列):包装应用后过滤
-        for e in post_sq_preds.drain(..) {
+        // 标量提升谓词(引用 __sq 值列):包装应用后过滤;
+        // EXPLAIN 展示改写前的原始谓词文本
+        for (i, e) in post_sq_preds.drain(..).enumerate() {
             exec = Box::new(FilterExec::new(exec, e));
-            expl = Some(ExplNode::with(
-                "Filter (scalar subquery)".to_string(),
-                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-            ));
+            let text = sq
+                .scalar_preds
+                .get(i)
+                .map(|c| format!("{c}"))
+                .unwrap_or_else(|| "scalar subquery".to_string());
+            expl = Some(
+                ExplNode::with(
+                    "Filter".to_string(),
+                    vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+                )
+                .detail(format!("Filter: {text}")),
+            );
         }
         // 条件池兜底:未被任何步骤应用的条件(理论上不可达)在顶层过滤
         for (pi, entry) in pool.iter().enumerate() {
@@ -1132,10 +1145,13 @@ fn plan_select(
             let e = plan_expr(entry.expr, scope_ref, ctx)?;
             check_bool(&e, &input_schema, "WHERE")?;
             exec = Box::new(FilterExec::new(exec, e));
-            expl = Some(ExplNode::with(
-                "Filter (leftover predicate)".to_string(),
-                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-            ));
+            expl = Some(
+                ExplNode::with(
+                    "Filter".to_string(),
+                    vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+                )
+                .detail(format!("Filter: {}", entry.expr)),
+            );
         }
         let dtypes = input_schema.iter().map(|c| c.ty.clone()).collect();
         (exec, dtypes)
@@ -1151,10 +1167,13 @@ fn plan_select(
             }
             let pred = plan_expr(where_expr, None, ctx)?;
             pipeline = Box::new(FilterExec::new(pipeline, pred));
-            expl = Some(ExplNode::with(
-                "Filter".to_string(),
-                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-            ));
+            expl = Some(
+                ExplNode::with(
+                    "Filter".to_string(),
+                    vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+                )
+                .detail(format!("Filter: {where_expr}")),
+            );
         }
     }
 
@@ -1162,7 +1181,9 @@ fn plan_select(
     if aggregate {
         // HAVING 先改写(可能注册投影中没有的新聚合),再取 agg 部件
         let mut having_pred: Option<Expr> = None;
+        let mut having_text: Option<String> = None;
         if let Some(having) = &select.having {
+            having_text = Some(format!("{having}"));
             let pred = rewriter.rewrite(having, false)?;
             // HAVING 改写可能注册新的聚合 → 重算输入 schema
             project_input_schema = rewriter.agg_output_schema();
@@ -1177,6 +1198,38 @@ fn plan_select(
         let (group_exprs, aggs, agg_out_schema) = rewriter.take_pipeline_parts();
         let n_groups = group_exprs.len();
         let n_aggs = aggs.len();
+        let mut agg_node = ExplNode::with(
+            "Hash Aggregate".to_string(),
+            vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+        );
+        if n_groups > 0 {
+            agg_node = agg_node.detail(format!(
+                "Group Key: {}",
+                group_exprs
+                    .iter()
+                    .map(|e| expr_text(e, &input_schema))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if n_aggs > 0 {
+            agg_node = agg_node.detail(format!(
+                "Aggregates: {}",
+                aggs.iter()
+                    .map(|d| match (&d.arg, d.distinct) {
+                        (None, false) => format!("{}(*)", d.func.name()),
+                        (None, true) => format!("{}(DISTINCT *)", d.func.name()),
+                        (Some(a), false) => format!("{}({})", d.func.name(), expr_text(a, &input_schema)),
+                        (Some(a), true) => format!(
+                            "{}(DISTINCT {})",
+                            d.func.name(),
+                            expr_text(a, &input_schema)
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         pipeline = Box::new(AggHashExec::new(
             pipeline,
             base_dtypes,
@@ -1184,16 +1237,16 @@ fn plan_select(
             aggs,
             agg_out_schema,
         ));
-        expl = Some(ExplNode::with(
-            format!("Aggregate (groups={n_groups} aggs={n_aggs})"),
-            vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-        ));
+        expl = Some(agg_node);
         if let Some(pred) = having_pred {
             pipeline = Box::new(FilterExec::new(pipeline, pred));
-            expl = Some(ExplNode::with(
-                "Filter (HAVING)".to_string(),
-                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-            ));
+            expl = Some(
+                ExplNode::with(
+                    "Filter".to_string(),
+                    vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+                )
+                .detail(format!("Filter (HAVING): {}", having_text.as_deref().unwrap_or(""))),
+            );
         }
     }
 
@@ -1205,14 +1258,47 @@ fn plan_select(
         project_schema.clone(),
         project_exprs,
     ));
-    expl = Some(ExplNode::with(
-        format!("Project ({} cols)", project_schema.len()),
-        vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-    ));
+    expl = Some(
+        ExplNode::with(
+            "Project".to_string(),
+            vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+        )
+        .detail(format!(
+            "Output: {}",
+            project_schema
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    );
 
     // Sort + 砍隐藏列(下游紧跟 LIMIT k 且无 OFFSET → Top-N 模式)
     if !keys.is_empty() {
-        let n_keys = keys.len();
+        let sort_key_text = keys
+            .iter()
+            .map(|k| {
+                let col = match &k.expr {
+                    Expr::Column(i) => *i,
+                    _ => usize::MAX,
+                };
+                let name = project_schema
+                    .get(col)
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("#sort");
+                let default_nulls = !k.asc;
+                match (k.asc, k.nulls_first == default_nulls) {
+                    (true, true) => format!("{name} ASC"),
+                    (false, true) => format!("{name} DESC"),
+                    (asc, false) => format!(
+                        "{name} {} NULLS {}",
+                        if asc { "ASC" } else { "DESC" },
+                        if k.nulls_first { "FIRST" } else { "LAST" }
+                    ),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut sort_exec = SortExec::new(pipeline, keys, project_schema.clone());
         let mut topn_k: Option<u64> = None;
         if let Some((k, false)) = limit_hint {
@@ -1221,13 +1307,16 @@ fn plan_select(
         }
         pipeline = Box::new(sort_exec);
         let sort_label = match topn_k {
-            Some(k) => format!("Sort ({n_keys} keys, topn={k})"),
-            None => format!("Sort ({n_keys} keys)"),
+            Some(k) => format!("Sort (top-N {k})"),
+            None => "Sort".to_string(),
         };
-        expl = Some(ExplNode::with(
-            sort_label,
-            vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-        ));
+        expl = Some(
+            ExplNode::with(
+                sort_label,
+                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+            )
+            .detail(format!("Sort Key: {sort_key_text}")),
+        );
         if !hidden.is_empty() {
             let visible_n = visible.len();
             pipeline = Box::new(ProjectExec::new(
@@ -1235,10 +1324,20 @@ fn plan_select(
                 project_schema[..visible_n].to_vec(),
                 (0..visible_n).map(Expr::Column).collect(),
             ));
-            expl = Some(ExplNode::with(
-                "Project (drop sort keys)".to_string(),
-                vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-            ));
+            expl = Some(
+                ExplNode::with(
+                    "Project".to_string(),
+                    vec![expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
+                )
+                .detail(format!(
+                    "Output: {} (sort keys dropped)",
+                    project_schema[..visible_n]
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            );
         }
     }
 
@@ -1261,29 +1360,187 @@ fn plan_select(
 // ---------- 执行计划描述(EXPLAIN) ----------
 
 /// 计划树节点(自顶向下展示:根在前,子节点缩进)。
+///
+/// 展示形态对齐 PostgreSQL EXPLAIN:节点行 = `->  操作  rows≈N`,
+/// 属性细节行(Sort Key / Hash Cond / Filter 等)在子节点之前缩进列出;
+/// 哈希构建侧渲染为合成 `Hash (build)` 节点,内部列序修正投影不展示。
 struct ExplNode {
     label: String,
+    /// 输出行数估计(None = 无法估算,如聚合组数)
+    est: Option<f64>,
+    /// 属性细节(Sort Key / Hash Cond / Filter …),渲染在子节点之前
+    details: Vec<String>,
     children: Vec<ExplNode>,
+    /// 第二个子节点是哈希构建侧 → 渲染为合成 `Hash (build)` 节点
+    hash_build: bool,
+    /// 预渲染子树行(去相关子查询的构建侧;整体平移到本层子节点缩进)
+    raw_children: Vec<String>,
 }
 
 impl ExplNode {
     fn leaf(label: String) -> ExplNode {
         ExplNode {
             label,
+            est: None,
+            details: Vec::new(),
             children: Vec::new(),
+            hash_build: false,
+            raw_children: Vec::new(),
         }
     }
 
     fn with(label: String, children: Vec<ExplNode>) -> ExplNode {
-        ExplNode { label, children }
+        ExplNode {
+            label,
+            est: None,
+            details: Vec::new(),
+            children,
+            hash_build: false,
+            raw_children: Vec::new(),
+        }
+    }
+
+    /// 设置行数估计(builder 风格,链在构造点尾部)。
+    fn est(mut self, est: f64) -> Self {
+        self.est = Some(est);
+        self
+    }
+
+    fn detail(mut self, line: impl Into<String>) -> Self {
+        self.details.push(line.into());
+        self
+    }
+
+    fn hash_build(mut self) -> Self {
+        self.hash_build = true;
+        self
+    }
+
+    fn raw_child(mut self, lines: Vec<String>) -> Self {
+        self.raw_children = lines;
+        self
     }
 }
 
+/// 计划表达式 → 可读文本(列名经 schema 解析;AST 文本在别处已有)。
+fn expr_text(e: &Expr, schema: &[ColumnDesc]) -> String {
+    match e {
+        Expr::Column(i) => schema
+            .get(*i)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "#col".to_string()),
+        Expr::Literal(v) => match v {
+            ScalarValue::Null => "NULL".to_string(),
+            ScalarValue::Utf8(s) => format!("'{s}'"),
+            other => other.to_text().unwrap_or_else(|| "?".to_string()),
+        },
+        Expr::Binary { op, left, right } => format!(
+            "({} {} {})",
+            expr_text(left, schema),
+            op.symbol(),
+            expr_text(right, schema)
+        ),
+        Expr::Function { name, args } => format!(
+            "{}({})",
+            name,
+            args.iter()
+                .map(|a| expr_text(a, schema))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::IsNull { expr, negated } => format!(
+            "{} IS {}NULL",
+            expr_text(expr, schema),
+            if *negated { "NOT " } else { "" }
+        ),
+        Expr::Case { whens, else_expr } => {
+            let mut s = String::from("CASE");
+            for (c, r) in whens {
+                s.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    expr_text(c, schema),
+                    expr_text(r, schema)
+                ));
+            }
+            if let Some(el) = else_expr {
+                s.push_str(&format!(" ELSE {}", expr_text(el, schema)));
+            }
+            s.push_str(" END");
+            s
+        }
+        Expr::InList { expr, list, negated } => {
+            let items = list
+                .iter()
+                .map(|v| match v {
+                    ScalarValue::Null => "NULL".to_string(),
+                    ScalarValue::Utf8(s) => format!("'{s}'"),
+                    other => other.to_text().unwrap_or_else(|| "?".to_string()),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{} {}IN ({})",
+                expr_text(expr, schema),
+                if *negated { "NOT " } else { "" },
+                items
+            )
+        }
+    }
+}
+
+
+/// 谓词文本中的标量值(字符串加引号,日期输出 YYYY-MM-DD)。
+fn scalar_cond_text(v: &ScalarValue) -> String {
+    match v {
+        ScalarValue::Null => "NULL".to_string(),
+        ScalarValue::Utf8(s) => format!("'{s}'"),
+        other => other.to_text().unwrap_or_else(|| "?".to_string()),
+    }
+}
+
+/// EXPLAIN 渲染:PG 风格缩进树。
+/// 节点行 = `<缩进>->  <label>[  rows≈N]`;细节行与子节点箭头对齐;
+/// 哈希构建侧子节点包一层合成 `Hash (build)`(行数随构建子节点)。
+/// 首行箭头由最终树根的剥除点处理(plan_statement)。
 fn flatten_expl(node: &ExplNode, depth: usize, out: &mut Vec<String>) {
-    out.push(format!("{}{}", "  ".repeat(depth), node.label));
+    let indent = format!("  {}", "      ".repeat(depth));
+    let mut line = format!("{indent}->  {}", node.label);
+    if let Some(est) = node.est {
+        line.push_str(&format!("  rows≈{}", fmt_est(est)));
+    }
+    out.push(line);
+    let detail_indent = format!("{indent}      ");
+    for d in &node.details {
+        out.push(format!("{detail_indent}{d}"));
+    }
+    if node.hash_build && node.children.len() == 2 {
+        flatten_expl(&node.children[0], depth + 1, out);
+        let build = &node.children[1];
+        let mut hash = ExplNode::leaf("Hash (build)".to_string());
+        hash.est = build.est;
+        flatten_expl(&hash, depth + 1, out);
+        flatten_expl(build, depth + 2, out);
+        return;
+    }
     for c in &node.children {
         flatten_expl(c, depth + 1, out);
     }
+    // 预渲染子树(去相关构建侧):整体平移到本层子节点缩进
+    if !node.raw_children.is_empty() {
+        let pad = " ".repeat(6 + 6 * depth);
+        for l in &node.raw_children {
+            out.push(format!("{pad}{l}"));
+        }
+    }
+}
+
+/// 剥除首个节点行的箭头与前导缩进(最终树根;调用方:EXPLAIN 语句出口)。
+fn strip_root_arrow(mut lines: Vec<String>) -> Vec<String> {
+    if let Some(first) = lines.first_mut() {
+        let trimmed = first.trim_start().to_string();
+        *first = trimmed.strip_prefix("->  ").map(String::from).unwrap_or(trimmed);
+    }
+    lines
 }
 
 /// 发射上下文:路由产物与计划期环境(供 flush/emit 函数共享)。
@@ -1315,13 +1572,20 @@ struct PipelineState {
     expl: Option<ExplNode>,
 }
 
-/// 扫描节点标签。
-fn scan_label(em: &EmitCtx<'_>, t: usize, est_rows: f64) -> String {
-    let mut label = format!("Scan {} rows≈{}", em.steps[t].alias, fmt_est(est_rows));
+/// 扫描节点(行数估计 + 下推过滤细节行)。
+fn scan_node(em: &EmitCtx<'_>, t: usize, est_rows: f64) -> ExplNode {
+    let alias = &em.steps[t].alias;
+    let derived = em.pipelines.borrow().contains_key(alias);
+    let label = if derived {
+        format!("Seq Scan on {alias} (derived)")
+    } else {
+        format!("Seq Scan on {alias}")
+    };
+    let mut node = ExplNode::leaf(label).est(est_rows);
     if !em.scan_sql[t].is_empty() {
-        label.push_str(&format!(" filter: [{}]", em.scan_sql[t].join(" AND ")));
+        node = node.detail(format!("Filter: {}", em.scan_sql[t].join(" AND ")));
     }
-    label
+    node
 }
 
 fn fmt_est(v: f64) -> String {
@@ -1460,7 +1724,7 @@ fn flush_group(
         if k == 0 {
             // 首表扫描:列 = 该表局部下标(偏移 = offsets[node]);
             // 后续连接的累计侧表达式按规范布局定位(rebase_to_layout)
-            let (exec, idx_label) = table_scan(
+            let (exec, idx_node) = table_scan(
                 &em.steps[node],
                 &em.scan_preds[node],
                 em.offsets[node],
@@ -1471,9 +1735,9 @@ fn flush_group(
             st.exec = Some(exec);
             st.cur_order = vec![node];
             st.est_rows = plan.est_rows[0];
-            st.expl = Some(ExplNode::leaf(
-                idx_label.unwrap_or_else(|| scan_label(em, node, base_of(em, node))),
-            ));
+            st.expl = Some(
+                idx_node.unwrap_or_else(|| scan_node(em, node, base_of(em, node))),
+            );
             continue;
         }
         let step = &plan.steps[k - 1];
@@ -1647,7 +1911,7 @@ fn emit_inner_join(
         .map(|&f| em.input_schema[f].clone())
         .collect();
     let (probe_exec, build_exec, probe_schema, build_schema, children) = if build_accumulated {
-        let (probe, probe_label) = table_scan(
+        let (probe, probe_node) = table_scan(
             &em.steps[t],
             &em.scan_preds[t],
             t_offset,
@@ -1657,17 +1921,10 @@ fn emit_inner_join(
         )?;
         let build = st.exec.take().expect("accumulated pipeline");
         let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
-        let probe_label =
-            probe_label.unwrap_or_else(|| scan_label(em, t, base_of(em, t)));
-        (
-            probe,
-            build,
-            em.steps[t].schema.columns.clone(),
-            prefix_schema,
-            vec![ExplNode::leaf(probe_label), expl_prev],
-        )
+        let probe_node = probe_node.unwrap_or_else(|| scan_node(em, t, base_of(em, t)));
+        (probe, build, em.steps[t].schema.columns.clone(), prefix_schema, vec![probe_node, expl_prev])
     } else {
-        let (build, build_label) = table_scan(
+        let (build, build_node) = table_scan(
             &em.steps[t],
             &em.scan_preds[t],
             t_offset,
@@ -1677,15 +1934,8 @@ fn emit_inner_join(
         )?;
         let probe = st.exec.take().expect("accumulated pipeline");
         let expl_prev = st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()));
-        let build_label =
-            build_label.unwrap_or_else(|| scan_label(em, t, base_of(em, t)));
-        (
-            probe,
-            build,
-            prefix_schema,
-            em.steps[t].schema.columns.clone(),
-            vec![expl_prev, ExplNode::leaf(build_label)],
-        )
+        let build_node = build_node.unwrap_or_else(|| scan_node(em, t, base_of(em, t)));
+        (probe, build, prefix_schema, em.steps[t].schema.columns.clone(), vec![expl_prev, build_node])
     };
 
     let exec: BoxedExecutor = Box::new(HashJoinExec::new(
@@ -1699,22 +1949,21 @@ fn emit_inner_join(
         combine_and(residual),
         JoinType::Inner,
     ));
-    let side = if build_accumulated {
-        "build=accumulated"
-    } else {
-        "build=new"
-    };
-    let mut label = format!("HashJoin inner rows≈{} [{side}]", fmt_est(est_out));
+    let mut node = ExplNode::with(
+        "Hash Join (inner)".to_string(),
+        children,
+    )
+    .est(est_out);
     if !key_sql.is_empty() {
-        label.push_str(&format!(" on: [{}]", key_sql.join(", ")));
+        node = node.detail(format!("Hash Cond: {}", key_sql.join(" AND ")));
     }
     if !residual_sql.is_empty() {
-        label.push_str(&format!(" filter: [{}]", residual_sql.join(" AND ")));
+        node = node.detail(format!("Join Filter: {}", residual_sql.join(" AND ")));
     }
-    st.expl = Some(ExplNode::with(label, children));
+    st.expl = Some(node.hash_build());
 
     // 列顺序:交换 = [t] ++ 前缀,否则 = 前缀 ++ [t](集合 = 前缀 ∪ {t});
-    // 与规范序不一致则置换
+    // 与规范序不一致则置换(内部列序修正,EXPLAIN 不展示)
     let mut new_cur = if build_accumulated {
         let mut c = vec![t];
         c.extend(prefix.iter().copied());
@@ -1730,10 +1979,6 @@ fn emit_inner_join(
     if new_cur != canonical {
         exec = permute_to_canonical(exec, &new_cur, em);
         new_cur = canonical;
-        st.expl = Some(ExplNode::with(
-            "Project (column restore)".to_string(),
-            vec![st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-        ));
     }
     st.cur_order = new_cur;
     st.est_rows = est_out;
@@ -1759,8 +2004,9 @@ fn emit_left_join(
         .iter()
         .map(|&f| em.input_schema[f].clone())
         .collect();
-    let (build, _build_label) =
+    let (build, build_node) =
         table_scan(&em.steps[k], &[], em.offsets[k], &em.needed[k], em.plan_ctx, em.pipelines)?;
+    let build_node = build_node.unwrap_or_else(|| scan_node(em, k, base_of(em, k)));
 
     let mut residual: Vec<Expr> = Vec::new();
     let mut residual_sql: Vec<String> = Vec::new();
@@ -1784,28 +2030,59 @@ fn emit_left_join(
 
     let (pk, bk) = left_keys[k].clone();
     let probe_est = st.est_rows;
+    let build_schema_cols = em.steps[k].schema.columns.clone();
     let exec: BoxedExecutor = Box::new(HashJoinExec::new(
         st.exec.take().expect("accumulated pipeline"),
         build,
         probe_schema,
-        em.steps[k].schema.columns.clone(),
+        build_schema_cols.clone(),
         pk,
         bk,
         combine_and(left_match[k].clone()),
         combine_and(residual),
         JoinType::LeftOuter,
     ));
-    let mut label = format!("HashJoin left rows≈{}", fmt_est(probe_est));
+    let mut node = ExplNode::with(
+        "Hash Join (left outer)".to_string(),
+        vec![
+            st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into())),
+            build_node,
+        ],
+    )
+    .est(probe_est);
     if !left_keys[k].0.is_empty() {
-        label.push_str(&format!(" ({} key cols)", left_keys[k].0.len()));
+        // 键:探测侧按累计(全扁平)schema 解析;构建侧按新表局部 schema 解析
+        node = node.detail(format!(
+            "Hash Cond: {}",
+            left_keys[k]
+                .0
+                .iter()
+                .zip(&left_keys[k].1)
+                .map(|(p, b)| format!(
+                    "({} = {})",
+                    expr_text(p, em.input_schema),
+                    expr_text(b, &build_schema_cols)
+                ))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        ));
+    }
+    if !left_match[k].is_empty() {
+        // match_cond 表达式按全扁平 schema 计划,连接输出位置 = 扁平下标
+        // (LEFT 步骤的累计侧恒为从 0 连续的规范布局)
+        node = node.detail(format!(
+            "Join Filter: {}",
+            left_match[k]
+                .iter()
+                .map(|e| expr_text(e, em.input_schema))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        ));
     }
     if !residual_sql.is_empty() {
-        label.push_str(&format!(" filter: [{}]", residual_sql.join(" AND ")));
+        node = node.detail(format!("Join Filter: {}", residual_sql.join(" AND ")));
     }
-    st.expl = Some(ExplNode::with(
-        label,
-        vec![st.expl.take().unwrap_or_else(|| ExplNode::leaf("?".into()))],
-    ));
+    st.expl = Some(node.hash_build());
     st.cur_order.push(k); // FROM 序追加,天然规范(集合含表 0 → 全扁平)
     st.exec = Some(exec);
     Ok(())
@@ -2040,7 +2317,7 @@ fn plan_from(
 }
 
 /// 单表扫描(可选下推过滤,列下标重基到表内局部)。
-/// 返回 (执行器, Option<IndexScan 标签>):索引命中时标签替代普通 Scan 标签。
+/// 返回 (执行器, Option<IndexScan 节点>):索引命中时该节点替代普通 Scan 节点。
 fn table_scan(
     step: &RelationStep,
     preds: &[Expr],
@@ -2048,7 +2325,7 @@ fn table_scan(
     needed: &[bool],
     ctx: &PlanContext<'_>,
     pipelines: &std::cell::RefCell<HashMap<String, BoxedExecutor>>,
-) -> Result<(BoxedExecutor, Option<String>)> {
+) -> Result<(BoxedExecutor, Option<ExplNode>)> {
     // 谓词下推:随解码过滤(列存路径则在列块上求值),不再叠加 FilterExec
     let rebased: Vec<Expr> = preds
         .iter()
@@ -2093,39 +2370,53 @@ fn table_scan(
                         needed_opt,
                     ),
                 );
-                let mut range = String::from("(-∞, +∞)");
+                let idx_name = step
+                    .schema
+                    .indexes
+                    .iter()
+                    .find(|ix| ix.column == step.schema.columns[ip.col_idx].name)
+                    .map(|ix| ix.name.as_str())
+                    .unwrap_or("?");
+                let col_name = &step.schema.columns[ip.col_idx].name;
+                let mut node = ExplNode::leaf(format!(
+                    "Index Scan on {} using {}",
+                    step.alias, idx_name
+                ))
+                .est(est.max(1.0));
+                // 区间 → 标准比较谓词文本(PG 风格 Index Cond;
+                // 闭区间且上下界相等 → 等值点查 `col = x`)
+                let mut conds: Vec<String> = Vec::with_capacity(2);
                 match (&ip.lo, &ip.hi) {
-                    (Some((l, li)), Some((h, hi))) => {
-                        range = format!(
-                            "{}{}, {}{}",
-                            if *li { "[" } else { "(" },
-                            l,
-                            h,
-                            if *hi { "]" } else { ")" }
-                        );
+                    (Some((lo, true)), Some((hi, true))) if lo == hi => {
+                        conds.push(format!("{col_name} = {}", scalar_cond_text(lo)));
                     }
-                    (Some((l, li)), None) => {
-                        range = format!("{}{}, +∞)", if *li { "[" } else { "(" }, l);
+                    (lo, hi) => {
+                        if let Some((lo, inclusive)) = lo {
+                            let text = scalar_cond_text(lo);
+                            conds
+                                .push(format!("{col_name} {} {text}", if *inclusive { ">=" } else { ">" }));
+                        }
+                        if let Some((hi, inclusive)) = hi {
+                            let text = scalar_cond_text(hi);
+                            conds
+                                .push(format!("{col_name} {} {text}", if *inclusive { "<=" } else { "<" }));
+                        }
                     }
-                    (None, Some((h, hi))) => {
-                        range = format!("(-∞, {}{}", h, if *hi { "]" } else { ")" });
-                    }
-                    _ => {}
                 }
-                let label = format!(
-                    "IndexScan {} via {} col={} rows≈{} range: {}",
-                    step.alias,
-                    step.schema
-                        .indexes
-                        .iter()
-                        .find(|ix| ix.column == step.schema.columns[ip.col_idx].name)
-                        .map(|ix| ix.name.as_str())
-                        .unwrap_or("?"),
-                    step.schema.columns[ip.col_idx].name,
-                    fmt_est(est.max(1.0)),
-                    range
-                );
-                return Ok((exec, Some(label)));
+                if !conds.is_empty() {
+                    node = node.detail(format!("Index Cond: {}", conds.join(" AND ")));
+                }
+                let residual_text = rebased
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !ip.matched.contains(i))
+                    .map(|(_, e)| expr_text(e, &step.schema.columns))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                if !residual_text.is_empty() {
+                    node = node.detail(format!("Filter: {residual_text}"));
+                }
+                return Ok((exec, Some(node)));
             }
         }
     }
