@@ -149,6 +149,13 @@ bloom + [min,max] range 短路;`covers` 用 user_key 闭区间。
   Utf8 用 data+offsets(u32,≤4GiB/列),null 位图 1=valid,无 null 不带位图。
 - 批:`DataChunk{columns, num_rows 不变式, Reservation}`;`select` 是 filter
   的核心动作(压缩所有列 + null 位图);`head` 供 limit。
+- **执行期内存原则**:尽量减少拷贝、尽量复用内存,只在"交付所有权必需"
+  时拷贝当批数据。`Vector::slice(offset, len)` 是批切片的关键原语 —— 只拷
+  窗口内行,源向量不动,剩余行复用同一份缓冲。反例(v2 踩过):seq_scan
+  旧实现每批 `head + select(rest)` 把剩余整块重压一遍,大块扫描退化为
+  O(N²/batch)(COUNT(*) 60k 行 47ms 切片 / Q19 116ms);游标 + slice 后
+  同查询切片 <2ms,SF0.1 合计 459 → 253ms。后续方向:ColumnData Arc 化
+  (窗口共享底层缓冲,缓存→chunk→批全程零拷贝)。
 - 表达式:`Expr::eval(chunk) -> Vector`,内核为切片上的紧密循环;
   算术 checked(溢出报错)、比较三值 null 传播、And/Or 暂按 false。
 - 算子:pull 式 `next_batch(ctx)`;`Ok(None)` 终止。混合类型算术按侧提升

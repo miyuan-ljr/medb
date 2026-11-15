@@ -174,7 +174,8 @@ postgres=# DELETE FROM users WHERE id = 1;
   - **并行框架**(`exec::parallel`):`scope_map` 作用域线程分片(保序拼接),
     应用于 LSM 解码过滤与 HashJoin 探测行组装;`engine.parallelism` 配置
     (默认 CPU 核数,上限 8);
-  - SF0.1 基准:11 条合计 976ms → **651ms**(-33%),Q6 -60%、Q10 -62%。
+  - SF0.1 基准:11 条合计 976ms → **651ms**(-33%),Q6 -60%、Q10 -62%;
+  后续批切片游标化(Vector::slice,消除 O(N²/batch) 重拷)→ **253ms**
 - **内存控制(30 GiB 上限)**:
   - 配额树根默认限额提升到 **30 GiB**(`memory.global_limit_bytes`,0 = 不限);
     memtable / arena / chunk / 哈希表 / 物化行集全在同一棵树上记账

@@ -644,30 +644,41 @@ impl Vector {
 
     /// 截取前 n 行(limit 算子用)。
     pub fn head(&self, n: usize) -> Vector {
-        let n = n.min(self.len());
+        self.slice(0, n)
+    }
+
+    /// 截取 [offset, offset + len) 行窗口。
+    /// **只拷贝窗口内数据**(交付给下游的所有权必需),源向量保持不变 ——
+    /// 批切片零冗余拷贝的关键原语:剩余行复用同一份缓冲,不重压。
+    pub fn slice(&self, offset: usize, len: usize) -> Vector {
+        let len = len.min(self.len().saturating_sub(offset));
+        let end = offset + len;
         let data = match &self.data {
-            ColumnData::Bool(v) => ColumnData::Bool(v[..n].to_vec()),
-            ColumnData::Int64(v) => ColumnData::Int64(v[..n].to_vec()),
-            ColumnData::Float64(v) => ColumnData::Float64(v[..n].to_vec()),
-            ColumnData::Date(v) => ColumnData::Date(v[..n].to_vec()),
+            ColumnData::Bool(v) => ColumnData::Bool(v[offset..end].to_vec()),
+            ColumnData::Int64(v) => ColumnData::Int64(v[offset..end].to_vec()),
+            ColumnData::Float64(v) => ColumnData::Float64(v[offset..end].to_vec()),
+            ColumnData::Date(v) => ColumnData::Date(v[offset..end].to_vec()),
             ColumnData::Utf8 { data, offsets } => ColumnData::Utf8 {
-                data: data[offsets[0] as usize..offsets[n] as usize].to_vec(),
-                offsets: offsets[..=n].iter().map(|o| o - offsets[0]).collect(),
+                data: data[offsets[offset] as usize..offsets[end] as usize].to_vec(),
+                offsets: offsets[offset..=end]
+                    .iter()
+                    .map(|o| o - offsets[offset])
+                    .collect(),
             },
-            ColumnData::Binary(v) => ColumnData::Binary(v[..n].to_vec()),
+            ColumnData::Binary(v) => ColumnData::Binary(v[offset..end].to_vec()),
             ColumnData::List { elem, values } => ColumnData::List {
                 elem: elem.clone(),
-                values: values[..n].to_vec(),
+                values: values[offset..end].to_vec(),
             },
             ColumnData::Vector { dim, values } => ColumnData::Vector {
                 dim: *dim,
-                values: values[..n].to_vec(),
+                values: values[offset..end].to_vec(),
             },
         };
         let nulls = self.nulls.as_ref().map(|v| {
-            let mut out = Validity::all_valid(n);
-            for i in 0..n {
-                out.set(i, v.get(i));
+            let mut out = Validity::all_valid(len);
+            for i in 0..len {
+                out.set(i, v.get(offset + i));
             }
             out
         });

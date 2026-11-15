@@ -125,6 +125,8 @@ pub struct SeqScanExec {
     column_chunks: std::collections::VecDeque<DataChunk>,
     /// 列存路径已选定(即使队列为空也不回退行存)
     columnar_started: bool,
+    /// 队首块的已交付游标(批切片只拷当批,front 本体不动)
+    front_off: usize,
     /// 物化行集的内存记账(超查询/全局限额 → MemoryLimitExceeded)
     mem: Option<Reservation>,
     next: usize,
@@ -163,6 +165,7 @@ impl SeqScanExec {
             rows: None,
             column_chunks: Default::default(),
             columnar_started: false,
+            front_off: 0,
             mem: None,
             next: 0,
         }
@@ -243,20 +246,29 @@ impl Executor for SeqScanExec {
 }
 
 impl SeqScanExec {
-    /// 列存路径的批切分:队首块 ≤ batch_size 直接整块交付;大块用 head
-    /// 逐步取出,余下压缩放回。
+    /// 列存路径的批切分:游标 + [`Vector::slice`]。
+    /// front 本体保持不变,每批只拷贝当批交付数据(必要拷贝),
+    /// 剩余行零拷贝复用 —— 消除 O(N²/batch) 的整块重压。
     fn next_columnar_batch(&mut self, ctx: &mut ExecuteContext) -> Result<Option<DataChunk>> {
-        let Some(front) = self.column_chunks.front_mut() else {
-            return Ok(None);
-        };
-        if front.num_rows() <= ctx.batch_size {
-            return Ok(self.column_chunks.pop_front());
+        loop {
+            let Some(front) = self.column_chunks.front() else {
+                return Ok(None);
+            };
+            if self.front_off >= front.num_rows() {
+                self.column_chunks.pop_front();
+                self.front_off = 0;
+                continue;
+            }
+            let n = (front.num_rows() - self.front_off).min(ctx.batch_size);
+            let cols = front
+                .columns()
+                .iter()
+                .map(|v| v.slice(self.front_off, n))
+                .collect();
+            let chunk = DataChunk::with_memory(cols, &ctx.mem.tracker)?;
+            self.front_off += n;
+            return Ok(Some(chunk));
         }
-        let head = front.head(ctx.batch_size, &ctx.mem.tracker)?;
-        let rest_sel: Vec<bool> = (0..front.num_rows()).map(|i| i >= ctx.batch_size).collect();
-        let rest = front.select(&rest_sel, &ctx.mem.tracker)?;
-        *front = rest;
-        Ok(Some(head))
     }
 }
 
