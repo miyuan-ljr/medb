@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use crate::chunk::DataChunk;
 use crate::executor::{BoxedExecutor, ExecuteContext, Executor};
+use crate::vector::Vector;
 use crate::expr::Expr;
 use crate::operators::hash_join::{build_ref_runs, gather_build_column};
 use memory::Reservation;
@@ -136,22 +137,17 @@ impl HashSemiJoinExec {
                 }
                 continue;
             }
-            let null_bits: Vec<Vec<bool>> = bcols
-                .iter()
-                .map(|c| {
-                    let col = batch.column(*c);
-                    (0..n).map(|i| col.null_at(i)).collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
+            // 类型化路径:键列引用提到行循环外;null 位图按需查询(零拷贝)
+            let key_cols: Vec<&Vector> = bcols.iter().map(|&c| batch.column(c)).collect();
             for i in 0..n {
-                let mut key = Vec::with_capacity(bcols.len());
+                let mut key = Vec::with_capacity(key_cols.len());
                 let mut has_null = false;
-                for (c, nulls) in bcols.iter().zip(&null_bits) {
-                    if nulls[i] {
+                for col in &key_cols {
+                    if col.null_at(i) {
                         has_null = true;
                         break;
                     }
-                    key.push(batch.column(*c).int64_values()[i]);
+                    key.push(col.int64_values()[i]);
                 }
                 if has_null {
                     continue;
