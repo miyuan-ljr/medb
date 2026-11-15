@@ -622,8 +622,8 @@ fn build_profile_tag() -> String {
 /// 打印与上次基线的逐 SQL 对比表,并把本次结果持久化为新基线 + 追加历史。
 ///
 /// 表格列:avg(本次均值)/ prev(上次基线)/ Δ%(变化)/ share(占总耗时)/
-/// vsPG(与 PG 参考值的倍数)。**优化方向看两列**:share 大 = 总耗时大头;
-/// vsPG 大 = 相对主流库差距最大的形状(单表聚合 / 连接 / 子查询)。
+/// PG(参考库绝对耗时,常量内嵌同机实测)。**优化方向看两列**:share 大 =
+/// 总耗时大头;与 PG 差距倍数大 = 相对主流库差距最大的形状。
 fn report_and_save_baseline(records: &[BenchRecord], total: f64, load_ms: f64, flush_ms: f64) {
     let profile = build_profile_tag();
     let prev: Option<Baseline> = std::fs::read(baseline_path())
@@ -643,8 +643,8 @@ fn report_and_save_baseline(records: &[BenchRecord], total: f64, load_ms: f64, f
     }
 
     println!(
-        "\n{:<6} {:>8} {:>9} {:>9} {:>9} {:>8} {:>7}",
-        "query", "avg(ms)", "prev", "Δ%", "share%", "vsPG", "min(ms)"
+        "\n{:<6} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8}",
+        "query", "avg(ms)", "prev", "Δ%", "share%", "PG(ms)", "min(ms)"
     );
     for r in records {
         let pg = PG_REFERENCE_MS
@@ -653,7 +653,6 @@ fn report_and_save_baseline(records: &[BenchRecord], total: f64, load_ms: f64, f
             .map(|(_, v)| *v)
             .unwrap_or(f64::NAN);
         let share = if total > 0.0 { r.avg_ms / total * 100.0 } else { 0.0 };
-        let vs_pg = if pg > 0.0 { r.avg_ms / pg } else { f64::NAN };
         let (prev_avg, delta) = if comparable {
             prev.as_ref()
                 .unwrap()
@@ -673,8 +672,8 @@ fn report_and_save_baseline(records: &[BenchRecord], total: f64, load_ms: f64, f
             (f64::NAN, f64::NAN)
         };
         println!(
-            "{:<6} {:>8.1} {:>9.1} {:>+8.1}% {:>7.1}% {:>6.2}x {:>7.1}",
-            r.query, r.avg_ms, prev_avg, delta, share, vs_pg, r.min_ms
+            "{:<6} {:>9.1} {:>9.1} {:>+8.1}% {:>7.1}% {:>8.1} {:>8.1}",
+            r.query, r.avg_ms, prev_avg, delta, share, pg, r.min_ms
         );
     }
     let prev_total = if comparable {
@@ -688,13 +687,13 @@ fn report_and_save_baseline(records: &[BenchRecord], total: f64, load_ms: f64, f
         f64::NAN
     };
     println!(
-        "{:<6} {:>8.1} {:>9.1} {:>+8.1}% {:>7.1}% {:>6.2}x",
+        "{:<6} {:>9.1} {:>9.1} {:>+8.1}% {:>7.1}% {:>8.1}",
         "TOTAL",
         total,
         prev_total,
         total_delta,
         100.0,
-        total / PG_REFERENCE_MS.iter().map(|(_, v)| v).sum::<f64>()
+        PG_REFERENCE_MS.iter().map(|(_, v)| v).sum::<f64>()
     );
 
     // 优化方向提示:占比前三(总耗时大头)+ 相对 PG 差距前三(形状差距)
@@ -710,10 +709,11 @@ fn report_and_save_baseline(records: &[BenchRecord], total: f64, load_ms: f64, f
                 .map(|(_, v)| *v)
                 .unwrap_or(1.0);
             format!(
-                "{} {:.1}ms (share {:.0}%, vsPG {:.1}x)",
+                "{} {:.1}ms (share {:.0}%, PG {:.1}ms, {:.1}x)",
                 r.query,
                 r.avg_ms,
                 if total > 0.0 { r.avg_ms / total * 100.0 } else { 0.0 },
+                pg,
                 r.avg_ms / pg
             )
         })
