@@ -4,3 +4,4 @@ medb.toml
 *.log
 target/
 crates/server/target/
+.vscode/
