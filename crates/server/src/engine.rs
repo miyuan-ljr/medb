@@ -1742,25 +1742,23 @@ impl Engine {
         next.columns.push(column);
         next.version = current.version.max(1) + 1;
 
-        // 1. 重写行数据(旧 schema 读 → 尾补 NULL → 新 schema 编码)
+        // 1. 重写行数据(旧 schema 读 → 尾补 NULL → 新 schema 编码)。
+        // 扫描 + 写回在 LSM 写锁内原子完成:并发 DELETE/UPDATE 落在重写
+        // 之后,不会被重写批盖掉(否则墓碑被覆盖 = 删除复活)。
         let (from, to) = row_range(current.id);
-        let entries = self.lsm.scan(&from, &to)?;
-        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
-        for (key, _seq, value) in entries {
-            let Some(bytes) = value else { continue };
-            let mut slice = bytes.as_slice();
-            let mut row = common::codec::decode_row(&mut slice)?;
-            row.resize(next.columns.len(), ScalarValue::Null);
-            batch.push((key, common::codec::encode_row_to_vec(&row)));
-        }
-        let batch_refs: Vec<(Vec<u8>, Option<Vec<u8>>)> = batch
-            .iter()
-            .map(|(k, v)| (k.clone(), Some(v.clone())))
-            .collect();
-        {
-            let _guard = self.commit_lock.lock();
-            self.lsm.write_batch(&batch_refs)?;
-        }
+        self.lsm.rewrite_locked(|| {
+            let entries = self.lsm.scan(&from, &to)?;
+            let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+                Vec::with_capacity(entries.len());
+            for (key, _seq, value) in entries {
+                let Some(bytes) = value else { continue };
+                let mut slice = bytes.as_slice();
+                let mut row = common::codec::decode_row(&mut slice)?;
+                row.resize(next.columns.len(), ScalarValue::Null);
+                batch.push((key, Some(common::codec::encode_row_to_vec(&row))));
+            }
+            Ok(batch)
+        })?;
 
         // 2. catalog 版本递增
         self.catalog.update_table(next.clone())?;
@@ -1786,20 +1784,21 @@ impl Engine {
 
     fn exec_drop_table(&self, name: &str) -> Result<Outcome> {
         let dropped = self.catalog.drop_table(name)?;
-        // 数据打墓碑 + 目录项删除 + 统计键删除,一并进一个写批
+        // 数据打墓碑 + 目录项删除 + 统计键删除:扫描与写回在 LSM 写锁内
+        // 完成(并发 INSERT 落在墓碑之后 → 该表已不存在,报目录错误;
+        // 落在锁前 → 行成为孤儿数据,id 单调不复用,永不可见)
         let (from, to) = row_range(dropped.id);
-        let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
-            .lsm
-            .scan(&from, &to)?
-            .into_iter()
-            .map(|(key, _, _)| (key, None))
-            .collect();
-        batch.push((catalog_key(name), None));
-        batch.push((storage::table::stats_key(name), None));
-        {
-            let _guard = self.commit_lock.lock();
-            self.lsm.write_batch(&batch)?;
-        }
+        self.lsm.rewrite_locked(|| {
+            let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
+                .lsm
+                .scan(&from, &to)?
+                .into_iter()
+                .map(|(key, _, _)| (key, None))
+                .collect();
+            batch.push((catalog_key(name), None));
+            batch.push((storage::table::stats_key(name), None));
+            Ok(batch)
+        })?;
         self.stats.remove(dropped.id);
         // 删除列存 segment 文件 + 代次/缓存
         self.ap.remove_table(dropped.id);

@@ -52,6 +52,10 @@ impl CatalogStore for InMemoryCatalog {
         }
         if schema.id == 0 {
             schema.id = self.id_gen.next();
+        } else {
+            // 恢复路径:持久化 id 不经过 next() → 推进生成器,避免
+            // 重启后建表撞上恢复表的 id(行区间按 table id 划分,撞车 = 串读)
+            self.id_gen.bump_past(schema.id);
         }
         let created = schema.clone();
         tables.insert(schema.name.clone(), schema);

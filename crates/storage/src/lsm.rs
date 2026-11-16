@@ -166,6 +166,26 @@ impl LsmStore {
             return Ok(());
         }
         let _writer = self.write_lock.lock();
+        self.write_batch_locked(entries)
+    }
+
+    /// 写锁内执行"快照读 + 写回"(DDL 行重写 / 整表墓碑):
+    /// build() 在锁内扫描并构造批次 → 写回前不可能有其它写入插入,
+    /// 消除"扫描 → 写回"窗口内并发 DML 被覆盖 / 复活的竞态。
+    pub fn rewrite_locked(
+        &self,
+        build: impl FnOnce() -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>>,
+    ) -> Result<()> {
+        let _writer = self.write_lock.lock();
+        let entries = build()?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.write_batch_locked(&entries)
+    }
+
+    /// 调用方必须已持有 write_lock。
+    fn write_batch_locked(&self, entries: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<()> {
 
         let base = self
             .last_seq

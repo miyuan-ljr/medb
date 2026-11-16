@@ -23,4 +23,19 @@ impl IdGenerator {
     pub fn peek(&self) -> u64 {
         self.0.load(Ordering::Relaxed) + 1
     }
+
+    /// 把计数器推进到至少 `last_used`(next() 返回值 > last_used)。
+    /// 恢复持久化对象时调用:恢复的 id 不经过 next(),不推进就会撞车。
+    pub fn bump_past(&self, last_used: u64) {
+        let mut cur = self.0.load(Ordering::Relaxed);
+        while cur < last_used {
+            match self
+                .0
+                .compare_exchange(cur, last_used, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
