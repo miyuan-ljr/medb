@@ -527,6 +527,14 @@ impl Vector {
         }
     }
 
+    /// 日期列的原始天数(i32,1970-01-01 起);非 Date 列 panic。
+    pub fn date_values(&self) -> &[i32] {
+        match &self.data {
+            ColumnData::Date(v) => v,
+            _ => panic!("date_values on non-date vector"),
+        }
+    }
+
     pub fn utf8_value(&self, i: usize) -> &str {
         match self.datum(i) {
             Datum::Utf8(s) => s,

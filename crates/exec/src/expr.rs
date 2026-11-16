@@ -485,7 +485,23 @@ pub fn eval_binary(op: BinaryOp, l: &Vector, r: &Vector) -> Result<Vector> {
             let nulls = combine_null_masks(l, r, out.len());
             Vector::new(ColumnData::Int64(out), nulls)
         }
-        (DataType::Date, DataType::Date) if op.is_comparison() => values_compare_kernel(op, l, r),
+        (DataType::Date, DataType::Date) if op.is_comparison() => {
+            // 日期比较走类型化切片:逐行 scalar_at + 通用比较链在
+            // 高通过率过滤(Q1 形状)下是主要开销,~500ns/行
+            let a = l.date_values();
+            let b = r.date_values();
+            let out: Vec<bool> = (0..a.len())
+                .map(|i| {
+                    if l.null_at(i) || r.null_at(i) {
+                        false
+                    } else {
+                        order_op(op, a[i].cmp(&b[i]))
+                    }
+                })
+                .collect();
+            let nulls = combine_null_masks(l, r, out.len());
+            Vector::new(crate::vector::ColumnData::Bool(out), nulls)
+        }
         // Date 列与字符串字面量比较:字符串按日期解析('1995-03-05' 风格)
         (DataType::Date, DataType::Utf8) if op.is_comparison() => {
             let r = coerce_nonscalar_side(r, &DataType::Date)?;
@@ -843,6 +859,32 @@ mod tests {
         let out = e.eval(&chunk).unwrap();
         assert_eq!(out.data_type(), DataType::Float64);
         assert_eq!(out.float64_values(), &[0.5, 1.0]);
+    }
+
+    #[test]
+    fn date_comparison_vectorized() {
+        let l = Vector::from_scalars(
+            DataType::Date,
+            [ScalarValue::Date(100), ScalarValue::Date(200), ScalarValue::Date(300)],
+        )
+        .unwrap();
+        let r = Vector::from_scalars(
+            DataType::Date,
+            [ScalarValue::Date(150), ScalarValue::Date(200), ScalarValue::Date(250)],
+        )
+        .unwrap();
+        // l <= r:第 1、2 行真,第 3 行假
+        let e = Expr::binary(BinaryOp::LtEq, Expr::Column(0), Expr::Column(1));
+        let out = e.eval(&chunk2(l, r.clone())).unwrap();
+        assert_eq!(out.bool_values(), &[true, true, false]);
+        // null 任意侧 → false
+        let l2 = Vector::from_scalars(
+            DataType::Date,
+            [ScalarValue::Date(100), ScalarValue::Null, ScalarValue::Date(300)],
+        )
+        .unwrap();
+        let out2 = e.eval(&chunk2(l2, r)).unwrap();
+        assert_eq!(out2.bool_values(), &[true, false, false]);
     }
 
     #[test]
