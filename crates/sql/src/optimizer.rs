@@ -1131,20 +1131,21 @@ fn range_selectivity(
         return 1.0; // 无有效 min/max → 保守不衰减
     }
     let x = scalar_f64(Some(v));
+    // 上界(col <= x):匹配 = [lo, x] 占比;下界(col >= x):匹配 = [x, hi] 占比
     let f = if upper {
         if x >= hi {
             1.0
         } else if x <= lo {
             0.001
         } else {
-            (hi - x) / span
+            (x - lo) / span
         }
     } else if x <= lo {
         1.0
     } else if x >= hi {
         0.001
     } else {
-        (x - lo) / span
+        (hi - x) / span
     };
     if f.is_finite() { f } else { 1.0 }
 }
