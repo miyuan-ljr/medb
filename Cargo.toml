@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "LicenseRef-NC-Lee-1.0"
 
 [workspace.dependencies]
 # 内部 crate(lib 短名:common / memory / exec / storage / catalog / sql / server)
