@@ -6,6 +6,7 @@
 
 use common::error::{Error, Result};
 use common::types::{DataType, ScalarValue};
+use std::sync::Arc;
 
 /// null 位图:bit=1 表示该行有效。尾部落模的位无意义,访问由 len 把关。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,7 +168,7 @@ impl ColumnData {
 /// 列向量 = 数据 + 可选 null 位图。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vector {
-    data: ColumnData,
+    data: Arc<ColumnData>,
     nulls: Option<Validity>,
 }
 
@@ -208,6 +209,11 @@ impl Datum<'_> {
 impl Vector {
     /// 构造并校验长度一致性。
     pub fn new(data: ColumnData, nulls: Option<Validity>) -> Result<Self> {
+        Self::from_shared(Arc::new(data), nulls)
+    }
+
+    /// 从共享数据构造(Arc 窗口:clone / 缓存复用零拷贝)。
+    pub fn from_shared(data: Arc<ColumnData>, nulls: Option<Validity>) -> Result<Self> {
         let len = data.len();
         if let Some(n) = &nulls {
             if n.len() != len {
@@ -217,9 +223,9 @@ impl Vector {
                 )));
             }
         }
-        if let ColumnData::Utf8 { data, offsets } = &data {
+        if let ColumnData::Utf8 { data: bytes, offsets } = data.as_ref() {
             if offsets.first() != Some(&0)
-                || offsets.last() != Some(&(data.len() as u32))
+                || offsets.last() != Some(&(bytes.len() as u32))
                 || offsets.windows(2).any(|w| w[0] > w[1])
             {
                 return Err(Error::invalid_argument("utf8 vector offsets malformed"));
@@ -232,21 +238,21 @@ impl Vector {
 
     pub fn bools(values: Vec<bool>) -> Self {
         Self {
-            data: ColumnData::Bool(values),
+            data: Arc::new(ColumnData::Bool(values)),
             nulls: None,
         }
     }
 
     pub fn int64s(values: Vec<i64>) -> Self {
         Self {
-            data: ColumnData::Int64(values),
+            data: Arc::new(ColumnData::Int64(values)),
             nulls: None,
         }
     }
 
     pub fn float64s(values: Vec<f64>) -> Self {
         Self {
-            data: ColumnData::Float64(values),
+            data: Arc::new(ColumnData::Float64(values)),
             nulls: None,
         }
     }
@@ -260,7 +266,7 @@ impl Vector {
             offsets.push(data.len() as u32);
         }
         Self {
-            data: ColumnData::Utf8 { data, offsets },
+            data: Arc::new(ColumnData::Utf8 { data, offsets }),
             nulls: None,
         }
     }
@@ -287,7 +293,7 @@ impl Vector {
             },
         };
         Self {
-            data,
+            data: Arc::new(data),
             nulls: Some(Validity::all_null(len)),
         }
     }
@@ -483,7 +489,7 @@ impl Vector {
         if self.null_at(i) {
             return Datum::Null;
         }
-        match &self.data {
+        match self.data.as_ref() {
             ColumnData::Bool(v) => Datum::Bool(v[i]),
             ColumnData::Int64(v) => Datum::Int64(v[i]),
             ColumnData::Float64(v) => Datum::Float64(v[i]),
@@ -507,29 +513,34 @@ impl Vector {
     // ---- 类型化快速通道(内核专用,类型不符 panic —— 执行期内部约定)----
 
     pub fn bool_values(&self) -> &[bool] {
-        match &self.data {
+        match self.data.as_ref() {
             ColumnData::Bool(v) => v,
             _ => panic!("bool_values on non-bool vector"),
         }
     }
 
     pub fn int64_values(&self) -> &[i64] {
-        match &self.data {
+        match self.data.as_ref() {
             ColumnData::Int64(v) => v,
             _ => panic!("int64_values on non-int64 vector"),
         }
     }
 
     pub fn float64_values(&self) -> &[f64] {
-        match &self.data {
+        match self.data.as_ref() {
             ColumnData::Float64(v) => v,
             _ => panic!("float64_values on non-float64 vector"),
         }
     }
 
+    /// 只读列数据(供字节编码分组键等内核匹配类型)。
+    pub fn as_column_data(&self) -> &ColumnData {
+        self.data.as_ref()
+    }
+
     /// 日期列的原始天数(i32,1970-01-01 起);非 Date 列 panic。
     pub fn date_values(&self) -> &[i32] {
-        match &self.data {
+        match self.data.as_ref() {
             ColumnData::Date(v) => v,
             _ => panic!("date_values on non-date vector"),
         }
@@ -557,7 +568,7 @@ impl Vector {
         let n: usize = selection.iter().filter(|s| **s).count();
         let has_null = self.nulls.is_some();
         let mut nulls = has_null.then(|| Validity::all_valid(n));
-        let data = match &self.data {
+        let data = match self.data.as_ref() {
             ColumnData::Bool(v) => ColumnData::Bool(
                 v.iter()
                     .zip(selection)
@@ -658,11 +669,37 @@ impl Vector {
     /// 按行下标集合抽取(gather):数值列纯索引拷贝,Utf8 单缓冲重建
     /// (无逐值 String 分配),null 位图同步抽取。输出所有权必需的拷贝。
     pub fn gather(&self, idx: &[usize]) -> Vector {
-        let data = match &self.data {
-            ColumnData::Bool(v) => ColumnData::Bool(idx.iter().map(|&i| v[i]).collect()),
-            ColumnData::Int64(v) => ColumnData::Int64(idx.iter().map(|&i| v[i]).collect()),
-            ColumnData::Float64(v) => ColumnData::Float64(idx.iter().map(|&i| v[i]).collect()),
-            ColumnData::Date(v) => ColumnData::Date(idx.iter().map(|&i| v[i]).collect()),
+        // 预分配:idx.iter().map(..).collect() 无法预知长度,大索引集会
+        // 反复 realloc(哈希连接物化 9 列 × 8 万行的实测最大单点)
+        let data = match self.data.as_ref() {
+            ColumnData::Bool(v) => {
+                let mut out = Vec::with_capacity(idx.len());
+                for &i in idx {
+                    out.push(v[i]);
+                }
+                ColumnData::Bool(out)
+            }
+            ColumnData::Int64(v) => {
+                let mut out = Vec::with_capacity(idx.len());
+                for &i in idx {
+                    out.push(v[i]);
+                }
+                ColumnData::Int64(out)
+            }
+            ColumnData::Float64(v) => {
+                let mut out = Vec::with_capacity(idx.len());
+                for &i in idx {
+                    out.push(v[i]);
+                }
+                ColumnData::Float64(out)
+            }
+            ColumnData::Date(v) => {
+                let mut out = Vec::with_capacity(idx.len());
+                for &i in idx {
+                    out.push(v[i]);
+                }
+                ColumnData::Date(out)
+            }
             ColumnData::Utf8 { data, offsets } => {
                 let total: usize = idx
                     .iter()
@@ -695,7 +732,7 @@ impl Vector {
             }
             out
         });
-        Self { data, nulls }
+        Self { data: Arc::new(data), nulls }
     }
 
     /// 纵向拼接(同类型列;null 位图合并)。分片产出的合并原语。
@@ -713,7 +750,7 @@ impl Vector {
             }
         }
         let total: usize = parts.iter().map(|p| p.len()).sum();
-        let data = match &first.data {
+        let data = match first.data.as_ref() {
             ColumnData::Bool(_) => ColumnData::Bool(
                 parts.iter().flat_map(|p| p.bool_values().to_vec()).collect(),
             ),
@@ -742,7 +779,7 @@ impl Vector {
                 let mut offs = Vec::with_capacity(total + 1);
                 offs.push(0u32);
                 for p in parts {
-                    if let ColumnData::Utf8 { data, offsets } = &p.data {
+                    if let ColumnData::Utf8 { data, offsets } = p.data.as_ref() {
                         for w in &offsets[1..] {
                             offs.push(buf.len() as u32 + *w);
                         }
@@ -756,7 +793,7 @@ impl Vector {
             ColumnData::Binary(_) => ColumnData::Binary(
                 parts
                     .iter()
-                    .flat_map(|p| match &p.data {
+                    .flat_map(|p| match p.data.as_ref() {
                         ColumnData::Binary(v) => v.clone(),
                         _ => unreachable!(),
                     })
@@ -766,7 +803,7 @@ impl Vector {
                 elem: elem.clone(),
                 values: parts
                     .iter()
-                    .flat_map(|p| match &p.data {
+                    .flat_map(|p| match p.data.as_ref() {
                         ColumnData::List { values, .. } => values.clone(),
                         _ => unreachable!(),
                     })
@@ -776,7 +813,7 @@ impl Vector {
                 dim: *dim,
                 values: parts
                     .iter()
-                    .flat_map(|p| match &p.data {
+                    .flat_map(|p| match p.data.as_ref() {
                         ColumnData::Vector { values, .. } => values.clone(),
                         _ => unreachable!(),
                     })
@@ -796,7 +833,7 @@ impl Vector {
             }
             out
         });
-        Ok(Self { data, nulls })
+        Ok(Self { data: Arc::new(data), nulls })
     }
 
     /// 截取 [offset, offset + len) 行窗口。
@@ -805,7 +842,7 @@ impl Vector {
     pub fn slice(&self, offset: usize, len: usize) -> Vector {
         let len = len.min(self.len().saturating_sub(offset));
         let end = offset + len;
-        let data = match &self.data {
+        let data = match self.data.as_ref() {
             ColumnData::Bool(v) => ColumnData::Bool(v[offset..end].to_vec()),
             ColumnData::Int64(v) => ColumnData::Int64(v[offset..end].to_vec()),
             ColumnData::Float64(v) => ColumnData::Float64(v[offset..end].to_vec()),
@@ -834,7 +871,7 @@ impl Vector {
             }
             out
         });
-        Self { data, nulls }
+        Self { data: Arc::new(data), nulls }
     }
 }
 
@@ -892,7 +929,7 @@ mod tests {
         assert_eq!(v.datum(1), Datum::Utf8(""));
         assert_eq!(v.utf8_value(2), "中文");
         // offsets: [0, 5, 5, 11]
-        if let ColumnData::Utf8 { offsets, .. } = &v.data {
+        if let ColumnData::Utf8 { offsets, .. } = v.data.as_ref() {
             assert_eq!(offsets, &[0, 5, 5, 11]);
         } else {
             panic!("expected utf8 column");
