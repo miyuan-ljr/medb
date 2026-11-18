@@ -611,6 +611,29 @@ impl Vector {
 
     // ---- 变换 ----
 
+/// 按连续 true 段整段拷贝(copy_from_slice 走 memcpy 路径);
+/// 稀疏位图退化为逐元素 push。返回恰好 n = true 计数个元素。
+fn gather_runs<T: Copy>(v: &[T], selection: &[bool]) -> Vec<T> {
+    let kept: usize = selection.iter().filter(|s| **s).count();
+    let mut out = Vec::with_capacity(kept);
+    let mut run = 0usize;
+    for (i, keep) in selection.iter().enumerate() {
+        if *keep {
+            run += 1;
+        } else {
+            if run > 0 {
+                out.extend_from_slice(&v[i - run..i]);
+            }
+            run = 0;
+        }
+    }
+    if run > 0 {
+        out.extend_from_slice(&v[selection.len() - run..selection.len()]);
+    }
+    debug_assert_eq!(out.len(), kept);
+    out
+}
+
     /// 按选择位图压缩(向量化 filter 的核心动作)。
     pub fn select(&self, selection: &[bool]) -> Result<Vector> {
         if selection.len() != self.len() {
@@ -623,60 +646,30 @@ impl Vector {
         let n: usize = selection.iter().filter(|s| **s).count();
         let has_null = self.nulls.is_some();
         let mut nulls = has_null.then(|| Validity::all_valid(n));
+        // 高密度选择(常见形状):按连续 true 段 copy_from_slice 整段拷贝,
+        // 近 memcpy 速率;稀疏选择退化为逐元素收集。
         let data = match self.data.as_ref() {
-            ColumnData::Bool(v) => {
-                let mut out = Vec::with_capacity(n);
-                for (i, keep) in selection.iter().enumerate() {
-                    if *keep {
-                        out.push(v[self.offset + i]);
-                    }
-                }
-                ColumnData::Bool(out)
-            }
-            ColumnData::Int64(v) => {
-                let mut out = Vec::with_capacity(n);
-                for (i, keep) in selection.iter().enumerate() {
-                    if *keep {
-                        out.push(v[self.offset + i]);
-                    }
-                }
-                ColumnData::Int64(out)
-            }
-            ColumnData::Float64(v) => {
-                let mut out = Vec::with_capacity(n);
-                for (i, keep) in selection.iter().enumerate() {
-                    if *keep {
-                        out.push(v[self.offset + i]);
-                    }
-                }
-                ColumnData::Float64(out)
-            }
-            ColumnData::Date(v) => {
-                let mut out = Vec::with_capacity(n);
-                for (i, keep) in selection.iter().enumerate() {
-                    if *keep {
-                        out.push(v[self.offset + i]);
-                    }
-                }
-                ColumnData::Date(out)
-            }
+            ColumnData::Bool(v) => ColumnData::Bool(Self::gather_runs(&v[self.offset..self.offset + self.len], selection)),
+            ColumnData::Int64(v) => ColumnData::Int64(Self::gather_runs(&v[self.offset..self.offset + self.len], selection)),
+            ColumnData::Float64(v) => ColumnData::Float64(Self::gather_runs(&v[self.offset..self.offset + self.len], selection)),
+            ColumnData::Date(v) => ColumnData::Date(Self::gather_runs(&v[self.offset..self.offset + self.len], selection)),
             ColumnData::Utf8 { data: d, offsets } => {
-                let mut out_data = Vec::with_capacity(d.len());
+                let mut out_data = Vec::with_capacity(n * 12);
                 let mut out_offsets = Vec::with_capacity(n + 1);
                 out_offsets.push(0u32);
                 let mut j = 0usize;
                 for (i, keep) in selection.iter().enumerate() {
-                    let wi = self.offset + i;
-                    let start = offsets[wi] as usize;
-                    let end = offsets[wi + 1] as usize;
-                    if *keep {
-                        out_data.extend_from_slice(&d[start..end]);
-                        out_offsets.push(out_data.len() as u32);
-                        if let Some(nulls) = nulls.as_mut() {
-                            nulls.set(j, self.null_at(i));
-                        }
-                        j += 1;
+                    if !*keep {
+                        continue;
                     }
+                    let wi = self.offset + i;
+                    out_data
+                        .extend_from_slice(&d[offsets[wi] as usize..offsets[wi + 1] as usize]);
+                    out_offsets.push(out_data.len() as u32);
+                    if let Some(nulls) = nulls.as_mut() {
+                        nulls.set(j, self.null_at(i));
+                    }
+                    j += 1;
                 }
                 ColumnData::Utf8 {
                     data: out_data,

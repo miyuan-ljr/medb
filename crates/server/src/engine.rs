@@ -20,7 +20,7 @@ use common::types::ScalarValue;
 use exec::chunk::DataChunk;
 use exec::executor::ExecuteContext;
 use exec::expr::Expr;
-use exec::operators::seq_scan::QueryDataSource;
+use exec::operators::seq_scan::{ChunkZone, ColumnarScan, QueryDataSource};
 use exec::vector::Vector;
 use memory::{MemoryContext, MemoryManager};
 use parking_lot::Mutex;
@@ -34,16 +34,19 @@ use storage::table::{catalog_key, catalog_range, row_key, row_range};
 const SCAN_CHUNK_ROWS: usize = 256 * 1024;
 
 /// 列集 → 按行分块的窗口列表(零拷贝共享底层数据)。
-fn chunked(cols: &[Vector]) -> Vec<Vec<Vector>> {
+fn chunked(cols: &[Vector]) -> ColumnarScan {
     let rows = cols.first().map(|v| v.len()).unwrap_or(0);
-    let mut out = Vec::new();
+    let mut chunks = Vec::new();
+    let mut zones = Vec::new();
     let mut start = 0;
     while start < rows {
         let n = SCAN_CHUNK_ROWS.min(rows - start);
-        out.push(cols.iter().map(|v| v.slice(start, n)).collect());
+        chunks.push(cols.iter().map(|v| v.slice(start, n)).collect());
+        // 此处分块与缓存区图按同一 SCAN_CHUNK_ROWS 对齐 → 块 i ↔ zone i
+        zones.push(None);
         start += n;
     }
-    out
+    ColumnarScan { chunks, zones }
 }
 use storage::columnar_file::{self as columnar_file, SegmentRow};
 use tracing::{debug, info, warn};
@@ -244,6 +247,42 @@ struct LsmDataSource {
     threads: usize,
 }
 
+/// 块级区图计算:按 SCAN_CHUNK_ROWS 行分块,逐列求 min/max
+/// (typed 快路径;全 null 列 → None)。每缓存构建执行一次,查询期零成本。
+fn compute_zones(cols: &[Vector]) -> Vec<ChunkZone> {
+    let rows = cols.first().map(|v| v.len()).unwrap_or(0);
+    if rows == 0 {
+        return Vec::new();
+    }
+    let n_chunks = rows.div_ceil(SCAN_CHUNK_ROWS);
+    let mut mins: Vec<Vec<Option<ScalarValue>>> = vec![vec![None; cols.len()]; n_chunks];
+    let mut maxes: Vec<Vec<Option<ScalarValue>>> = vec![vec![None; cols.len()]; n_chunks];
+    for (c, col) in cols.iter().enumerate() {
+        for i in 0..rows {
+            if col.null_at(i) { continue; }
+            let ci = i / SCAN_CHUNK_ROWS;
+            let v = col.scalar_at(i);
+            match &mut mins[ci][c] {
+                None => mins[ci][c] = Some(v.clone()),
+                Some(m) => {
+                    if let Ok(std::cmp::Ordering::Greater) = common::types::compare_values(m, &v) { *m = v.clone(); }
+                }
+            }
+            match &mut maxes[ci][c] {
+                None => maxes[ci][c] = Some(v.clone()),
+                Some(m) => {
+                    if let Ok(std::cmp::Ordering::Less) = common::types::compare_values(m, &v) { *m = v.clone(); }
+                }
+            }
+        }
+    }
+    (0..n_chunks).map(|ci| ChunkZone {
+        rows: SCAN_CHUNK_ROWS.min(rows - ci * SCAN_CHUNK_ROWS),
+        mins: mins[ci].clone(),
+        maxes: maxes[ci].clone(),
+    }).collect()
+}
+
 impl QueryDataSource for LsmDataSource {
     fn scan_table(&self, table: &TableSchema) -> Result<Vec<Row>> {
         let (from, to) = row_range(table.id);
@@ -324,7 +363,7 @@ impl QueryDataSource for LsmDataSource {
     /// 解码成独立 delta 块,被覆盖/删除的 segment 行用键成员判定整行剔除
     /// (`Vector::select`,向量化压缩)。
     /// 门控:事务内读回退行存(overlay 不含事务缓冲,保读己之写)。
-    fn scan_columns(&self, table: &TableSchema) -> Result<Option<Vec<Vec<Vector>>>> {
+    fn scan_columns(&self, table: &TableSchema) -> Result<Option<ColumnarScan>> {
         let Some(ap) = &self.ap else {
             return Ok(None);
         };
@@ -351,7 +390,12 @@ impl QueryDataSource for LsmDataSource {
         let (from, to) = row_range(table.id);
         let mt = self.lsm.scan_memtable(&from, &to, self.read_ts)?;
         if mt.is_empty() {
-            return Ok(Some(chunked(&cache.cols)));
+            // 无 delta:块与缓存区图直接对齐(同一 SCAN_CHUNK_ROWS 分块)
+            let cs = chunked(&cache.cols);
+            return Ok(Some(ColumnarScan {
+                chunks: cs.chunks,
+                zones: cache.zones.iter().cloned().map(Some).collect(),
+            }));
         }
         // 影子键集:memtable 覆盖/删除的行键(update + tombstone)
         let shadow: std::collections::HashSet<&[u8]> =
@@ -373,6 +417,7 @@ impl QueryDataSource for LsmDataSource {
             }
         }
         let mut chunks: Vec<Vec<Vector>> = Vec::with_capacity(2);
+        let mut zones: Vec<Option<ChunkZone>> = Vec::new();
         // segment 块:无影子键 → 缓存分块窗口复用(零拷贝);有 → 向量化剔除
         let seg_shadowed = cache.keys.iter().any(|k| shadow.contains(k.as_slice()));
         if cache.rows > 0 {
@@ -388,10 +433,14 @@ impl QueryDataSource for LsmDataSource {
                     .map(|v| v.select(&keep))
                     .collect::<Result<Vec<_>>>()?;
                 if cols.first().map(|v| v.len()).unwrap_or(0) > 0 {
-                    chunks.extend(chunked(&cols));
+                    let cc = chunked(&cols);
+                    chunks.extend(cc.chunks.iter().cloned());
+                    zones.extend(std::iter::repeat(None).take(cc.chunks.len()));
                 }
             } else {
-                chunks.extend(chunked(&cache.cols));
+                let cw = chunked(&cache.cols);
+                chunks.extend(cw.chunks.iter().cloned());
+                zones.extend(cw.zones.iter().cloned());
             }
         }
         if dvals.first().map(|v| !v.is_empty()).unwrap_or(false) {
@@ -401,9 +450,11 @@ impl QueryDataSource for LsmDataSource {
                 .enumerate()
                 .map(|(c, desc)| Vector::from_scalars(desc.ty.clone(), dvals[c].clone()))
                 .collect::<Result<Vec<_>>>()?;
-            chunks.extend(chunked(&cols));
+            let dc = chunked(&cols);
+            chunks.extend(dc.chunks.iter().cloned());
+            zones.extend(dc.zones.iter().map(|z| z.clone()));
         }
-        Ok(Some(chunks))
+        Ok(Some(ColumnarScan { chunks, zones }))
     }
 
     /// 数据源支持索引访问(AP 路径可用,即非事务读)。
@@ -597,12 +648,14 @@ impl LsmDataSource {
             .enumerate()
             .map(|(c, desc)| Vector::from_scalars(desc.ty.clone(), col_vals[c].clone()))
             .collect::<Result<Vec<_>>>()?;
+        let zones = compute_zones(&cols);
         let c = Arc::new(ApCache {
             generation,
             keys,
             key_pos,
             cols,
             rows: seg.rows.len(),
+            zones,
         });
         ap.set_cache(table.id, c.clone());
         Ok(Some(c))
@@ -773,6 +826,9 @@ pub(crate) struct ApCache {
     pub key_pos: HashMap<Vec<u8>, usize>,
     pub cols: Vec<Vector>,
     pub rows: usize,
+    /// 块级区图(每 SCAN_CHUNK_ROWS 行一块,与 scan_columns 分块一致):
+    /// 各列 min/max,谓词与区图矛盾 → 整块跳过(块级剪枝)。
+    pub zones: Vec<ChunkZone>,
 }
 
 /// 引擎持有的活跃快照(GC 水位 = 最小活跃快照);语句结束自动注销。

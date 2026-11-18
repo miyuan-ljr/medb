@@ -13,13 +13,87 @@ use std::sync::Arc;
 
 use common::error::Result;
 use common::schema::{ColumnDesc, Row, TableSchema};
-use common::types::DataType;
+use common::types::{DataType, ScalarValue};
 use memory::Reservation;
 
 use crate::chunk::DataChunk;
 use crate::executor::{ExecuteContext, Executor};
-use crate::expr::Expr;
+use crate::expr::{BinaryOp, Expr};
 use crate::vector::Vector;
+
+/// 一个列存块(零拷贝窗口列集)+ 可选 min/max 区图(zones[i] ↔ chunks[i])。
+pub struct ColumnarScan {
+    pub chunks: Vec<Vec<Vector>>,
+    /// None = 该块无区图(不剪枝);delta 块恒 None。
+    pub zones: Vec<Option<ChunkZone>>,
+}
+
+/// 块级区图:块内各列的 min/max(全 null 列 → None)。
+/// 语义:块内非 null 值 ⊆ [min, max](逐列)。谓词与区图矛盾 → 整块跳过。
+#[derive(Debug, Clone)]
+pub struct ChunkZone {
+    pub rows: usize,
+    pub mins: Vec<Option<ScalarValue>>,
+    pub maxes: Vec<Option<ScalarValue>>,
+}
+
+/// 谓词(AND 链)与区图矛盾判定:任一"列 op 字面量"项证明该块无匹配行
+/// → true(整块剪枝)。保守:无法判定一律 false(不跳)。
+fn zone_excludes(pred: &Expr, cols: &[ColumnDesc], zone: &ChunkZone) -> bool {
+    match pred {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            zone_excludes(left, cols, zone) || zone_excludes(right, cols, zone)
+        }
+        Expr::Binary { op, left, right } => {
+            // 归一为 (列, 字面量, op):字面量在左则翻转比较方向
+            let (ci, lit, op) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(v)) => (*c, v, *op),
+                (Expr::Literal(v), Expr::Column(c)) => {
+                    (*c, v, match *op {
+                        BinaryOp::Lt => BinaryOp::Gt,
+                        BinaryOp::LtEq => BinaryOp::GtEq,
+                        BinaryOp::Gt => BinaryOp::Lt,
+                        BinaryOp::GtEq => BinaryOp::LtEq,
+                        other => other,
+                    })
+                }
+                _ => return false,
+            };
+            if matches!(lit, ScalarValue::Null) || ci >= zone.mins.len() {
+                return false;
+            }
+            let (Some(mn), Some(mx)) = (&zone.mins[ci], &zone.maxes[ci]) else {
+                return false; // 全 null 块:不做矛盾判定
+            };
+            let (Ok(lt_min), Ok(gt_max)) = (
+                common::types::compare_values(lit, mn),
+                common::types::compare_values(lit, mx),
+            ) else {
+                return false;
+            };
+            use std::cmp::Ordering as O;
+            match op {
+                // col < v:命中需 min < v → 排除 iff v <= min
+                BinaryOp::Lt => lt_min != O::Greater,
+                // col <= v:排除 iff v < min
+                BinaryOp::LtEq => lt_min == O::Less,
+                // col > v:命中需 max > v → 排除 iff max <= v
+                BinaryOp::Gt => gt_max != O::Less,
+                // col >= v:排除 iff max < v
+                BinaryOp::GtEq => gt_max == O::Greater,
+                BinaryOp::Eq => {
+                    lt_min == O::Less || gt_max == O::Greater
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
 
 /// 表数据源抽象(存储引擎实现)。
 pub trait QueryDataSource: Send + Sync {
@@ -73,14 +147,15 @@ pub trait QueryDataSource: Send + Sync {
         Ok(out)
     }
 
-    /// **AP 列存路径**:按列返回若干整块列向量(列序 = schema 列序)。
-    /// 多块语义 = **拼接结果**(如 segment 块 + memtable delta 块);实现方
-    /// 保证跨块无重复行。每块独立走向量化谓词求值。返回 None = 该表不可
+    /// **AP 列存路径**:按列返回若干分块列向量(列序 = schema 列序)。
+    /// 多块语义 = **拼接结果**(segment 256k 行窗口块 + memtable delta 块);
+    /// 每块可携带 **min/max 区图**(zones,与 chunks 一一对应;None = 无统计),
+    /// 谓词与区图矛盾 → 整块跳过(块级剪枝)。返回 None = 该表不可
     /// 列式读取(类型不支持 / 一致性门控 / 段缺失),调用方回退行存路径。
     fn scan_columns(
         &self,
         table: &TableSchema,
-    ) -> Result<Option<Vec<Vec<crate::vector::Vector>>>> {
+    ) -> Result<Option<ColumnarScan>> {
         let _ = table;
         Ok(None)
     }
@@ -123,7 +198,7 @@ pub struct SeqScanExec {
     rows: Option<Vec<Row>>,
     /// 列存路径:尚未拉取的源块队列(scan_columns 的分块窗口;逐块拉取,
     /// 谓词求值 → select 后立即交付,**不整批堆积** —— 内存 = 单过滤块)
-    pending_chunks: Option<std::collections::VecDeque<Vec<Vector>>>,
+    pending_chunks: Option<std::collections::VecDeque<(Vec<Vector>, Option<ChunkZone>)>>,
     /// 列存路径:当前正在交付的过滤块(消费完拉下一块)
     current: Option<DataChunk>,
     /// 列存路径已选定(即使队列为空也不回退行存)
@@ -185,10 +260,11 @@ impl Executor for SeqScanExec {
         // ③ 行存全表。
         if self.rows.is_none() && !self.columnar_started {
             match self.source.scan_columns(&self.table)? {
-                Some(chunks) => {
+                Some(scan) => {
                     self.columnar_started = true;
-                    self.pending_chunks =
-                        Some(std::collections::VecDeque::from(chunks));
+                    self.pending_chunks = Some(std::collections::VecDeque::from(
+                        scan.chunks.into_iter().zip(scan.zones).collect::<Vec<_>>(),
+                    ));
                 }
                 None => {
                     let rows = match (&self.pushdown, &self.needed) {
@@ -263,7 +339,13 @@ impl SeqScanExec {
             }
             // 2. 拉下一源块:谓词求值 → select 过滤块
             match self.pending_chunks.as_mut().and_then(|p| p.pop_front()) {
-                Some(columns) => {
+                Some((columns, zone)) => {
+                    // 块级剪枝:谓词与区图矛盾 → 整块跳过(不物化、不求值)
+                    if let (Some(pred), Some(z)) = (&self.pushdown, zone.as_ref()) {
+                        if zone_excludes(pred, &self.schema, z) {
+                            continue;
+                        }
+                    }
                     let chunk = DataChunk::new(columns)?;
                     if let Some(pred) = &self.pushdown {
                         let mask = pred.eval(&chunk)?;
@@ -289,6 +371,43 @@ mod tests {
     use memory::{MemoryContext, MemoryTracker};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+
+    /// 区图矛盾判定:块 [1, 38] 上各比较算子的排除方向(回归 Q6 全跳 bug)。
+    #[test]
+    fn zone_excludes_directions() {
+        let zone = ChunkZone {
+            rows: 100,
+            mins: vec![Some(ScalarValue::Int64(1))],
+            maxes: vec![Some(ScalarValue::Int64(38))],
+        };
+        let cols = vec![ColumnDesc::new("q".to_string(), DataType::Int64, true)];
+        let pred = |op: BinaryOp, v: i64| {
+            zone_excludes(
+                &Expr::binary(op, Expr::Column(0), Expr::Literal(ScalarValue::Int64(v))),
+                &cols,
+                &zone,
+            )
+        };
+        assert!(!pred(BinaryOp::Lt, 24));
+        assert!(!pred(BinaryOp::Lt, 40));
+        assert!(pred(BinaryOp::Lt, 1));
+        assert!(pred(BinaryOp::Lt, 0));
+        assert!(!pred(BinaryOp::LtEq, 5));
+        // col <= 39:块内 [1, 38] 全部 <= 39 → 不剪(只有 max < v 才剪)
+        assert!(!pred(BinaryOp::LtEq, 39));
+        // col <= 0:v=0 < min=1 → 全块无值 <= 0 → 剪
+        assert!(pred(BinaryOp::LtEq, 0));
+        assert!(!pred(BinaryOp::Gt, 10));
+        // col > 38:max = 38,无值 > 38 → 剪
+        assert!(pred(BinaryOp::Gt, 38));
+        assert!(pred(BinaryOp::Gt, 39));
+        assert!(pred(BinaryOp::Gt, 40));
+        // col >= 38:max = 38,存在 38 → 不剪
+        assert!(!pred(BinaryOp::GtEq, 38));
+        assert!(pred(BinaryOp::GtEq, 39));
+        assert!(!pred(BinaryOp::Eq, 5));
+        assert!(pred(BinaryOp::Eq, 0));
+    }
     struct FakeSource {
         rows: Vec<Row>,
         fetches: AtomicUsize,
