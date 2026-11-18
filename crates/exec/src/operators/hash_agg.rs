@@ -21,7 +21,7 @@ use crate::agg::{AggDesc, AggFunc};
 use crate::chunk::DataChunk;
 use crate::executor::{BoxedExecutor, ExecuteContext, Executor};
 use crate::expr::Expr;
-use crate::vector::{ColumnData, Vector};
+use crate::vector::{Datum, Vector};
 
 /// 分组键(标量值序列;ScalarValue 已实现 Hash/Eq,NaN 归一)。
 type GroupKey = Vec<ScalarValue>;
@@ -80,8 +80,7 @@ fn encode_group_key(buf: &mut Vec<u8>, key_cols: &[Vector], i: usize) {
             }
             DataType::Binary => {
                 buf.push(6);
-                if let ColumnData::Binary(v) = col.as_column_data() {
-                    let b = &v[i];
+                if let Datum::Binary(b) = col.datum(i) {
                     buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
                     buf.extend_from_slice(b);
                 }

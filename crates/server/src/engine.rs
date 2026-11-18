@@ -28,6 +28,23 @@ use sql::parser::parse_statements;
 use sql::planner::{PlanContext, PlannedQuery, StatementPlan, plan_statement};
 use storage::lsm::LsmStore;
 use storage::table::{catalog_key, catalog_range, row_key, row_range};
+
+/// 列存扫描的分块行数:每块 = 缓存列的窗口视图(零拷贝),过滤/聚合在
+/// 块内完成——内存占用与块大小成正比,不再整表物化。
+const SCAN_CHUNK_ROWS: usize = 256 * 1024;
+
+/// 列集 → 按行分块的窗口列表(零拷贝共享底层数据)。
+fn chunked(cols: &[Vector]) -> Vec<Vec<Vector>> {
+    let rows = cols.first().map(|v| v.len()).unwrap_or(0);
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < rows {
+        let n = SCAN_CHUNK_ROWS.min(rows - start);
+        out.push(cols.iter().map(|v| v.slice(start, n)).collect());
+        start += n;
+    }
+    out
+}
 use storage::columnar_file::{self as columnar_file, SegmentRow};
 use tracing::{debug, info, warn};
 
@@ -334,7 +351,7 @@ impl QueryDataSource for LsmDataSource {
         let (from, to) = row_range(table.id);
         let mt = self.lsm.scan_memtable(&from, &to, self.read_ts)?;
         if mt.is_empty() {
-            return Ok(Some(vec![cache.cols.clone()]));
+            return Ok(Some(chunked(&cache.cols)));
         }
         // 影子键集:memtable 覆盖/删除的行键(update + tombstone)
         let shadow: std::collections::HashSet<&[u8]> =
@@ -356,7 +373,7 @@ impl QueryDataSource for LsmDataSource {
             }
         }
         let mut chunks: Vec<Vec<Vector>> = Vec::with_capacity(2);
-        // segment 块:无影子键 → 缓存原样复用(零拷贝);有 → 向量化剔除
+        // segment 块:无影子键 → 缓存分块窗口复用(零拷贝);有 → 向量化剔除
         let seg_shadowed = cache.keys.iter().any(|k| shadow.contains(k.as_slice()));
         if cache.rows > 0 {
             if seg_shadowed {
@@ -371,10 +388,10 @@ impl QueryDataSource for LsmDataSource {
                     .map(|v| v.select(&keep))
                     .collect::<Result<Vec<_>>>()?;
                 if cols.first().map(|v| v.len()).unwrap_or(0) > 0 {
-                    chunks.push(cols);
+                    chunks.extend(chunked(&cols));
                 }
             } else {
-                chunks.push(cache.cols.clone());
+                chunks.extend(chunked(&cache.cols));
             }
         }
         if dvals.first().map(|v| !v.is_empty()).unwrap_or(false) {
@@ -384,7 +401,7 @@ impl QueryDataSource for LsmDataSource {
                 .enumerate()
                 .map(|(c, desc)| Vector::from_scalars(desc.ty.clone(), dvals[c].clone()))
                 .collect::<Result<Vec<_>>>()?;
-            chunks.push(cols);
+            chunks.extend(chunked(&cols));
         }
         Ok(Some(chunks))
     }

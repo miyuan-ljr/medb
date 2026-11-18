@@ -19,6 +19,7 @@ use memory::Reservation;
 use crate::chunk::DataChunk;
 use crate::executor::{ExecuteContext, Executor};
 use crate::expr::Expr;
+use crate::vector::Vector;
 
 /// 表数据源抽象(存储引擎实现)。
 pub trait QueryDataSource: Send + Sync {
@@ -120,12 +121,14 @@ pub struct SeqScanExec {
     needed: Option<Vec<bool>>,
     /// 行存路径:物化行集(下推过滤后)
     rows: Option<Vec<Row>>,
-    /// 列存路径:整块列块队列(AP 路径;segment + memtable delta 各一块,
-    /// 谓词逐块向量化求值),空队列即扫完
-    column_chunks: std::collections::VecDeque<DataChunk>,
+    /// 列存路径:尚未拉取的源块队列(scan_columns 的分块窗口;逐块拉取,
+    /// 谓词求值 → select 后立即交付,**不整批堆积** —— 内存 = 单过滤块)
+    pending_chunks: Option<std::collections::VecDeque<Vec<Vector>>>,
+    /// 列存路径:当前正在交付的过滤块(消费完拉下一块)
+    current: Option<DataChunk>,
     /// 列存路径已选定(即使队列为空也不回退行存)
     columnar_started: bool,
-    /// 队首块的已交付游标(批切片只拷当批,front 本体不动)
+    /// 当前块的已交付游标(批切片零拷贝窗口,front 本体不动)
     front_off: usize,
     /// 物化行集的内存记账(超查询/全局限额 → MemoryLimitExceeded)
     mem: Option<Reservation>,
@@ -163,7 +166,8 @@ impl SeqScanExec {
             pushdown,
             needed,
             rows: None,
-            column_chunks: Default::default(),
+            pending_chunks: None,
+            current: None,
             columnar_started: false,
             front_off: 0,
             mem: None,
@@ -183,19 +187,8 @@ impl Executor for SeqScanExec {
             match self.source.scan_columns(&self.table)? {
                 Some(chunks) => {
                     self.columnar_started = true;
-                    for columns in chunks {
-                        let mut chunk = DataChunk::new(columns)?;
-                        if let Some(pred) = &self.pushdown {
-                            let mask = pred.eval(&chunk)?;
-                            let sel: Vec<bool> = (0..chunk.num_rows())
-                                .map(|i| !mask.null_at(i) && mask.bool_values()[i])
-                                .collect();
-                            chunk = chunk.select(&sel, &ctx.mem.tracker)?;
-                        }
-                        if chunk.num_rows() > 0 {
-                            self.column_chunks.push_back(chunk);
-                        }
-                    }
+                    self.pending_chunks =
+                        Some(std::collections::VecDeque::from(chunks));
                 }
                 None => {
                     let rows = match (&self.pushdown, &self.needed) {
@@ -249,25 +242,42 @@ impl SeqScanExec {
     /// 列存路径的批切分:游标 + [`Vector::slice`]。
     /// front 本体保持不变,每批只拷贝当批交付数据(必要拷贝),
     /// 剩余行零拷贝复用 —— 消除 O(N²/batch) 的整块重压。
+    /// 列存真流式:当前过滤块切片交付,耗尽即拉下一源块(谓词求值 → select),
+    /// 内存峰值 = 单过滤块(≤ SCAN_CHUNK_ROWS 行),与表大小无关。
     fn next_columnar_batch(&mut self, ctx: &mut ExecuteContext) -> Result<Option<DataChunk>> {
         loop {
-            let Some(front) = self.column_chunks.front() else {
-                return Ok(None);
-            };
-            if self.front_off >= front.num_rows() {
-                self.column_chunks.pop_front();
-                self.front_off = 0;
-                continue;
+            // 1. 当前块仍有余量 → 零拷贝窗口切片交付
+            if let Some(front) = &self.current {
+                if self.front_off < front.num_rows() {
+                    let n = (front.num_rows() - self.front_off).min(ctx.batch_size);
+                    let cols = front
+                        .columns()
+                        .iter()
+                        .map(|v| v.slice(self.front_off, n))
+                        .collect();
+                    let chunk = DataChunk::with_memory(cols, &ctx.mem.tracker)?;
+                    self.front_off += n;
+                    return Ok(Some(chunk));
+                }
+                self.current = None; // 块消费完即弃
             }
-            let n = (front.num_rows() - self.front_off).min(ctx.batch_size);
-            let cols = front
-                .columns()
-                .iter()
-                .map(|v| v.slice(self.front_off, n))
-                .collect();
-            let chunk = DataChunk::with_memory(cols, &ctx.mem.tracker)?;
-            self.front_off += n;
-            return Ok(Some(chunk));
+            // 2. 拉下一源块:谓词求值 → select 过滤块
+            match self.pending_chunks.as_mut().and_then(|p| p.pop_front()) {
+                Some(columns) => {
+                    let chunk = DataChunk::new(columns)?;
+                    if let Some(pred) = &self.pushdown {
+                        let mask = pred.eval(&chunk)?;
+                        let sel: Vec<bool> = (0..chunk.num_rows())
+                            .map(|i| !mask.null_at(i) && mask.bool_values()[i])
+                            .collect();
+                        self.current = Some(chunk.select(&sel, &ctx.mem.tracker)?);
+                    } else {
+                        self.current = Some(chunk);
+                    }
+                    self.front_off = 0;
+                }
+                None => return Ok(None),
+            }
         }
     }
 }

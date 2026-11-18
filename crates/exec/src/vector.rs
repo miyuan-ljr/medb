@@ -68,6 +68,20 @@ impl Validity {
         (self.words[i / 64] >> (i % 64)) & 1 != 0
     }
 
+    /// 窗口位图:拷贝 [offset, offset + len) 的有效位。
+    pub fn window(&self, offset: usize, len: usize) -> Validity {
+        let mut out = Validity::all_valid(len);
+        for i in 0..len {
+            out.set(i, self.get(offset + i));
+        }
+        out
+    }
+
+    /// 窗口位图占用的字数。
+    pub fn window_words(&self, _offset: usize, len: usize) -> usize {
+        len.div_ceil(64)
+    }
+
     #[inline]
     pub fn set(&mut self, i: usize, valid: bool) {
         debug_assert!(i < self.len);
@@ -165,11 +179,14 @@ impl ColumnData {
     }
 }
 
-/// 列向量 = 数据 + 可选 null 位图。
+/// 列向量 = 共享数据(Arc)+ 窗口(offset/len)+ 可选 null 位图。
+/// clone = 引用计数 +1;slice = 零拷贝窗口;select/gather/concat 构建新数据。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vector {
     data: Arc<ColumnData>,
     nulls: Option<Validity>,
+    offset: usize,
+    len: usize,
 }
 
 /// 行内取值(借用视图,Utf8 返回 &str 零拷贝)。
@@ -231,29 +248,44 @@ impl Vector {
                 return Err(Error::invalid_argument("utf8 vector offsets malformed"));
             }
         }
-        Ok(Self { data, nulls })
+        let n = data.len();
+        Ok(Self {
+            data,
+            nulls,
+            offset: 0,
+            len: n,
+        })
     }
 
     // ---- 构造器(无 null 快捷方式)----
 
     pub fn bools(values: Vec<bool>) -> Self {
+        let n = values.len();
         Self {
             data: Arc::new(ColumnData::Bool(values)),
             nulls: None,
+            offset: 0,
+            len: n,
         }
     }
 
     pub fn int64s(values: Vec<i64>) -> Self {
+        let n = values.len();
         Self {
             data: Arc::new(ColumnData::Int64(values)),
             nulls: None,
+            offset: 0,
+            len: n,
         }
     }
 
     pub fn float64s(values: Vec<f64>) -> Self {
+        let n = values.len();
         Self {
             data: Arc::new(ColumnData::Float64(values)),
             nulls: None,
+            offset: 0,
+            len: n,
         }
     }
 
@@ -265,9 +297,12 @@ impl Vector {
             data.extend_from_slice(s.as_bytes());
             offsets.push(data.len() as u32);
         }
+        let n = values.len();
         Self {
             data: Arc::new(ColumnData::Utf8 { data, offsets }),
             nulls: None,
+            offset: 0,
+            len: n,
         }
     }
 
@@ -295,6 +330,8 @@ impl Vector {
         Self {
             data: Arc::new(data),
             nulls: Some(Validity::all_null(len)),
+            offset: 0,
+            len,
         }
     }
 
@@ -463,11 +500,11 @@ impl Vector {
     }
 
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len == 0
     }
 
     pub fn has_nulls(&self) -> bool {
@@ -476,11 +513,27 @@ impl Vector {
 
     #[inline]
     pub fn null_at(&self, i: usize) -> bool {
+        // nulls 位图恒按窗口相对下标(位图 len == 窗口 len)
         self.nulls.as_ref().is_some_and(|n| !n.get(i))
     }
 
+    /// 窗口内字节的近似大小(内存记账;共享数据不重复计数)。
     pub fn approx_size(&self) -> usize {
-        self.data.approx_size() + self.nulls.as_ref().map_or(0, |n| n.words.len() * 8)
+        let o = self.offset;
+        let n = self.len;
+        let data_bytes = match self.data.as_ref() {
+            ColumnData::Bool(_) => n,
+            ColumnData::Int64(_) => n * 8,
+            ColumnData::Float64(_) => n * 8,
+            ColumnData::Date(_) => n * 4,
+            ColumnData::Utf8 { data: _, offsets } => {
+                (offsets[o + n] - offsets[o]) as usize + n * 4
+            }
+            ColumnData::Binary(v) => v[o..o + n].iter().map(|b| b.len()).sum::<usize>() + n * 8,
+            ColumnData::List { .. } => n * 16,
+            ColumnData::Vector { .. } => n * 16,
+        };
+        data_bytes + self.nulls.as_ref().map_or(0, |v| v.window_words(o, n) * 8)
     }
 
     // ---- 取值 ----
@@ -489,6 +542,7 @@ impl Vector {
         if self.null_at(i) {
             return Datum::Null;
         }
+        let i = self.offset + i;
         match self.data.as_ref() {
             ColumnData::Bool(v) => Datum::Bool(v[i]),
             ColumnData::Int64(v) => Datum::Int64(v[i]),
@@ -514,34 +568,35 @@ impl Vector {
 
     pub fn bool_values(&self) -> &[bool] {
         match self.data.as_ref() {
-            ColumnData::Bool(v) => v,
+            ColumnData::Bool(v) => &v[self.offset..self.offset + self.len],
             _ => panic!("bool_values on non-bool vector"),
         }
     }
 
     pub fn int64_values(&self) -> &[i64] {
         match self.data.as_ref() {
-            ColumnData::Int64(v) => v,
+            ColumnData::Int64(v) => &v[self.offset..self.offset + self.len],
             _ => panic!("int64_values on non-int64 vector"),
         }
     }
 
     pub fn float64_values(&self) -> &[f64] {
         match self.data.as_ref() {
-            ColumnData::Float64(v) => v,
+            ColumnData::Float64(v) => &v[self.offset..self.offset + self.len],
             _ => panic!("float64_values on non-float64 vector"),
         }
     }
 
-    /// 只读列数据(供字节编码分组键等内核匹配类型)。
+    /// 只读列数据(**全量视图**,不含窗口偏移 —— 仅构造/校验场景使用,
+    /// 行级访问请走 datum/utf8_value/类型化切片)。
     pub fn as_column_data(&self) -> &ColumnData {
         self.data.as_ref()
     }
 
-    /// 日期列的原始天数(i32,1970-01-01 起);非 Date 列 panic。
+    /// 日期列的原始天数(窗口切片);非 Date 列 panic。
     pub fn date_values(&self) -> &[i32] {
         match self.data.as_ref() {
-            ColumnData::Date(v) => v,
+            ColumnData::Date(v) => &v[self.offset..self.offset + self.len],
             _ => panic!("date_values on non-date vector"),
         }
     }
@@ -569,42 +624,51 @@ impl Vector {
         let has_null = self.nulls.is_some();
         let mut nulls = has_null.then(|| Validity::all_valid(n));
         let data = match self.data.as_ref() {
-            ColumnData::Bool(v) => ColumnData::Bool(
-                v.iter()
-                    .zip(selection)
-                    .filter(|(_, s)| **s)
-                    .map(|(x, _)| *x)
-                    .collect(),
-            ),
-            ColumnData::Int64(v) => ColumnData::Int64(
-                v.iter()
-                    .zip(selection)
-                    .filter(|(_, s)| **s)
-                    .map(|(x, _)| *x)
-                    .collect(),
-            ),
-            ColumnData::Float64(v) => ColumnData::Float64(
-                v.iter()
-                    .zip(selection)
-                    .filter(|(_, s)| **s)
-                    .map(|(x, _)| *x)
-                    .collect(),
-            ),
-            ColumnData::Date(v) => ColumnData::Date(
-                v.iter()
-                    .zip(selection)
-                    .filter(|(_, s)| **s)
-                    .map(|(x, _)| *x)
-                    .collect(),
-            ),
+            ColumnData::Bool(v) => {
+                let mut out = Vec::with_capacity(n);
+                for (i, keep) in selection.iter().enumerate() {
+                    if *keep {
+                        out.push(v[self.offset + i]);
+                    }
+                }
+                ColumnData::Bool(out)
+            }
+            ColumnData::Int64(v) => {
+                let mut out = Vec::with_capacity(n);
+                for (i, keep) in selection.iter().enumerate() {
+                    if *keep {
+                        out.push(v[self.offset + i]);
+                    }
+                }
+                ColumnData::Int64(out)
+            }
+            ColumnData::Float64(v) => {
+                let mut out = Vec::with_capacity(n);
+                for (i, keep) in selection.iter().enumerate() {
+                    if *keep {
+                        out.push(v[self.offset + i]);
+                    }
+                }
+                ColumnData::Float64(out)
+            }
+            ColumnData::Date(v) => {
+                let mut out = Vec::with_capacity(n);
+                for (i, keep) in selection.iter().enumerate() {
+                    if *keep {
+                        out.push(v[self.offset + i]);
+                    }
+                }
+                ColumnData::Date(out)
+            }
             ColumnData::Utf8 { data: d, offsets } => {
                 let mut out_data = Vec::with_capacity(d.len());
                 let mut out_offsets = Vec::with_capacity(n + 1);
                 out_offsets.push(0u32);
                 let mut j = 0usize;
                 for (i, keep) in selection.iter().enumerate() {
-                    let start = offsets[i] as usize;
-                    let end = offsets[i + 1] as usize;
+                    let wi = self.offset + i;
+                    let start = offsets[wi] as usize;
+                    let end = offsets[wi + 1] as usize;
                     if *keep {
                         out_data.extend_from_slice(&d[start..end]);
                         out_offsets.push(out_data.len() as u32);
@@ -619,31 +683,33 @@ impl Vector {
                     offsets: out_offsets,
                 }
             }
-            ColumnData::Binary(v) => ColumnData::Binary(
-                v.iter()
-                    .zip(selection)
-                    .filter(|(_, s)| **s)
-                    .map(|(x, _)| x.clone())
-                    .collect(),
-            ),
-            ColumnData::List { elem, values } => ColumnData::List {
-                elem: elem.clone(),
-                values: values
-                    .iter()
-                    .zip(selection)
-                    .filter(|(_, s)| **s)
-                    .map(|(x, _)| x.clone())
-                    .collect(),
-            },
-            ColumnData::Vector { dim, values } => ColumnData::Vector {
-                dim: *dim,
-                values: values
-                    .iter()
-                    .zip(selection)
-                    .filter(|(_, s)| **s)
-                    .map(|(x, _)| x.clone())
-                    .collect(),
-            },
+            ColumnData::Binary(v) => {
+                let mut out = Vec::with_capacity(n);
+                for (i, keep) in selection.iter().enumerate() {
+                    if *keep {
+                        out.push(v[self.offset + i].clone());
+                    }
+                }
+                ColumnData::Binary(out)
+            }
+            ColumnData::List { elem, values } => {
+                let mut out = Vec::with_capacity(n);
+                for (i, keep) in selection.iter().enumerate() {
+                    if *keep {
+                        out.push(values[self.offset + i].clone());
+                    }
+                }
+                ColumnData::List { elem: elem.clone(), values: out }
+            }
+            ColumnData::Vector { dim, values } => {
+                let mut out = Vec::with_capacity(n);
+                for (i, keep) in selection.iter().enumerate() {
+                    if *keep {
+                        out.push(values[self.offset + i].clone());
+                    }
+                }
+                ColumnData::Vector { dim: *dim, values: out }
+            }
         };
         // 非 Utf8 列的 null 位图按行同步压缩
         if let (Some(src), Some(dst)) = (self.nulls.as_ref(), nulls.as_mut()) {
@@ -675,55 +741,68 @@ impl Vector {
             ColumnData::Bool(v) => {
                 let mut out = Vec::with_capacity(idx.len());
                 for &i in idx {
-                    out.push(v[i]);
+                    out.push(v[self.offset + i]);
                 }
                 ColumnData::Bool(out)
             }
             ColumnData::Int64(v) => {
                 let mut out = Vec::with_capacity(idx.len());
                 for &i in idx {
-                    out.push(v[i]);
+                    out.push(v[self.offset + i]);
                 }
                 ColumnData::Int64(out)
             }
             ColumnData::Float64(v) => {
                 let mut out = Vec::with_capacity(idx.len());
                 for &i in idx {
-                    out.push(v[i]);
+                    out.push(v[self.offset + i]);
                 }
                 ColumnData::Float64(out)
             }
             ColumnData::Date(v) => {
                 let mut out = Vec::with_capacity(idx.len());
                 for &i in idx {
-                    out.push(v[i]);
+                    out.push(v[self.offset + i]);
                 }
                 ColumnData::Date(out)
             }
             ColumnData::Utf8 { data, offsets } => {
                 let total: usize = idx
                     .iter()
-                    .map(|&i| (offsets[i + 1] - offsets[i]) as usize)
+                    .map(|&i| (offsets[self.offset + i + 1] - offsets[self.offset + i]) as usize)
                     .sum();
                 let mut buf = Vec::with_capacity(total);
                 let mut offs = Vec::with_capacity(idx.len() + 1);
                 offs.push(0u32);
                 for &i in idx {
-                    let (s, e) = (offsets[i] as usize, offsets[i + 1] as usize);
+                    let wi = self.offset + i;
+                    let (s, e) = (offsets[wi] as usize, offsets[wi + 1] as usize);
                     buf.extend_from_slice(&data[s..e]);
                     offs.push(buf.len() as u32);
                 }
                 ColumnData::Utf8 { data: buf, offsets: offs }
             }
-            ColumnData::Binary(v) => ColumnData::Binary(idx.iter().map(|&i| v[i].clone()).collect()),
-            ColumnData::List { elem, values } => ColumnData::List {
-                elem: elem.clone(),
-                values: idx.iter().map(|&i| values[i].clone()).collect(),
-            },
-            ColumnData::Vector { dim, values } => ColumnData::Vector {
-                dim: *dim,
-                values: idx.iter().map(|&i| values[i].clone()).collect(),
-            },
+            ColumnData::Binary(v) => {
+                let mut out = Vec::with_capacity(idx.len());
+                for &i in idx {
+                    out.push(v[self.offset + i].clone());
+                }
+                ColumnData::Binary(out)
+            }
+            ColumnData::List { elem, values } => {
+                let mut out = Vec::with_capacity(idx.len());
+                for &i in idx {
+                    out.push(values[self.offset + i].clone());
+                }
+                ColumnData::List { elem: elem.clone(), values: out }
+            }
+            ColumnData::Vector { dim, values } => {
+                let mut out = Vec::with_capacity(idx.len());
+                for &i in idx {
+                    out.push(values[self.offset + i].clone());
+                }
+                ColumnData::Vector { dim: *dim, values: out }
+            }
         };
         let nulls = self.nulls.as_ref().map(|v| {
             let mut out = Validity::all_valid(idx.len());
@@ -732,7 +811,7 @@ impl Vector {
             }
             out
         });
-        Self { data: Arc::new(data), nulls }
+        Self::new(data, nulls).expect("gather build")
     }
 
     /// 纵向拼接(同类型列;null 位图合并)。分片产出的合并原语。
@@ -779,13 +858,11 @@ impl Vector {
                 let mut offs = Vec::with_capacity(total + 1);
                 offs.push(0u32);
                 for p in parts {
-                    if let ColumnData::Utf8 { data, offsets } = p.data.as_ref() {
-                        for w in &offsets[1..] {
-                            offs.push(buf.len() as u32 + *w);
-                        }
-                        buf.extend_from_slice(data);
-                    } else {
-                        unreachable!("concat utf8 part mismatch");
+                    // 部件可能是窗口:逐行借 utf8_value(经 datum,含偏移)
+                    for i in 0..p.len() {
+                        let s = p.utf8_value(i);
+                        buf.extend_from_slice(s.as_bytes());
+                        offs.push(buf.len() as u32);
                     }
                 }
                 ColumnData::Utf8 { data: buf, offsets: offs }
@@ -793,30 +870,33 @@ impl Vector {
             ColumnData::Binary(_) => ColumnData::Binary(
                 parts
                     .iter()
-                    .flat_map(|p| match p.data.as_ref() {
-                        ColumnData::Binary(v) => v.clone(),
+                    .flat_map(|p| (0..p.len()).map(|i| match p.datum(i) {
+                        Datum::Binary(b) => b.to_owned(),
+                        Datum::Null => Vec::new(),
                         _ => unreachable!(),
-                    })
+                    }))
                     .collect(),
             ),
             ColumnData::List { elem, .. } => ColumnData::List {
                 elem: elem.clone(),
                 values: parts
                     .iter()
-                    .flat_map(|p| match p.data.as_ref() {
-                        ColumnData::List { values, .. } => values.clone(),
+                    .flat_map(|p| (0..p.len()).map(|i| match p.datum(i) {
+                        Datum::List(l) => l.to_vec(),
+                        Datum::Null => Vec::new(),
                         _ => unreachable!(),
-                    })
+                    }))
                     .collect(),
             },
             ColumnData::Vector { dim, .. } => ColumnData::Vector {
                 dim: *dim,
                 values: parts
                     .iter()
-                    .flat_map(|p| match p.data.as_ref() {
-                        ColumnData::Vector { values, .. } => values.clone(),
+                    .flat_map(|p| (0..p.len()).map(|i| match p.datum(i) {
+                        Datum::Vector(v) => v.to_vec(),
+                        Datum::Null => Vec::new(),
                         _ => unreachable!(),
-                    })
+                    }))
                     .collect(),
             },
         };
@@ -833,45 +913,23 @@ impl Vector {
             }
             out
         });
-        Ok(Self { data: Arc::new(data), nulls })
+        Self::new(data, nulls)
     }
 
     /// 截取 [offset, offset + len) 行窗口。
-    /// **只拷贝窗口内数据**(交付给下游的所有权必需),源向量保持不变 ——
-    /// 批切片零冗余拷贝的关键原语:剩余行复用同一份缓冲,不重压。
+    /// **零拷贝**:返回共享底层数据的窗口视图(clone = 引用计数),
+    /// 交付分批/流式扫描均不重压数据。gather/select 仍构建所有权拷贝。
     pub fn slice(&self, offset: usize, len: usize) -> Vector {
-        let len = len.min(self.len().saturating_sub(offset));
-        let end = offset + len;
-        let data = match self.data.as_ref() {
-            ColumnData::Bool(v) => ColumnData::Bool(v[offset..end].to_vec()),
-            ColumnData::Int64(v) => ColumnData::Int64(v[offset..end].to_vec()),
-            ColumnData::Float64(v) => ColumnData::Float64(v[offset..end].to_vec()),
-            ColumnData::Date(v) => ColumnData::Date(v[offset..end].to_vec()),
-            ColumnData::Utf8 { data, offsets } => ColumnData::Utf8 {
-                data: data[offsets[offset] as usize..offsets[end] as usize].to_vec(),
-                offsets: offsets[offset..=end]
-                    .iter()
-                    .map(|o| o - offsets[offset])
-                    .collect(),
-            },
-            ColumnData::Binary(v) => ColumnData::Binary(v[offset..end].to_vec()),
-            ColumnData::List { elem, values } => ColumnData::List {
-                elem: elem.clone(),
-                values: values[offset..end].to_vec(),
-            },
-            ColumnData::Vector { dim, values } => ColumnData::Vector {
-                dim: *dim,
-                values: values[offset..end].to_vec(),
-            },
-        };
-        let nulls = self.nulls.as_ref().map(|v| {
-            let mut out = Validity::all_valid(len);
-            for i in 0..len {
-                out.set(i, v.get(offset + i));
-            }
-            out
-        });
-        Self { data: Arc::new(data), nulls }
+        let start = self.offset + offset.min(self.len);
+        let n = len.min(self.len.saturating_sub(offset));
+        // nulls 已是窗口相对位图:取相对区间 [offset, offset+n)
+        let nulls = self.nulls.as_ref().map(|v| v.window(offset, n));
+        Self {
+            data: Arc::clone(&self.data),
+            nulls,
+            offset: start,
+            len: n,
+        }
     }
 }
 
